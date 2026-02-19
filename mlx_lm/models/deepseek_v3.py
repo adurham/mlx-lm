@@ -162,6 +162,19 @@ class DeepseekV3Attention(nn.Module):
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
+        # One-time SDPA shape probe for debugging
+        if L > 1 and not getattr(self, '_sdpa_logged', False):
+            import logging as _logging
+            _logging.getLogger("exo").info(
+                f"SDPA PROBE: L={L}, "
+                f"q_nope.shape={q_nope.shape}, k.shape={k.shape}, v.shape={v.shape}, "
+                f"q_head_dim={q_nope.shape[-1]}, k_head_dim={k.shape[-1]}, v_head_dim={v.shape[-1]}, "
+                f"mask_type={'array' if pe_scores is not None else 'None'}, "
+                f"mask_shape={pe_scores.shape if pe_scores is not None else None}, "
+                f"mask_dtype={pe_scores.dtype if pe_scores is not None else None}, "
+                f"q_dtype={q_nope.dtype}, k_dtype={k.dtype}, v_dtype={v.dtype}"
+            )
+            self._sdpa_logged = True
         if L == 1:
             output = self.unembed_out(output)
 
