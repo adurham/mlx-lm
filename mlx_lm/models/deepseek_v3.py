@@ -164,8 +164,8 @@ class DeepseekV3Attention(nn.Module):
         )
         # One-time SDPA shape probe for debugging
         if L > 1 and not getattr(self, '_sdpa_logged', False):
-            import logging as _logging
-            _logging.getLogger("exo").info(
+            from loguru import logger as _logger
+            _logger.info(
                 f"SDPA PROBE: L={L}, "
                 f"q_nope.shape={q_nope.shape}, k.shape={k.shape}, v.shape={v.shape}, "
                 f"q_head_dim={q_nope.shape[-1]}, k_head_dim={k.shape[-1]}, v_head_dim={v.shape[-1]}, "
