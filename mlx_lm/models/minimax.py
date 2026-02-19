@@ -150,6 +150,20 @@ class MiniMaxAttention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        # One-time SDPA shape probe for debugging
+        if L > 1 and not getattr(self, '_sdpa_logged', False):
+            from loguru import logger as _logger
+            _logger.info(
+                f"SDPA PROBE: L={L}, "
+                f"queries.shape={queries.shape}, keys.shape={keys.shape}, values.shape={values.shape}, "
+                f"q_head_dim={queries.shape[-1]}, k_head_dim={keys.shape[-1]}, v_head_dim={values.shape[-1]}, "
+                f"mask_type={'array' if isinstance(mask, mx.array) else type(mask).__name__}, "
+                f"mask_shape={mask.shape if isinstance(mask, mx.array) else None}, "
+                f"q_dtype={queries.dtype}, k_dtype={keys.dtype}, v_dtype={values.dtype}, "
+                f"scale={self.scale}"
+            )
+            self._sdpa_logged = True
+
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
