@@ -206,12 +206,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
         y = (y * scores[..., None]).sum(axis=-2)
 
         if self.sharding_group is not None:
-            # all_gather + GPU reduce instead of CPU-side all_sum
-            N = self.sharding_group.size()
-            gathered = mx.distributed.all_gather(y, group=self.sharding_group)
-            orig_shape = y.shape
-            gathered = gathered.reshape(N, *orig_shape)
-            y = gathered.sum(axis=0)
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
 
