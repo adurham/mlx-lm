@@ -71,6 +71,22 @@ def quantized_scaled_dot_product_attention(
     bits: int = 8,
 ) -> mx.array:
     B, n_q_heads, L, D = queries.shape
+
+    # Use the fused Metal kernel for decode (L<=8, 8-bit, supported head dims).
+    # This avoids materializing the full [seq_len x seq_len] attention matrix.
+    if L <= 8 and bits == 8 and D in (64, 96, 128, 256):
+        k_data, k_scales, k_biases = q_keys
+        v_data, v_scales, v_biases = q_values
+        return mx.fast.quantized_scaled_dot_product_attention(
+            queries,
+            k_data, k_scales, k_biases,
+            v_data, v_scales, v_biases,
+            scale=scale,
+            group_size=group_size,
+            mask=mask,
+        )
+
+    # Fallback: unfused quantized_matmul path (prefill or unsupported config)
     n_kv_heads = q_keys[0].shape[-3]
     n_repeats = n_q_heads // n_kv_heads
 
