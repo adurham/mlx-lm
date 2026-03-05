@@ -8,7 +8,7 @@ from typing import Any, Optional
 import mlx.core as mx
 from mlx.utils import tree_map
 
-_USE_FUSED_SDPA = os.environ.get("EXO_FUSED_SDPA", "0") == "1"
+_USE_FUSED_SDPA = os.environ.get("EXO_FUSED_SDPA", "1") == "1"
 
 
 @dataclass
