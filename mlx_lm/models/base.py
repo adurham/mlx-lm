@@ -1,11 +1,14 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import inspect
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import mlx.core as mx
 from mlx.utils import tree_map
+
+_USE_FUSED_SDPA = os.environ.get("EXO_FUSED_SDPA", "0") == "1"
 
 
 @dataclass
@@ -74,7 +77,8 @@ def quantized_scaled_dot_product_attention(
 
     # Use the fused Metal kernel for decode (L<=8, 8-bit, supported head dims).
     # This avoids materializing the full [seq_len x seq_len] attention matrix.
-    if L <= 8 and bits == 8 and D in (64, 96, 128, 256):
+    # Gated by EXO_FUSED_SDPA=1 — the kernel causes Metal GPU timeouts on M4 base.
+    if _USE_FUSED_SDPA and L <= 8 and bits == 8 and D in (64, 96, 128, 256):
         k_data, k_scales, k_biases = q_keys
         v_data, v_scales, v_biases = q_values
         return mx.fast.quantized_scaled_dot_product_attention(
