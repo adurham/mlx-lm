@@ -417,15 +417,20 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
+    import logging as _logging
+    _gen_logger = _logging.getLogger("exo.generate_step")
+
     with mx.stream(generation_stream):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        _gen_logger.info(f"[generate_step] prefill loop: total_prompt_tokens={total_prompt_tokens}")
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
+            _gen_logger.info(f"[generate_step] prefill chunk: {n_to_process} tokens")
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
@@ -434,8 +439,10 @@ def generate_step(
                     else None
                 ),
             )
+            _gen_logger.info("[generate_step] prefill model_call done, evaling cache")
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
+            _gen_logger.info("[generate_step] prefill eval done")
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
@@ -446,16 +453,23 @@ def generate_step(
             )
             mx.clear_cache()
 
+        _gen_logger.info(f"[generate_step] first _step (remaining prompt={len(prompt)} tokens)")
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+        _gen_logger.info("[generate_step] first _step built graph, calling async_eval")
 
     mx.async_eval(y, logprobs)
+    _gen_logger.info("[generate_step] async_eval dispatched, entering decode loop")
     n = 0
     while True:
         if n != max_tokens:
+            _gen_logger.info(f"[generate_step] decode step n={n}, calling _step")
             next_y, next_logprobs = _step(y)
+            _gen_logger.info(f"[generate_step] decode step n={n}, _step done, async_eval")
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
+            _gen_logger.info("[generate_step] n=0, calling mx.eval(y) — FIRST EVAL")
             mx.eval(y)
+            _gen_logger.info("[generate_step] n=0, mx.eval(y) complete")
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
         if n == max_tokens:
             break
