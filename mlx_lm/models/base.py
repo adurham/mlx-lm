@@ -78,7 +78,7 @@ def quantized_scaled_dot_product_attention(
     # Use the fused Metal kernel for decode (L<=8, 8-bit, supported head dims).
     # This avoids materializing the full [seq_len x seq_len] attention matrix.
     # Gated by EXO_FUSED_SDPA=1 — the kernel causes Metal GPU timeouts on M4 base.
-    if _USE_FUSED_SDPA and L <= 8 and bits == 8 and D in (64, 96, 128, 256):
+    if _USE_FUSED_SDPA and L <= 8 and bits == 8 and D in (64, 96, 128, 256, 512):
         k_data, k_scales, k_biases = q_keys
         v_data, v_scales, v_biases = q_values
         return mx.fast.quantized_scaled_dot_product_attention(
