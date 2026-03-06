@@ -8,6 +8,10 @@ from typing import Any, Optional
 import mlx.core as mx
 from mlx.utils import tree_map
 
+# TODO: Remove custom fused quantized SDPA kernel and this flag.
+# 8-bit KV was strictly worse than fp16 at all context sizes for MiniMax M2.5,
+# and Apple's quantized_matmul outperformed our kernel. Dead code with fp16 KV.
+# Kernel lives in mlx/mlx/backend/metal/kernels/sdpa_vector_quantized.h
 _USE_FUSED_SDPA = os.environ.get("EXO_FUSED_SDPA", "1") == "1"
 
 
