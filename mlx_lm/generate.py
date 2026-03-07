@@ -484,11 +484,12 @@ def generate_step(
     if _use_compiled_decode:
         _gen_logger.info("[generate_step] using mx.compile for decode")
     n = 0
+    _step_t0 = time.perf_counter()
     while True:
         if n != max_tokens:
-            _gen_logger.info(f"[generate_step] decode step n={n}, calling _step")
+            _step_build_t0 = time.perf_counter()
             next_y, next_logprobs = _decode_fn(y)
-            _gen_logger.info(f"[generate_step] decode step n={n}, _step done, async_eval")
+            _step_build_ms = (time.perf_counter() - _step_build_t0) * 1000
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
             _gen_logger.info("[generate_step] n=0, calling mx.eval(y) — FIRST EVAL")
@@ -497,6 +498,11 @@ def generate_step(
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
         if n == max_tokens:
             break
+        _step_total_ms = (time.perf_counter() - _step_t0) * 1000
+        _gen_logger.info(
+            f"[decode] n={n} total={_step_total_ms:.1f}ms build={_step_build_ms:.1f}ms"
+        )
+        _step_t0 = time.perf_counter()
         yield y.item(), logprobs
         if n % 256 == 0:
             mx.clear_cache()
