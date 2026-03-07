@@ -478,31 +478,40 @@ def generate_step(
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
         _gen_logger.info("[generate_step] first _step built graph, calling async_eval")
 
+    _trace_decode = os.environ.get("EXO_TRACING_ENABLED", "false").lower() in ("true", "1")
+
     mx.async_eval(y, logprobs)
-    _gen_logger.info("[generate_step] async_eval dispatched, entering decode loop")
+    if _trace_decode:
+        _gen_logger.info("[generate_step] async_eval dispatched, entering decode loop")
     _decode_fn = _compiled_step if _use_compiled_decode else _step
-    if _use_compiled_decode:
+    if _use_compiled_decode and _trace_decode:
         _gen_logger.info("[generate_step] using mx.compile for decode")
     n = 0
-    _step_t0 = time.perf_counter()
+    if _trace_decode:
+        _step_t0 = time.perf_counter()
     while True:
         if n != max_tokens:
-            _step_build_t0 = time.perf_counter()
+            if _trace_decode:
+                _step_build_t0 = time.perf_counter()
             next_y, next_logprobs = _decode_fn(y)
-            _step_build_ms = (time.perf_counter() - _step_build_t0) * 1000
+            if _trace_decode:
+                _step_build_ms = (time.perf_counter() - _step_build_t0) * 1000
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
-            _gen_logger.info("[generate_step] n=0, calling mx.eval(y) — FIRST EVAL")
+            if _trace_decode:
+                _gen_logger.info("[generate_step] n=0, calling mx.eval(y) — FIRST EVAL")
             mx.eval(y)
-            _gen_logger.info("[generate_step] n=0, mx.eval(y) complete")
+            if _trace_decode:
+                _gen_logger.info("[generate_step] n=0, mx.eval(y) complete")
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
         if n == max_tokens:
             break
-        _step_total_ms = (time.perf_counter() - _step_t0) * 1000
-        _gen_logger.info(
-            f"[decode] n={n} total={_step_total_ms:.1f}ms build={_step_build_ms:.1f}ms"
-        )
-        _step_t0 = time.perf_counter()
+        if _trace_decode:
+            _step_total_ms = (time.perf_counter() - _step_t0) * 1000
+            _gen_logger.info(
+                f"[decode] n={n} total={_step_total_ms:.1f}ms build={_step_build_ms:.1f}ms"
+            )
+            _step_t0 = time.perf_counter()
         yield y.item(), logprobs
         if n % 256 == 0:
             mx.clear_cache()
