@@ -428,8 +428,12 @@ def generate_step(
         and (kv_bits is None or kv_bits >= 16)
     )
 
-    import logging as _logging
-    _gen_logger = _logging.getLogger("exo.generate_step")
+    _trace = os.environ.get("EXO_TRACING_ENABLED", "false").lower() in ("true", "1")
+
+    def _log(msg: str) -> None:
+        if _trace:
+            sys.stderr.write(f"[generate_step] {msg}\n")
+            sys.stderr.flush()
 
     with mx.stream(generation_stream):
         total_prompt_tokens = (
@@ -437,11 +441,11 @@ def generate_step(
         )
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
-        _gen_logger.info(f"[generate_step] prefill loop: total_prompt_tokens={total_prompt_tokens}")
+        _log(f"prefill start: {total_prompt_tokens} tokens")
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
-            _gen_logger.info(f"[generate_step] prefill chunk: {n_to_process} tokens")
+            _t0 = time.perf_counter()
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
@@ -450,10 +454,9 @@ def generate_step(
                     else None
                 ),
             )
-            _gen_logger.info("[generate_step] prefill model_call done, evaling cache")
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
-            _gen_logger.info("[generate_step] prefill eval done")
+            _log(f"prefill chunk: {n_to_process} tokens in {(time.perf_counter() - _t0)*1000:.0f}ms")
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
@@ -464,9 +467,9 @@ def generate_step(
             )
             mx.clear_cache()
 
-        _gen_logger.info(f"[generate_step] first _step (remaining prompt={len(prompt)} tokens)")
+        _t0 = time.perf_counter()
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
-        _gen_logger.info("[generate_step] first _step built graph, calling async_eval")
+        _log(f"first _step graph built in {(time.perf_counter() - _t0)*1000:.1f}ms")
 
     # Build compiled decode step AFTER prefill so cache is populated (keys != None)
     if _use_compiled_decode:
@@ -481,39 +484,26 @@ def generate_step(
                 sampled = sampler(logprobs)
                 return sampled, logprobs.squeeze(0)
 
-    _trace_decode = os.environ.get("EXO_TRACING_ENABLED", "false").lower() in ("true", "1")
-
     mx.async_eval(y, logprobs)
-    if _trace_decode:
-        _gen_logger.info("[generate_step] async_eval dispatched, entering decode loop")
     _decode_fn = _compiled_step if _use_compiled_decode else _step
-    if _use_compiled_decode and _trace_decode:
-        _gen_logger.info("[generate_step] using mx.compile for decode")
+    if _use_compiled_decode:
+        _log("decode: using mx.compile")
     n = 0
-    if _trace_decode:
-        _step_t0 = time.perf_counter()
+    _step_t0 = time.perf_counter() if _trace else 0.0
     while True:
         if n != max_tokens:
-            if _trace_decode:
-                _step_build_t0 = time.perf_counter()
             next_y, next_logprobs = _decode_fn(y)
-            if _trace_decode:
-                _step_build_ms = (time.perf_counter() - _step_build_t0) * 1000
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
-            if _trace_decode:
-                _gen_logger.info("[generate_step] n=0, calling mx.eval(y) — FIRST EVAL")
+            _t0 = time.perf_counter()
             mx.eval(y)
-            if _trace_decode:
-                _gen_logger.info("[generate_step] n=0, mx.eval(y) complete")
+            _log(f"first eval (TTFT barrier): {(time.perf_counter() - _t0)*1000:.0f}ms")
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
         if n == max_tokens:
             break
-        if _trace_decode:
-            _step_total_ms = (time.perf_counter() - _step_t0) * 1000
-            _gen_logger.info(
-                f"[decode] n={n} total={_step_total_ms:.1f}ms build={_step_build_ms:.1f}ms"
-            )
+        if _trace:
+            _step_ms = (time.perf_counter() - _step_t0) * 1000
+            sys.stderr.write(f"[decode] n={n} {_step_ms:.1f}ms\n")
             _step_t0 = time.perf_counter()
         yield y.item(), logprobs
         if n % 256 == 0:
