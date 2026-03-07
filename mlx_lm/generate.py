@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import functools
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -417,6 +418,26 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
+    # Compiled decode: eliminates ~9-11ms graph-building overhead per step.
+    # Only safe when there are no logits_processors (dynamic concat) and no
+    # KV cache quantization (mutates cache list).  Gate behind env var.
+    _use_compiled_decode = (
+        os.environ.get("EXO_COMPILE_DECODE", "0") == "1"
+        and not logits_processors
+        and (kv_bits is None or kv_bits >= 16)
+    )
+    if _use_compiled_decode:
+        _cache_state = [c.state for c in prompt_cache]
+
+        @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
+        def _compiled_step(y):
+            with mx.stream(generation_stream):
+                logits = model(y[None], cache=prompt_cache)
+                logits = logits[:, -1, :]
+                logprobs = logits - mx.logsumexp(logits, keepdims=True)
+                sampled = sampler(logprobs)
+                return sampled, logprobs.squeeze(0)
+
     import logging as _logging
     _gen_logger = _logging.getLogger("exo.generate_step")
 
@@ -459,11 +480,14 @@ def generate_step(
 
     mx.async_eval(y, logprobs)
     _gen_logger.info("[generate_step] async_eval dispatched, entering decode loop")
+    _decode_fn = _compiled_step if _use_compiled_decode else _step
+    if _use_compiled_decode:
+        _gen_logger.info("[generate_step] using mx.compile for decode")
     n = 0
     while True:
         if n != max_tokens:
             _gen_logger.info(f"[generate_step] decode step n={n}, calling _step")
-            next_y, next_logprobs = _step(y)
+            next_y, next_logprobs = _decode_fn(y)
             _gen_logger.info(f"[generate_step] decode step n={n}, _step done, async_eval")
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
