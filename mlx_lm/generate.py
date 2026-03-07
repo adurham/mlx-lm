@@ -421,22 +421,12 @@ def generate_step(
     # Compiled decode: eliminates ~9-11ms graph-building overhead per step.
     # Only safe when there are no logits_processors (dynamic concat) and no
     # KV cache quantization (mutates cache list).  Gate behind env var.
+    # NOTE: _compiled_step is created after prefill (cache must be populated first).
     _use_compiled_decode = (
         os.environ.get("EXO_COMPILE_DECODE", "0") == "1"
         and not logits_processors
         and (kv_bits is None or kv_bits >= 16)
     )
-    if _use_compiled_decode:
-        _cache_state = [c.state for c in prompt_cache]
-
-        @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
-        def _compiled_step(y):
-            with mx.stream(generation_stream):
-                logits = model(y[None], cache=prompt_cache)
-                logits = logits[:, -1, :]
-                logprobs = logits - mx.logsumexp(logits, keepdims=True)
-                sampled = sampler(logprobs)
-                return sampled, logprobs.squeeze(0)
 
     import logging as _logging
     _gen_logger = _logging.getLogger("exo.generate_step")
@@ -477,6 +467,19 @@ def generate_step(
         _gen_logger.info(f"[generate_step] first _step (remaining prompt={len(prompt)} tokens)")
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
         _gen_logger.info("[generate_step] first _step built graph, calling async_eval")
+
+    # Build compiled decode step AFTER prefill so cache is populated (keys != None)
+    if _use_compiled_decode:
+        _cache_state = [c.state for c in prompt_cache]
+
+        @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
+        def _compiled_step(y):
+            with mx.stream(generation_stream):
+                logits = model(y[None], cache=prompt_cache)
+                logits = logits[:, -1, :]
+                logprobs = logits - mx.logsumexp(logits, keepdims=True)
+                sampled = sampler(logprobs)
+                return sampled, logprobs.squeeze(0)
 
     _trace_decode = os.environ.get("EXO_TRACING_ENABLED", "false").lower() in ("true", "1")
 
