@@ -293,7 +293,7 @@ class GenerationResponse:
 
 
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
-    if kv_bits is None:
+    if kv_bits is None or kv_bits >= 16:
         return
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
