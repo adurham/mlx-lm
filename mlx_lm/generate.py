@@ -219,8 +219,11 @@ def setup_arg_parser():
     return parser
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
+# Use the default stream for generation instead of a separate stream.
+# A separate stream causes JACCL RDMA deadlocks in TP mode: collective ops
+# (all_sum, all_gather) succeed on the default stream but deadlock on a
+# secondary stream, even after mx.synchronize().
+generation_stream = mx.default_stream(mx.default_device())
 
 
 @contextlib.contextmanager
