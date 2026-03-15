@@ -433,10 +433,14 @@ def generate_step(
 
     _trace = os.environ.get("EXO_TRACING_ENABLED", "false").lower() in ("true", "1")
 
+    # Import loguru for tracing — sys.stderr doesn't reach the log file in
+    # multiprocessing subprocess contexts.
+    if _trace:
+        from loguru import logger as _trace_logger
+
     def _log(msg: str) -> None:
         if _trace:
-            sys.stderr.write(f"[generate_step] {msg}\n")
-            sys.stderr.flush()
+            _trace_logger.debug(f"[generate_step] {msg}")
 
     with mx.stream(generation_stream):
         total_prompt_tokens = (
@@ -508,7 +512,7 @@ def generate_step(
                 break
             if _trace:
                 _step_ms = (time.perf_counter() - _step_t0) * 1000
-                sys.stderr.write(f"[decode] n={n} {_step_ms:.1f}ms\n")
+                _log(f"[decode] n={n} {_step_ms:.1f}ms")
                 _step_t0 = time.perf_counter()
             yield y.item(), logprobs
             if n % 256 == 0:
