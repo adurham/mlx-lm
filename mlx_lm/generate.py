@@ -491,28 +491,33 @@ def generate_step(
     _decode_fn = _compiled_step if _use_compiled_decode else _step
     if _use_compiled_decode:
         _log("decode: using mx.compile")
+        model._compiled_decode_active = True  # type: ignore
     n = 0
     _step_t0 = time.perf_counter() if _trace else 0.0
-    while True:
-        if n != max_tokens:
-            next_y, next_logprobs = _decode_fn(y)
-            mx.async_eval(next_y, next_logprobs)
-        if n == 0:
-            _t0 = time.perf_counter()
-            mx.eval(y)
-            _log(f"first eval (TTFT barrier): {(time.perf_counter() - _t0)*1000:.0f}ms")
-            prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
-        if n == max_tokens:
-            break
-        if _trace:
-            _step_ms = (time.perf_counter() - _step_t0) * 1000
-            sys.stderr.write(f"[decode] n={n} {_step_ms:.1f}ms\n")
-            _step_t0 = time.perf_counter()
-        yield y.item(), logprobs
-        if n % 256 == 0:
-            mx.clear_cache()
-        y, logprobs = next_y, next_logprobs
-        n += 1
+    try:
+        while True:
+            if n != max_tokens:
+                next_y, next_logprobs = _decode_fn(y)
+                mx.async_eval(next_y, next_logprobs)
+            if n == 0:
+                _t0 = time.perf_counter()
+                mx.eval(y)
+                _log(f"first eval (TTFT barrier): {(time.perf_counter() - _t0)*1000:.0f}ms")
+                prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+            if n == max_tokens:
+                break
+            if _trace:
+                _step_ms = (time.perf_counter() - _step_t0) * 1000
+                sys.stderr.write(f"[decode] n={n} {_step_ms:.1f}ms\n")
+                _step_t0 = time.perf_counter()
+            yield y.item(), logprobs
+            if n % 256 == 0:
+                mx.clear_cache()
+            y, logprobs = next_y, next_logprobs
+            n += 1
+    finally:
+        if _use_compiled_decode:
+            model._compiled_decode_active = False  # type: ignore
 
 
 def speculative_generate_step(
