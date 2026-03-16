@@ -433,14 +433,15 @@ def generate_step(
 
     _trace = os.environ.get("EXO_TRACING_ENABLED", "false").lower() in ("true", "1")
 
-    # Import loguru for tracing — sys.stderr doesn't reach the log file in
-    # multiprocessing subprocess contexts.
-    if _trace:
-        from loguru import logger as _trace_logger
+    _trace = os.environ.get("EXO_TRACING_ENABLED", "false").lower() in ("true", "1")
 
     def _log(msg: str) -> None:
         if _trace:
-            _trace_logger.debug(f"[generate_step] {msg}")
+            # Use print to stderr — loguru's default logger in subprocesses
+            # may not be configured to write to the log file, but the parent
+            # process redirects stderr to ~/exo.log via > ~/exo.log 2>&1.
+            sys.stderr.write(f"[generate_step] {msg}\n")
+            sys.stderr.flush()
 
     with mx.stream(generation_stream):
         total_prompt_tokens = (
