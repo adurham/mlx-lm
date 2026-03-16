@@ -1292,9 +1292,13 @@ class BatchGenerator:
         return sampled, list(logprobs)
 
     def stats(self):
-        self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
+        self._stats.prompt_tps = (
+            self._stats.prompt_tokens / self._stats.prompt_time
+            if self._stats.prompt_time > 0 else 0.0
+        )
         self._stats.generation_tps = (
             self._stats.generation_tokens / self._stats.generation_time
+            if self._stats.generation_time > 0 else 0.0
         )
         self._stats.peak_memory = mx.get_peak_memory() / 1e9
         return self._stats
