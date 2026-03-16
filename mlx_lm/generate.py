@@ -501,7 +501,11 @@ def generate_step(
     try:
         while True:
             if n != max_tokens:
+                if _trace:
+                    _t_graph = time.perf_counter()
                 next_y, next_logprobs = _decode_fn(y)
+                if _trace:
+                    _graph_ms = (time.perf_counter() - _t_graph) * 1000
                 mx.async_eval(next_y, next_logprobs)
             if n == 0:
                 _t0 = time.perf_counter()
@@ -511,10 +515,20 @@ def generate_step(
             if n == max_tokens:
                 break
             if _trace:
+                _t_yield = time.perf_counter()
+            _y_item = y.item()  # blocks until GPU completes current step
+            if _trace:
+                _yield_ms = (time.perf_counter() - _t_yield) * 1000
                 _step_ms = (time.perf_counter() - _step_t0) * 1000
-                _log(f"[decode] n={n} {_step_ms:.1f}ms")
+                # Log detailed breakdown every 50 tokens, summary otherwise
+                if n % 50 == 0:
+                    _log(f"[decode] n={n} {_step_ms:.1f}ms (graph={_graph_ms:.1f}ms gpu_wait={_yield_ms:.1f}ms)")
+                else:
+                    _log(f"[decode] n={n} {_step_ms:.1f}ms")
                 _step_t0 = time.perf_counter()
-            yield y.item(), logprobs
+            else:
+                _y_item = y.item()
+            yield _y_item, logprobs
             if n % 256 == 0:
                 mx.clear_cache()
             y, logprobs = next_y, next_logprobs
