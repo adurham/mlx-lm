@@ -1396,28 +1396,6 @@ class BatchGenerator:
         batch = self.active_batch
         y, logprobs = batch.y, batch.logprobs
 
-        # CPU-pipelined speculative decode: check if draft predictions are ready
-        # from the PREVIOUS step's background thread.
-        draft_accepted = []
-        if (self.cpu_draft_fn is not None and self._draft_started
-                and len(batch) == 1 and self._next_count > 3):
-            # Check non-blocking
-            if self._draft_thread is not None and not self._draft_thread.is_alive():
-                self._draft_thread.join(timeout=0)
-                draft_tokens = self._draft_result[0]
-                self._draft_thread = None
-                self._draft_result[0] = None
-
-                if draft_tokens and len(draft_tokens) > 0:
-                    # Verify draft: feed current token + draft tokens together
-                    all_input = mx.concatenate([
-                        y[:, None],
-                        mx.array([draft_tokens])[None] if len(y.shape) == 1
-                        else mx.array([draft_tokens])
-                    ], axis=1) if False else None  # TODO: multi-token verify needs careful cache handling
-                    # For now just log that draft was available
-                    pass
-
         for i, toks in enumerate(batch.tokens):
             batch.tokens[i] = mx.concatenate((toks, y[i : i + 1]))
         batch.y, batch.logprobs = self._step(
@@ -1431,16 +1409,6 @@ class BatchGenerator:
         mx.async_eval(batch.y, batch.logprobs, batch.tokens)
 
         y = y.tolist()
-
-        # Start CPU draft for next step (runs in background during GPU's _step)
-        if self.cpu_draft_fn is not None and len(batch) == 1 and len(y) == 1:
-            token_id = y[0]
-            self._draft_result[0] = None
-            def _draft_work(tid=token_id):
-                self._draft_result[0] = self.cpu_draft_fn(tid, self.num_draft_tokens)
-            self._draft_thread = threading.Thread(target=_draft_work, daemon=True)
-            self._draft_thread.start()
-            self._draft_started = True
         toc = time.perf_counter()
         if prompt_processing:
             self._stats.prompt_time += toc - tic
