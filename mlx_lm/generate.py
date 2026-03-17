@@ -6,6 +6,7 @@ import functools
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -319,6 +320,8 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    cpu_draft_fn: Optional[Callable[[int, int], list]] = None,
+    num_draft_tokens: int = 2,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -497,6 +500,38 @@ def generate_step(
     if _use_compiled_decode:
         _log("decode: using mx.compile")
         model._compiled_decode_active = True  # type: ignore
+
+    # CPU draft state
+    _draft_thread = None
+    _draft_result = [None]  # mutable container for thread result
+    _draft_started_for_token = None
+
+    def _start_cpu_draft(token_id: int):
+        """Start CPU drafting in background thread."""
+        nonlocal _draft_thread, _draft_started_for_token
+        if _draft_thread is not None and _draft_thread.is_alive():
+            _draft_thread.join(timeout=0.001)
+        _draft_result[0] = None
+        _draft_started_for_token = token_id
+
+        def _work():
+            _draft_result[0] = cpu_draft_fn(token_id, num_draft_tokens)
+
+        _draft_thread = threading.Thread(target=_work, daemon=True)
+        _draft_thread.start()
+
+    def _get_cpu_draft() -> list | None:
+        """Get draft results if ready. Non-blocking check, then short wait."""
+        nonlocal _draft_thread
+        if _draft_thread is None:
+            return None
+        _draft_thread.join(timeout=0.05)  # wait up to 50ms
+        if _draft_thread.is_alive():
+            return None
+        result = _draft_result[0]
+        _draft_thread = None
+        return result
+
     n = 0
     _step_t0 = time.perf_counter() if _trace else 0.0
     try:
@@ -521,7 +556,6 @@ def generate_step(
             if _trace:
                 _yield_ms = (time.perf_counter() - _t_yield) * 1000
                 _step_ms = (time.perf_counter() - _step_t0) * 1000
-                # Log detailed breakdown every 50 tokens, summary otherwise
                 if n % 50 == 0:
                     _log(f"[decode] n={n} {_step_ms:.1f}ms (graph={_graph_ms:.1f}ms gpu_wait={_yield_ms:.1f}ms)")
                 else:
@@ -529,6 +563,67 @@ def generate_step(
                 _step_t0 = time.perf_counter()
             else:
                 _y_item = y.item()
+
+            # CPU-pipelined speculative decode: after yielding current token,
+            # check if we have draft predictions and try multi-token verify
+            if cpu_draft_fn is not None and n > 2:
+                draft_tokens = _get_cpu_draft()
+                if draft_tokens and len(draft_tokens) > 0:
+                    # We have draft predictions! Verify them with the model.
+                    # Feed current token + draft tokens as multi-token input.
+                    all_tokens = mx.array([_y_item] + draft_tokens)
+                    with mx.stream(generation_stream):
+                        verify_logits = _model_call(
+                            input_tokens=all_tokens[None],
+                            input_embeddings=None,
+                        )
+                        # Get predictions at each position
+                        verify_logits = verify_logits[0]  # (seq_len, vocab)
+                        quantize_cache_fn(prompt_cache)
+
+                    mx.eval(verify_logits)
+
+                    # Check acceptance: position i predicts token i+1
+                    # Position 0 (current token) predicts draft_tokens[0]
+                    # Position 1 (draft_tokens[0]) predicts draft_tokens[1]
+                    # etc.
+                    accepted = 0
+                    for i in range(len(draft_tokens)):
+                        pred = verify_logits[i].argmax().item()
+                        if pred == draft_tokens[i]:
+                            accepted += 1
+                        else:
+                            break
+
+                    if accepted > 0:
+                        if _trace:
+                            _log(f"[speculative] accepted {accepted}/{len(draft_tokens)} draft tokens")
+                        # Yield accepted draft tokens
+                        for i in range(accepted):
+                            n += 1
+                            # Compute logprobs for accepted token
+                            lp = verify_logits[i] - mx.logsumexp(verify_logits[i], keepdims=True)
+                            yield draft_tokens[i], lp
+
+                        # Trim cache for rejected tokens
+                        if accepted < len(draft_tokens):
+                            from mlx_lm.models import cache as cache_mod
+                            cache_mod.trim_prompt_cache(prompt_cache, len(draft_tokens) - accepted)
+
+                        # The verified token at position `accepted` is the model's
+                        # own prediction (not a draft). Use it as next y.
+                        last_pred = verify_logits[accepted].argmax()
+                        lp = verify_logits[accepted] - mx.logsumexp(verify_logits[accepted], keepdims=True)
+                        next_y = last_pred
+                        next_logprobs = lp
+                    else:
+                        # All rejected — trim all draft tokens from cache
+                        from mlx_lm.models import cache as cache_mod
+                        cache_mod.trim_prompt_cache(prompt_cache, len(draft_tokens))
+
+                # Start next CPU draft (runs during GPU's next decode step)
+                _start_cpu_draft(_y_item)
+
             yield _y_item, logprobs
             if n % 256 == 0:
                 mx.clear_cache()
@@ -537,6 +632,8 @@ def generate_step(
     finally:
         if _use_compiled_decode:
             model._compiled_decode_active = False  # type: ignore
+        if _draft_thread is not None and _draft_thread.is_alive():
+            _draft_thread.join(timeout=1.0)
 
 
 def speculative_generate_step(
