@@ -521,13 +521,13 @@ def generate_step(
         _draft_thread.start()
 
     def _get_cpu_draft() -> list | None:
-        """Get draft results if ready. Non-blocking check, then short wait."""
+        """Get draft results ONLY if already done. Never blocks."""
         nonlocal _draft_thread
         if _draft_thread is None:
             return None
-        _draft_thread.join(timeout=0.05)  # wait up to 50ms
         if _draft_thread.is_alive():
-            return None
+            return None  # not done yet, don't wait
+        _draft_thread.join(timeout=0)
         result = _draft_result[0]
         _draft_thread = None
         return result
