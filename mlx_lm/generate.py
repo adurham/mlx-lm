@@ -749,6 +749,9 @@ def speculative_generate_step(
     # Set these so the finally block doesn't raise
     num_draft = 0
     n = 0
+    _total_accepted = 0
+    _total_drafted = 0
+    _num_exchanges = 0
     draft_y = y if not _use_draft_fn else None
     try:
         while True:
@@ -774,12 +777,15 @@ def speculative_generate_step(
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
+            _num_exchanges += 1
+            _total_drafted += num_draft
             n = 0
             while n < num_draft:
                 tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
                 if tn != dtn:
                     break
                 n += 1
+                _total_accepted += 1
                 ntoks += 1
                 yield tn, lpn, True
                 if ntoks == max_tokens:
@@ -808,6 +814,18 @@ def speculative_generate_step(
             _rewind_cache(num_draft, n)
     finally:
         _rewind_cache(num_draft, n)
+        if _num_exchanges > 0:
+            _acc_rate = _total_accepted / _total_drafted * 100 if _total_drafted > 0 else 0
+            _avg_accepted = _total_accepted / _num_exchanges
+            import sys
+            print(
+                f"[speculative] {_num_exchanges} exchanges, "
+                f"{_total_accepted}/{_total_drafted} accepted ({_acc_rate:.1f}%), "
+                f"avg {_avg_accepted:.1f}/step, "
+                f"K={num_draft_tokens}, total_tokens={ntoks}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def stream_generate(
