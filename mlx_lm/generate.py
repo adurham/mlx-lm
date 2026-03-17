@@ -817,14 +817,12 @@ def speculative_generate_step(
         if _num_exchanges > 0:
             _acc_rate = _total_accepted / _total_drafted * 100 if _total_drafted > 0 else 0
             _avg_accepted = _total_accepted / _num_exchanges
-            import sys
-            print(
+            import logging
+            logging.getLogger("mlx_lm.generate").info(
                 f"[speculative] {_num_exchanges} exchanges, "
                 f"{_total_accepted}/{_total_drafted} accepted ({_acc_rate:.1f}%), "
                 f"avg {_avg_accepted:.1f}/step, "
-                f"K={num_draft_tokens}, total_tokens={ntoks}",
-                file=sys.stderr,
-                flush=True,
+                f"K={num_draft_tokens}, total_tokens={ntoks}"
             )
 
 
