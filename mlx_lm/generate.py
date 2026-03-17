@@ -564,64 +564,13 @@ def generate_step(
             else:
                 _y_item = y.item()
 
-            # CPU-pipelined speculative decode: after yielding current token,
-            # check if we have draft predictions and try multi-token verify
+            # CPU-pipelined speculative decode
             if cpu_draft_fn is not None and n > 2:
                 draft_tokens = _get_cpu_draft()
-                if draft_tokens and len(draft_tokens) > 0:
-                    # We have draft predictions! Verify them with the model.
-                    # Feed current token + draft tokens as multi-token input.
-                    all_tokens = mx.array([_y_item] + draft_tokens)
-                    with mx.stream(generation_stream):
-                        verify_logits = _model_call(
-                            input_tokens=all_tokens[None],
-                            input_embeddings=None,
-                        )
-                        # Get predictions at each position
-                        verify_logits = verify_logits[0]  # (seq_len, vocab)
-                        quantize_cache_fn(prompt_cache)
+                if draft_tokens and len(draft_tokens) > 0 and _trace:
+                    _log(f"[speculative] draft ready: {draft_tokens} (not yet verified)")
 
-                    mx.eval(verify_logits)
-
-                    # Check acceptance: position i predicts token i+1
-                    # Position 0 (current token) predicts draft_tokens[0]
-                    # Position 1 (draft_tokens[0]) predicts draft_tokens[1]
-                    # etc.
-                    accepted = 0
-                    for i in range(len(draft_tokens)):
-                        pred = verify_logits[i].argmax().item()
-                        if pred == draft_tokens[i]:
-                            accepted += 1
-                        else:
-                            break
-
-                    if accepted > 0:
-                        if _trace:
-                            _log(f"[speculative] accepted {accepted}/{len(draft_tokens)} draft tokens")
-                        # Yield accepted draft tokens
-                        for i in range(accepted):
-                            n += 1
-                            # Compute logprobs for accepted token
-                            lp = verify_logits[i] - mx.logsumexp(verify_logits[i], keepdims=True)
-                            yield draft_tokens[i], lp
-
-                        # Trim cache for rejected tokens
-                        if accepted < len(draft_tokens):
-                            from mlx_lm.models import cache as cache_mod
-                            cache_mod.trim_prompt_cache(prompt_cache, len(draft_tokens) - accepted)
-
-                        # The verified token at position `accepted` is the model's
-                        # own prediction (not a draft). Use it as next y.
-                        last_pred = verify_logits[accepted].argmax()
-                        lp = verify_logits[accepted] - mx.logsumexp(verify_logits[accepted], keepdims=True)
-                        next_y = last_pred
-                        next_logprobs = lp
-                    else:
-                        # All rejected — trim all draft tokens from cache
-                        from mlx_lm.models import cache as cache_mod
-                        cache_mod.trim_prompt_cache(prompt_cache, len(draft_tokens))
-
-                # Start next CPU draft (runs during GPU's next decode step)
+                # Start next CPU draft in background (runs during GPU's next step)
                 _start_cpu_draft(_y_item)
 
             yield _y_item, logprobs
