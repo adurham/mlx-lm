@@ -1074,8 +1074,6 @@ class BatchGenerator:
             Callable[[List[Tuple[int, int, int]]], None]
         ] = None,
         max_kv_size: Optional[int] = None,
-        cpu_draft_fn: Optional[Callable[[int, int], list]] = None,
-        num_draft_tokens: int = 2,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -1092,11 +1090,6 @@ class BatchGenerator:
         self._stats = BatchStats()
         self._next_count = 0
         self.max_kv_size = max_kv_size
-        self.cpu_draft_fn = cpu_draft_fn
-        self.num_draft_tokens = num_draft_tokens
-        self._draft_thread = None
-        self._draft_result = [None]
-        self._draft_started = False
 
         self.active_batch = None
 
