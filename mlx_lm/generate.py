@@ -588,8 +588,9 @@ def generate_step(
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
-    draft_model: nn.Module,
+    draft_model: Optional[nn.Module] = None,
     *,
+    draft_fn: Optional[Callable[[int, int], list]] = None,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
@@ -632,14 +633,23 @@ def speculative_generate_step(
 
     y = prompt.astype(mx.uint32)
     prev_tokens = None
+    _use_draft_fn = draft_fn is not None
 
     # Create the KV cache for generation
-    if prompt_cache is None:
-        model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
+    if _use_draft_fn:
+        # Remote draft: no local draft model/cache needed
+        if prompt_cache is None:
+            model_cache = cache.make_prompt_cache(model)
+        else:
+            model_cache = prompt_cache
+        draft_cache = None
     else:
-        model_cache = prompt_cache[: len(model.layers)]
-        draft_cache = prompt_cache[len(model.layers) :]
+        if prompt_cache is None:
+            model_cache = cache.make_prompt_cache(model)
+            draft_cache = cache.make_prompt_cache(draft_model)
+        else:
+            model_cache = prompt_cache[: len(model.layers)]
+            draft_cache = prompt_cache[len(model.layers) :]
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
@@ -649,6 +659,9 @@ def speculative_generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
     )
+
+    # Track rejected count for remote draft server cache trimming
+    _draft_fn_trim = 0
 
     def _process_and_sample(tokens, logits):
         if logits_processors:
@@ -695,31 +708,65 @@ def speculative_generate_step(
         return y
 
     def _rewind_cache(num_draft, num_accept):
+        nonlocal _draft_fn_trim
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        if _use_draft_fn:
+            # Remote draft server handles its own cache trimming
+            _draft_fn_trim = max(num_draft - num_accept - 1, 0)
+        else:
+            cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
+        nonlocal _draft_fn_trim
         if num_draft == 0:
             return mx.array([], mx.uint32)
-        ys = []
-        for _ in range(num_draft):
-            y, _ = _step(draft_model, draft_cache, y)
-            mx.async_eval(y)
-            ys.append(y)
-        return mx.concatenate(ys)
+        if _use_draft_fn:
+            # Get drafts from remote server (blocking call)
+            token_id = y.item() if y.size == 1 else y[-1].item()
+            drafts = draft_fn(token_id, num_draft, _draft_fn_trim)
+            _draft_fn_trim = 0
+            if not drafts:
+                return mx.array([], mx.uint32)
+            return mx.array(drafts, mx.uint32)
+        else:
+            ys = []
+            for _ in range(num_draft):
+                y, _ = _step(draft_model, draft_cache, y)
+                mx.async_eval(y)
+                ys.append(y)
+            return mx.concatenate(ys)
 
-    with mx.stream(generation_stream):
-        draft_y = _prefill(draft_model, draft_cache, y)
-        y = _prefill(model, model_cache, y)
+    if _use_draft_fn:
+        # Remote draft: only prefill the primary model
+        with mx.stream(generation_stream):
+            y = _prefill(model, model_cache, y)
+    else:
+        with mx.stream(generation_stream):
+            draft_y = _prefill(draft_model, draft_cache, y)
+            y = _prefill(model, model_cache, y)
 
     ntoks = 0
     # Set these so the finally block doesn't raise
     num_draft = 0
     n = 0
+    draft_y = y if not _use_draft_fn else None
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
-            draft_tokens = _draft_generate(draft_y, num_draft)
+            # For draft_fn, pass y (single token); for local draft, pass draft_y
+            draft_input = y if _use_draft_fn else draft_y
+            draft_tokens = _draft_generate(draft_input, num_draft)
+            if draft_tokens.size == 0:
+                # No drafts available — fall back to single-token decode
+                tokens, logprobs = _step(model, model_cache, y, 1)
+                mx.eval(tokens)
+                ntoks += 1
+                yield tokens.item() if tokens.ndim > 0 else tokens, logprobs, False
+                if ntoks == max_tokens:
+                    break
+                y = mx.array([tokens.item() if tokens.ndim > 0 else tokens], mx.uint32)
+                continue
+
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
@@ -745,15 +792,16 @@ def speculative_generate_step(
                 break
 
             y = mx.array([tokens[n]], mx.uint32)
-            draft_y = y
 
-            # If we accepted all the draft tokens, include the last
-            # draft token in the next draft step since it hasn't been
-            # processed yet by the draft model
-            if n == num_draft:
-                draft_y = mx.concatenate(
-                    [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
-                )
+            if not _use_draft_fn:
+                draft_y = y
+                # If we accepted all the draft tokens, include the last
+                # draft token in the next draft step since it hasn't been
+                # processed yet by the draft model
+                if n == num_draft:
+                    draft_y = mx.concatenate(
+                        [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
+                    )
 
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
@@ -768,6 +816,7 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    draft_fn: Optional[Callable[[int, int, int], list]] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -806,7 +855,7 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if draft_model is None and draft_fn is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
@@ -817,7 +866,7 @@ def stream_generate(
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
+            prompt, model, draft_model, draft_fn=draft_fn, **kwargs
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
