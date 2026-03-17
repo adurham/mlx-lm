@@ -1090,6 +1090,7 @@ class BatchGenerator:
         self._stats = BatchStats()
         self._next_count = 0
         self.max_kv_size = max_kv_size
+        self.draft_callback = None  # Called between async_eval and y.tolist()
 
         self.active_batch = None
 
@@ -1400,6 +1401,12 @@ class BatchGenerator:
         )
 
         mx.async_eval(batch.y, batch.logprobs, batch.tokens)
+
+        # CPU draft callback: runs DURING GPU async eval.
+        # The GPU is processing the next step asynchronously.
+        # CPU draft takes ~16ms, GPU takes ~35ms. Draft finishes first.
+        if self.draft_callback is not None and len(batch) == 1:
+            self.draft_callback(y)
 
         y = y.tolist()
         toc = time.perf_counter()
