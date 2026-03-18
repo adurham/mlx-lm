@@ -110,8 +110,12 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
 
 
 def create_attention_mask(
-    N: int, offset: int, return_array: bool, window_size: Optional[int]
+    N: int, offset: int, return_array: bool = False, window_size: Optional[int] = None
 ):
+    if N > 1 and offset >= 1024:
+        # Force array mask for multi-token with long KV cache — the "causal"
+        # string path through sdpa_vector_2pass doesn't handle q_seq > 1 correctly.
+        return create_causal_mask(N, offset, window_size=window_size)
     if window_size is not None:
         return create_causal_mask(N, offset, window_size=window_size)
     elif N == 1:
