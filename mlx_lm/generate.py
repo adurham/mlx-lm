@@ -813,7 +813,8 @@ def speculative_generate_step(
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
             _rewind_cache(num_draft, n)
     finally:
-        _rewind_cache(num_draft, n)
+        # Do NOT rewind here — the main loop already rewinds after each step.
+        # A second rewind would double-trim valid tokens from the cache.
         if _num_exchanges > 0:
             _acc_rate = _total_accepted / _total_drafted * 100 if _total_drafted > 0 else 0
             _avg_accepted = _total_accepted / _num_exchanges
