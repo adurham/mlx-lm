@@ -780,6 +780,12 @@ def speculative_generate_step(
             tokens = tokens.tolist()
             _num_exchanges += 1
             _total_drafted += num_draft
+            if _num_exchanges <= 3 or _num_exchanges % 20 == 0:
+                import logging as _dbg_log
+                _dbg_log.warning(
+                    f"[spec-verify] ex={_num_exchanges} ntoks={ntoks} draft={draft_tokens[:num_draft]} "
+                    f"verify={tokens[:num_draft+1]} matched={sum(1 for d,v in zip(draft_tokens,tokens) if d==v)}/{num_draft}"
+                )
             n = 0
             while n < num_draft:
                 tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
