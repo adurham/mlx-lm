@@ -759,6 +759,7 @@ def speculative_generate_step(
             # For draft_fn, pass y (single token); for local draft, pass draft_y
             draft_input = y if _use_draft_fn else draft_y
             draft_tokens = _draft_generate(draft_input, num_draft)
+            num_draft = draft_tokens.size  # actual count may be less than requested
             if draft_tokens.size == 0:
                 # No drafts available — fall back to single-token decode
                 tokens, logprobs = _step(model, model_cache, y, 1)
