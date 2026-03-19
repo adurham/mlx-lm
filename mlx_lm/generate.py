@@ -780,6 +780,9 @@ def speculative_generate_step(
             tokens = tokens.tolist()
             _num_exchanges += 1
             _total_drafted += num_draft
+            if _num_exchanges <= 3:
+                import logging as _dl
+                _dl.warning(f"[spec] ex={_num_exchanges} draft={draft_tokens[:num_draft]} verify={tokens[:num_draft+1]}")
             n = 0
             while n < num_draft:
                 tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
