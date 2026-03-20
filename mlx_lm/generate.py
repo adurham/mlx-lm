@@ -510,6 +510,11 @@ def generate_step(
             _cache_state.append(mx.zeros((1, 1, hidden_size), dtype=mx.bfloat16))
             set_pipeline_compiled_decode(model, True, _cache_state, _hidden_idx)
 
+            # Non-last rank: skip lm_head (~500MB wasted weight reads per token).
+            # Their logits/sampling are garbage — only last rank's token is used.
+            if _pp_info.rank != _pp_info.world_size - 1:
+                model._skip_lm_head = True  # type: ignore
+
             @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
             def _pp_compiled_compute(y):
                 with mx.stream(generation_stream):
@@ -643,6 +648,7 @@ def generate_step(
                     set_pipeline_compiled_decode(model, False)
                 except ImportError:
                     pass
+                model._skip_lm_head = False  # type: ignore
         if _draft_thread is not None and _draft_thread.is_alive():
             _draft_thread.join(timeout=1.0)
 

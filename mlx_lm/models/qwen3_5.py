@@ -292,6 +292,10 @@ class TextModel(nn.Module):
         input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
         out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        # PP non-last ranks: skip lm_head (500MB+ wasted weight reads).
+        # Their logits are garbage anyway — only last rank has full context.
+        if getattr(self, "_skip_lm_head", False):
+            return out
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
