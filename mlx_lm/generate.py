@@ -489,6 +489,7 @@ def generate_step(
         # Detect pipeline parallelism
         try:
             from exo.worker.engines.mlx.auto_parallel import (
+                get_inner_model,
                 get_pipeline_info,
                 set_pipeline_compiled_decode,
             )
@@ -500,7 +501,9 @@ def generate_step(
 
         if _pp_info is not None:
             # PP compiled decode: separate recv/send from compiled compute
-            hidden_size = model.args.hidden_size  # type: ignore
+            # Get hidden_size robustly — MoE wrappers nest args inside language_model
+            _inner = get_inner_model(model)
+            hidden_size = _inner.embed_tokens.weight.shape[1]  # type: ignore
             _hidden_buf = [mx.zeros((1, 1, hidden_size), dtype=mx.bfloat16)]
             set_pipeline_compiled_decode(model, True, _hidden_buf)
             _compile_state = _cache_state + _hidden_buf
