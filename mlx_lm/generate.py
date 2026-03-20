@@ -539,7 +539,7 @@ def generate_step(
                     mx.eval(sent)
                 gathered = mx.distributed.all_gather(sampled.reshape(1), group=_pp_group)
                 mx.eval(gathered)
-                sampled = gathered[-1]
+                sampled = gathered[-1:]
                 return sampled, logprobs
         else:
             @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
