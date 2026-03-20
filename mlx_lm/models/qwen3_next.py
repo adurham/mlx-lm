@@ -86,15 +86,12 @@ class Qwen3NextAttention(nn.Module):
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(
-            args.hidden_size,
-            self.num_attention_heads * self.head_dim * 2,
-            bias=args.attention_bias,
-        )
+        self._q_dim = self.num_attention_heads * self.head_dim * 2
         self._kv_dim = self.num_key_value_heads * self.head_dim
-        self.kv_proj = nn.Linear(
+        # Fused q+k+v into single dispatch — N=10240 instead of N=8192 + N=2048
+        self.qkv_proj = nn.Linear(
             args.hidden_size,
-            2 * self._kv_dim,
+            self._q_dim + 2 * self._kv_dim,
             bias=args.attention_bias,
         )
         self.o_proj = nn.Linear(
@@ -122,14 +119,14 @@ class Qwen3NextAttention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        q_proj_output = self.q_proj(x)
+        qkv = self.qkv_proj(x)
+        q_proj_output, keys, values = mx.split(
+            qkv, [self._q_dim, self._q_dim + self._kv_dim], axis=-1
+        )
         queries, gate = mx.split(
             q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
         )
         gate = gate.reshape(B, L, -1)
-
-        kv = self.kv_proj(x)
-        keys, values = mx.split(kv, 2, axis=-1)
 
         queries = self.q_norm(queries).transpose(0, 2, 1, 3)
         keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
