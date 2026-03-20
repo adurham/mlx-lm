@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import mlx.core as mx
+
 from .base import BaseModelArgs
 from .qwen3_5 import Model as Qwen3_5Model
 
@@ -37,16 +39,28 @@ class Model(Qwen3_5Model):
             prefix = f"language_model.model.layers.{l}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
             if gate_up_key in new_weights:
-                gate_up = new_weights.pop(gate_up_key)
-                mid = gate_up.shape[-2] // 2
-                new_weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
-                    ..., :mid, :
-                ]
-                new_weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
-                    ..., mid:, :
-                ]
+                # Un-quantized HF weights: keep gate+up fused
+                new_weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = (
+                    new_weights.pop(gate_up_key)
+                )
                 new_weights[f"{prefix}.switch_mlp.down_proj.weight"] = new_weights.pop(
                     f"{prefix}.experts.down_proj"
                 )
+
+            # Pre-quantized MLX weights: fuse separate gate_proj + up_proj
+            # into a single gate_up_proj for one gather_qmm dispatch.
+            # Weight/scales/biases all have output_dims on axis=1:
+            #   weight: (num_experts, output_dims, packed_input)
+            #   scales: (num_experts, output_dims, input_dims/group_size)
+            gate_key = f"{prefix}.switch_mlp.gate_proj"
+            up_key = f"{prefix}.switch_mlp.up_proj"
+            fused_key = f"{prefix}.switch_mlp.gate_up_proj"
+            for suffix in (".weight", ".scales", ".biases"):
+                gk = gate_key + suffix
+                uk = up_key + suffix
+                if gk in new_weights and uk in new_weights:
+                    new_weights[fused_key + suffix] = mx.concatenate(
+                        [new_weights.pop(gk), new_weights.pop(uk)], axis=1
+                    )
 
         return self.language_model.sanitize(new_weights)

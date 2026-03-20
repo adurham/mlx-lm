@@ -20,7 +20,7 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
+from .switch_layers import FusedSwitchGLU, SwitchGLU
 
 
 @dataclass
@@ -317,7 +317,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+        self.switch_mlp = FusedSwitchGLU(dim, intermediate_size, num_experts)
 
         self.shared_expert = Qwen3NextMLP(dim, shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
