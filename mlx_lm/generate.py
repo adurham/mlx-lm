@@ -484,7 +484,7 @@ def generate_step(
 
     # Build compiled decode step AFTER prefill so cache is populated (keys != None)
     _pp_info = None
-    _hidden_buf: list[mx.array] | None = None
+    _hidden_idx = -1
     if _use_compiled_decode:
         # Detect pipeline parallelism
         try:
@@ -500,15 +500,16 @@ def generate_step(
         _cache_state = [c.state for c in prompt_cache]
 
         if _pp_info is not None:
-            # PP compiled decode: separate recv/send from compiled compute
-            # Get hidden_size robustly — MoE wrappers nest args inside language_model
+            # PP compiled decode: separate recv/send from compiled compute.
+            # CRITICAL: pipeline layers must mutate the SAME list that mx.compile
+            # tracks as inputs/outputs. Append hidden buf to _cache_state directly.
             _inner = get_inner_model(model)
             hidden_size = _inner.embed_tokens.weight.shape[1]  # type: ignore
-            _hidden_buf = [mx.zeros((1, 1, hidden_size), dtype=mx.bfloat16)]
-            set_pipeline_compiled_decode(model, True, _hidden_buf)
-            _compile_state = _cache_state + _hidden_buf
+            _hidden_idx = len(_cache_state)
+            _cache_state.append(mx.zeros((1, 1, hidden_size), dtype=mx.bfloat16))
+            set_pipeline_compiled_decode(model, True, _cache_state, _hidden_idx)
 
-            @partial(mx.compile, inputs=_compile_state, outputs=_compile_state)
+            @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
             def _pp_compiled_compute(y):
                 with mx.stream(generation_stream):
                     logits = model(y[None], cache=prompt_cache)
@@ -525,15 +526,15 @@ def generate_step(
             def _compiled_step(y):
                 # Phase 1: Recv hidden state from previous rank
                 if _pp_rank != 0:
-                    received = mx.distributed.recv_like(_hidden_buf[0], _pp_recv_from, group=_pp_group)
+                    received = mx.distributed.recv_like(_cache_state[_hidden_idx], _pp_recv_from, group=_pp_group)
                     mx.eval(received)
-                    _hidden_buf[0] = received
+                    _cache_state[_hidden_idx] = received
                 # Phase 2: Compiled compute (model forward + sampling)
                 sampled, logprobs = _pp_compiled_compute(y)
                 # Phase 3: Send hidden state + all_gather sampled token
-                mx.eval(_hidden_buf[0])
                 if _pp_rank != _pp_world_size - 1:
-                    sent = mx.distributed.send(_hidden_buf[0], (_pp_rank + 1) % _pp_world_size, group=_pp_group)
+                    mx.eval(_cache_state[_hidden_idx])
+                    sent = mx.distributed.send(_cache_state[_hidden_idx], (_pp_rank + 1) % _pp_world_size, group=_pp_group)
                     mx.eval(sent)
                 gathered = mx.distributed.all_gather(sampled.reshape(1), group=_pp_group)
                 mx.eval(gathered)
