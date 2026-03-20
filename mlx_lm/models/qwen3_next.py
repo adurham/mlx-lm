@@ -91,14 +91,10 @@ class Qwen3NextAttention(nn.Module):
             self.num_attention_heads * self.head_dim * 2,
             bias=args.attention_bias,
         )
-        self.k_proj = nn.Linear(
+        self._kv_dim = self.num_key_value_heads * self.head_dim
+        self.kv_proj = nn.Linear(
             args.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            args.hidden_size,
-            self.num_key_value_heads * self.head_dim,
+            2 * self._kv_dim,
             bias=args.attention_bias,
         )
         self.o_proj = nn.Linear(
@@ -132,7 +128,8 @@ class Qwen3NextAttention(nn.Module):
         )
         gate = gate.reshape(B, L, -1)
 
-        keys, values = self.k_proj(x), self.v_proj(x)
+        kv = self.kv_proj(x)
+        keys, values = mx.split(kv, 2, axis=-1)
 
         queries = self.q_norm(queries).transpose(0, 2, 1, 3)
         keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(

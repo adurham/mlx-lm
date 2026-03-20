@@ -358,6 +358,15 @@ class TextModel(nn.Module):
                 if gate_k in weights and up_k in weights:
                     fusions.append((f"{prefix}.gate_up_proj{suffix}", [gate_k, up_k]))
 
+            # Attention: k_proj + v_proj → kv_proj
+            if ".k_proj." in k:
+                suffix = k.split(".k_proj")[-1]
+                prefix = k.split(".k_proj")[0]
+                k_k = f"{prefix}.k_proj{suffix}"
+                v_k = f"{prefix}.v_proj{suffix}"
+                if k_k in weights and v_k in weights:
+                    fusions.append((f"{prefix}.kv_proj{suffix}", [k_k, v_k]))
+
         for fused_key, part_keys in fusions:
             if fused_key not in weights and all(p in weights for p in part_keys):
                 weights[fused_key] = mx.concatenate(
