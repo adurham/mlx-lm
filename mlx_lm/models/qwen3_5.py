@@ -111,12 +111,17 @@ class GatedDeltaNet(nn.Module):
             padding=0,
         )
 
-        self.in_proj_qkv = nn.Linear(
-            self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
+        # Fused input projection: one qmm dispatch instead of four.
+        # Output is split into qkv, z, b, a after the matmul.
+        self._qkv_dim = self.key_dim * 2 + self.value_dim
+        self._z_dim = self.value_dim
+        self._b_dim = self.num_v_heads
+        self._a_dim = self.num_v_heads
+        self.in_proj = nn.Linear(
+            self.hidden_size,
+            self._qkv_dim + self._z_dim + self._b_dim + self._a_dim,
+            bias=False,
         )
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
         self.dt_bias = mx.ones(self.num_v_heads)
 
@@ -140,10 +145,13 @@ class GatedDeltaNet(nn.Module):
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        proj = self.in_proj(inputs)
+        qkv, z, b, a = mx.split(
+            proj,
+            [self._qkv_dim, self._qkv_dim + self._z_dim, self._qkv_dim + self._z_dim + self._b_dim],
+            axis=-1,
+        )
+        z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
@@ -321,6 +329,41 @@ class TextModel(nn.Module):
             if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
+
+        # Fuse projections that share the same input for fewer kernel dispatches.
+        # nn.Linear quantized layout: weight=(out, packed_in), scales=(out, in/gs)
+        # → concatenate on axis=0 (output dimension).
+        fusions = []
+        for k in list(weights.keys()):
+            # DeltaNet: in_proj_qkv + in_proj_z + in_proj_b + in_proj_a → in_proj
+            if ".linear_attn.in_proj_qkv." in k:
+                base = k.replace(".in_proj_qkv.", ".in_proj_")
+                suffix = k.split(".in_proj_qkv")[-1]  # e.g. ".weight"
+                prefix = k.split(".in_proj_qkv")[0]
+                parts = [
+                    f"{prefix}.in_proj_qkv{suffix}",
+                    f"{prefix}.in_proj_z{suffix}",
+                    f"{prefix}.in_proj_b{suffix}",
+                    f"{prefix}.in_proj_a{suffix}",
+                ]
+                if all(p in weights for p in parts):
+                    fusions.append((f"{prefix}.in_proj{suffix}", parts))
+
+            # MLP/shared_expert: gate_proj + up_proj → gate_up_proj
+            if ".gate_proj." in k and ".switch_mlp." not in k:
+                suffix = k.split(".gate_proj")[-1]
+                prefix = k.split(".gate_proj")[0]
+                gate_k = f"{prefix}.gate_proj{suffix}"
+                up_k = f"{prefix}.up_proj{suffix}"
+                if gate_k in weights and up_k in weights:
+                    fusions.append((f"{prefix}.gate_up_proj{suffix}", [gate_k, up_k]))
+
+        for fused_key, part_keys in fusions:
+            if fused_key not in weights and all(p in weights for p in part_keys):
+                weights[fused_key] = mx.concatenate(
+                    [weights.pop(p) for p in part_keys], axis=0
+                )
+
         return weights
 
     @property
