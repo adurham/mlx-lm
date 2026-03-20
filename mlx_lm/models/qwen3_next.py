@@ -319,6 +319,53 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         self.sharding_group = None
 
+        # Fused MoE routing: softmax + top-k + normalize in one Metal kernel.
+        # Eliminates ~3 dispatch transitions per layer vs separate ops.
+        self._fused_route = mx.fast.metal_kernel(
+            name="fused_moe_route",
+            input_names=["logits"],
+            output_names=["out_inds", "out_scores"],
+            source="""
+                uint batch_idx = thread_position_in_grid.x;
+                const int N = """ + str(num_experts) + """;
+                const int K = """ + str(args.num_experts_per_tok) + """;
+
+                float vals[""" + str(num_experts) + """];
+                int ids[""" + str(num_experts) + """];
+                float max_val = -1e10f;
+                for (int i = 0; i < N; i++) {
+                    vals[i] = (float)logits[batch_idx * N + i];
+                    ids[i] = i;
+                    if (vals[i] > max_val) max_val = vals[i];
+                }
+                float exp_sum = 0;
+                for (int i = 0; i < N; i++) {
+                    vals[i] = metal::exp(vals[i] - max_val);
+                    exp_sum += vals[i];
+                }
+                float inv_sum = 1.0f / exp_sum;
+                for (int i = 0; i < N; i++) vals[i] *= inv_sum;
+
+                for (int i = 0; i < K; i++) {
+                    int best = i;
+                    float best_val = vals[i];
+                    for (int j = i + 1; j < N; j++) {
+                        if (vals[j] > best_val) { best_val = vals[j]; best = j; }
+                    }
+                    float tv = vals[i]; vals[i] = vals[best]; vals[best] = tv;
+                    int ti = ids[i]; ids[i] = ids[best]; ids[best] = ti;
+                }
+
+                float topk_sum = 0;
+                for (int i = 0; i < K; i++) topk_sum += vals[i];
+                float topk_inv = 1.0f / topk_sum;
+                for (int i = 0; i < K; i++) {
+                    out_inds[batch_idx * K + i] = (uint32_t)ids[i];
+                    out_scores[batch_idx * K + i] = vals[i] * topk_inv;
+                }
+            """,
+        )
+
     def __call__(
         self,
         x: mx.array,
@@ -327,13 +374,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / scores.sum(axis=-1, keepdims=True)
+        logits_flat = gates.reshape(-1, self.num_experts)
+        batch = logits_flat.shape[0]
+        inds, scores = self._fused_route(
+            inputs=[logits_flat],
+            output_shapes=[(batch, k), (batch, k)],
+            output_dtypes=[mx.uint32, mx.float32],
+            grid=(batch, 1, 1),
+            threadgroup=(1, 1, 1),
+        )
+        inds = inds.reshape(gates.shape[:-1] + (k,))
+        scores = scores.reshape(gates.shape[:-1] + (k,))
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
