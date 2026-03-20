@@ -224,9 +224,7 @@ class FusedSwitchGLU(nn.Module):
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
-        # Always sort — even for small batches, sorted expert access helps
-        # the DRAM prefetcher read weight blocks sequentially.
-        do_sort = indices.size >= 2
+        do_sort = indices.size >= 64
         idx = indices
         inv_order = None
         if do_sort:
