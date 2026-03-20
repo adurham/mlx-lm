@@ -504,7 +504,8 @@ def generate_step(
             # CRITICAL: pipeline layers must mutate the SAME list that mx.compile
             # tracks as inputs/outputs. Append hidden buf to _cache_state directly.
             _inner = get_inner_model(model)
-            hidden_size = _inner.embed_tokens.weight.shape[1]  # type: ignore
+            # Use .dims for QuantizedEmbedding, fall back to weight shape for normal Embedding
+            hidden_size = getattr(_inner.embed_tokens, "dims", _inner.embed_tokens.weight.shape[1])  # type: ignore
             _hidden_idx = len(_cache_state)
             _cache_state.append(mx.zeros((1, 1, hidden_size), dtype=mx.bfloat16))
             set_pipeline_compiled_decode(model, True, _cache_state, _hidden_idx)
