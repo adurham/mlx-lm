@@ -483,22 +483,73 @@ def generate_step(
         _log(f"first _step graph built in {(time.perf_counter() - _t0)*1000:.1f}ms")
 
     # Build compiled decode step AFTER prefill so cache is populated (keys != None)
+    _pp_info = None
+    _hidden_buf: list[mx.array] | None = None
     if _use_compiled_decode:
+        # Detect pipeline parallelism
+        try:
+            from exo.worker.engines.mlx.auto_parallel import (
+                get_pipeline_info,
+                set_pipeline_compiled_decode,
+            )
+            _pp_info = get_pipeline_info(model)
+        except ImportError:
+            _pp_info = None
+
         _cache_state = [c.state for c in prompt_cache]
 
-        @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
-        def _compiled_step(y):
-            with mx.stream(generation_stream):
-                logits = model(y[None], cache=prompt_cache)
-                logits = logits[:, -1, :]
-                logprobs = logits - mx.logsumexp(logits, keepdims=True)
-                sampled = sampler(logprobs)
-                return sampled, logprobs.squeeze(0)
+        if _pp_info is not None:
+            # PP compiled decode: separate recv/send from compiled compute
+            hidden_size = model.args.hidden_size  # type: ignore
+            _hidden_buf = [mx.zeros((1, 1, hidden_size), dtype=mx.bfloat16)]
+            set_pipeline_compiled_decode(model, True, _hidden_buf)
+            _compile_state = _cache_state + _hidden_buf
+
+            @partial(mx.compile, inputs=_compile_state, outputs=_compile_state)
+            def _pp_compiled_compute(y):
+                with mx.stream(generation_stream):
+                    logits = model(y[None], cache=prompt_cache)
+                    logits = logits[:, -1, :]
+                    logprobs = logits - mx.logsumexp(logits, keepdims=True)
+                    sampled = sampler(logprobs)
+                    return sampled, logprobs.squeeze(0)
+
+            _pp_rank = _pp_info.rank
+            _pp_world_size = _pp_info.world_size
+            _pp_group = _pp_info.group
+            _pp_recv_from = _pp_info.recv_from
+
+            def _compiled_step(y):
+                # Phase 1: Recv hidden state from previous rank
+                if _pp_rank != 0:
+                    received = mx.distributed.recv_like(_hidden_buf[0], _pp_recv_from, group=_pp_group)
+                    mx.eval(received)
+                    _hidden_buf[0] = received
+                # Phase 2: Compiled compute (model forward + sampling)
+                sampled, logprobs = _pp_compiled_compute(y)
+                # Phase 3: Send hidden state + all_gather sampled token
+                mx.eval(_hidden_buf[0])
+                if _pp_rank != _pp_world_size - 1:
+                    sent = mx.distributed.send(_hidden_buf[0], (_pp_rank + 1) % _pp_world_size, group=_pp_group)
+                    mx.eval(sent)
+                gathered = mx.distributed.all_gather(sampled.reshape(1), group=_pp_group)
+                mx.eval(gathered)
+                sampled = gathered[-1]
+                return sampled, logprobs
+        else:
+            @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
+            def _compiled_step(y):
+                with mx.stream(generation_stream):
+                    logits = model(y[None], cache=prompt_cache)
+                    logits = logits[:, -1, :]
+                    logprobs = logits - mx.logsumexp(logits, keepdims=True)
+                    sampled = sampler(logprobs)
+                    return sampled, logprobs.squeeze(0)
 
     mx.async_eval(y, logprobs)
     _decode_fn = _compiled_step if _use_compiled_decode else _step
     if _use_compiled_decode:
-        _log("decode: using mx.compile")
+        _log(f"decode: using mx.compile (PP={_pp_info is not None})")
         model._compiled_decode_active = True  # type: ignore
 
     # CPU draft state
@@ -581,6 +632,12 @@ def generate_step(
     finally:
         if _use_compiled_decode:
             model._compiled_decode_active = False  # type: ignore
+            if _pp_info is not None:
+                try:
+                    from exo.worker.engines.mlx.auto_parallel import set_pipeline_compiled_decode
+                    set_pipeline_compiled_decode(model, False)
+                except ImportError:
+                    pass
         if _draft_thread is not None and _draft_thread.is_alive():
             _draft_thread.join(timeout=1.0)
 
