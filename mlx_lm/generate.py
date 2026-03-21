@@ -529,7 +529,12 @@ def generate_step(
             _pp_group = _pp_info.group
             _pp_recv_from = _pp_info.recv_from
 
+            # Speculation measurement: track draft accuracy of rank 0's partial model
+            _spec_match = [0]
+            _spec_total = [0]
+
             def _compiled_step(y):
+                draft_token = None
                 # Phase 1: Recv hidden state from previous rank
                 if _pp_rank != 0:
                     received = mx.distributed.recv_like(_cache_state[_hidden_idx], _pp_recv_from, group=_pp_group)
@@ -542,9 +547,38 @@ def generate_step(
                     mx.eval(_cache_state[_hidden_idx])
                     sent = mx.distributed.send(_cache_state[_hidden_idx], (_pp_rank + 1) % _pp_world_size, group=_pp_group)
                     mx.eval(sent)
+
+                    # === SPECULATION MEASUREMENT (rank 0 only) ===
+                    # Run lm_head on partial hidden state DURING idle wait.
+                    # async_eval lets GPU work while we block on all_gather.
+                    if _trace:
+                        try:
+                            hidden = _inner.norm(_cache_state[_hidden_idx])
+                            _lm = getattr(model, 'language_model', model)
+                            draft_logits = _lm.lm_head(hidden)
+                            draft_token = mx.argmax(draft_logits[:, -1, :], axis=-1)
+                            mx.async_eval(draft_token)
+                        except Exception:
+                            draft_token = None
+
                 gathered = mx.distributed.all_gather(sampled.reshape(1), group=_pp_group)
                 mx.eval(gathered)
                 sampled = gathered[-1:]
+
+                # === Log draft accuracy ===
+                if draft_token is not None and _trace:
+                    try:
+                        real_token = sampled.item()
+                        draft_val = draft_token.item()
+                        _spec_total[0] += 1
+                        if draft_val == real_token:
+                            _spec_match[0] += 1
+                        if _spec_total[0] % 50 == 0:
+                            rate = _spec_match[0] / _spec_total[0] * 100
+                            _log(f"[speculation] draft accuracy: {_spec_match[0]}/{_spec_total[0]} = {rate:.1f}%")
+                    except Exception:
+                        pass
+
                 return sampled, logprobs
         else:
             @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
