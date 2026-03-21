@@ -620,11 +620,10 @@ def generate_step(
 
                     # --- Idle-time speculation: draft + speculative forward during rank 1 compute ---
                     if _pp_spec_enabled:
-                        # Get the real token (from the all_gather that's about to happen)
-                        # We need the real token to feed the draft model.
-                        # But all_gather hasn't happened yet. We must speculate based on
-                        # the token we JUST processed (y), since the draft model predicts
-                        # the NEXT token from the current one.
+                        # Force-eval all cache arrays before uncompiled speculation.
+                        # mx.compile produces lazy output arrays that can't be used
+                        # outside the compile boundary without explicit evaluation.
+                        mx.eval([c.state for c in prompt_cache])
                         _spec_total[0] += 1
                         try:
                             _speculate(y.item())
