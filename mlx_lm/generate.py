@@ -326,6 +326,7 @@ def generate_step(
     num_draft_tokens: int = 2,
     pp_draft_model: Optional[nn.Module] = None,
     pp_draft_cache: Optional[Any] = None,
+    pp_no_compile: bool = False,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -534,6 +535,12 @@ def generate_step(
             # forward. The ~1ms graph-build savings isn't worth the boundary issues.
             if _pp_spec_enabled:
                 _log(f"PP idle-time speculation enabled on rank {_pp_rank}")
+
+            # Skip mx.compile on ALL PP ranks when speculation is active (pp_no_compile).
+            # Compiled decode produces lazy output arrays that poison the KV prefix
+            # cache — rank 1 crashes on the next request when it loads stale compile
+            # artifacts. Cost: ~1ms/step graph-build overhead per rank.
+            if _pp_spec_enabled or pp_no_compile:
                 def _pp_compiled_compute(y):
                     with mx.stream(generation_stream):
                         logits = model(y[None], cache=prompt_cache)
