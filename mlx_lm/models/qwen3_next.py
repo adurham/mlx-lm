@@ -303,8 +303,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 def _make_fused_moe_routing_kernel(num_experts: int, top_k: int):
     """Create a fused softmax+top-k+normalize kernel at module level.
 
-    One dispatch instead of ~4 (softmax, argpartition, take_along_axis, normalize).
-    Selection sort on num_experts values for top_k — single GPU thread per batch element.
+    Uses threadgroup shared memory (not per-thread registers) for the values
+    array, so it scales to any expert count. Softmax is parallelized across
+    a 32-thread simdgroup; selection sort runs on thread 0 over shared memory.
     """
     if not mx.metal.is_available():
         return None
@@ -314,41 +315,62 @@ def _make_fused_moe_routing_kernel(num_experts: int, top_k: int):
         output_names=["out_inds", "out_scores"],
         source=f"""
             uint batch_idx = thread_position_in_grid.x;
+            uint tid = thread_position_in_threadgroup.x;
             const int N = {num_experts};
             const int K = {top_k};
 
-            float vals[{num_experts}];
-            int ids[{num_experts}];
-            float max_val = -1e10f;
-            for (int i = 0; i < N; i++) {{
+            // Use threadgroup memory — no register pressure
+            threadgroup float vals[{num_experts}];
+            threadgroup int ids[{num_experts}];
+
+            // Cooperative load (32 threads each load N/32 values)
+            for (int i = tid; i < N; i += 32) {{
                 vals[i] = (float)logits[batch_idx * N + i];
                 ids[i] = i;
-                if (vals[i] > max_val) max_val = vals[i];
             }}
-            float exp_sum = 0;
-            for (int i = 0; i < N; i++) {{
-                vals[i] = metal::exp(vals[i] - max_val);
-                exp_sum += vals[i];
-            }}
-            float inv_sum = 1.0f / exp_sum;
-            for (int i = 0; i < N; i++) vals[i] *= inv_sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (int i = 0; i < K; i++) {{
-                int best = i;
-                float best_val = vals[i];
-                for (int j = i + 1; j < N; j++) {{
-                    if (vals[j] > best_val) {{ best_val = vals[j]; best = j; }}
+            // Cooperative softmax: parallel max
+            float local_max = -1e10f;
+            for (int i = tid; i < N; i += 32) {{
+                local_max = metal::max(local_max, vals[i]);
+            }}
+            float global_max = simd_max(local_max);
+
+            // Parallel exp + sum
+            float local_sum = 0;
+            for (int i = tid; i < N; i += 32) {{
+                vals[i] = metal::exp(vals[i] - global_max);
+                local_sum += vals[i];
+            }}
+            float global_sum = simd_sum(local_sum);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float inv_sum = 1.0f / global_sum;
+            for (int i = tid; i < N; i += 32) {{
+                vals[i] *= inv_sum;
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Selection sort top-K on thread 0 (operates on threadgroup memory)
+            if (tid == 0) {{
+                for (int i = 0; i < K; i++) {{
+                    int best = i;
+                    float best_val = vals[i];
+                    for (int j = i + 1; j < N; j++) {{
+                        if (vals[j] > best_val) {{ best_val = vals[j]; best = j; }}
+                    }}
+                    float tv = vals[i]; vals[i] = vals[best]; vals[best] = tv;
+                    int ti = ids[i]; ids[i] = ids[best]; ids[best] = ti;
                 }}
-                float tv = vals[i]; vals[i] = vals[best]; vals[best] = tv;
-                int ti = ids[i]; ids[i] = ids[best]; ids[best] = ti;
-            }}
 
-            float topk_sum = 0;
-            for (int i = 0; i < K; i++) topk_sum += vals[i];
-            float topk_inv = 1.0f / topk_sum;
-            for (int i = 0; i < K; i++) {{
-                out_inds[batch_idx * K + i] = ids[i];
-                out_scores[batch_idx * K + i] = vals[i] * topk_inv;
+                float topk_sum = 0;
+                for (int i = 0; i < K; i++) topk_sum += vals[i];
+                float topk_inv = 1.0f / topk_sum;
+                for (int i = 0; i < K; i++) {{
+                    out_inds[batch_idx * K + i] = ids[i];
+                    out_scores[batch_idx * K + i] = vals[i] * topk_inv;
+                }}
             }}
         """,
     )
@@ -356,8 +378,7 @@ def _make_fused_moe_routing_kernel(num_experts: int, top_k: int):
 
 # Module-level kernel creation (JIT-compiled on first use, like gated_delta kernels)
 _fused_moe_route_128_8 = _make_fused_moe_routing_kernel(128, 8)
-# 512 experts requires 512 floats + 512 ints in registers per thread — too large.
-# Fall back to MLX ops for this config.
+_fused_moe_route_512_10 = _make_fused_moe_routing_kernel(512, 10)
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -392,6 +413,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         _kernel = None
         if self.num_experts == 128 and k == 8 and _fused_moe_route_128_8 is not None:
             _kernel = _fused_moe_route_128_8
+        elif self.num_experts == 512 and k == 10 and _fused_moe_route_512_10 is not None:
+            _kernel = _fused_moe_route_512_10
 
         if _kernel is not None:
             logits_flat = gates.reshape(-1, self.num_experts)
@@ -401,7 +424,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 output_shapes=[(batch, k), (batch, k)],
                 output_dtypes=[mx.int32, mx.float32],
                 grid=(batch, 1, 1),
-                threadgroup=(1, 1, 1),
+                threadgroup=(32, 1, 1),
             )
             inds = inds.reshape(gates.shape[:-1] + (k,))
             scores = scores.reshape(gates.shape[:-1] + (k,))
