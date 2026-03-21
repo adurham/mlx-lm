@@ -356,7 +356,8 @@ def _make_fused_moe_routing_kernel(num_experts: int, top_k: int):
 
 # Module-level kernel creation (JIT-compiled on first use, like gated_delta kernels)
 _fused_moe_route_128_8 = _make_fused_moe_routing_kernel(128, 8)
-_fused_moe_route_512_10 = _make_fused_moe_routing_kernel(512, 10)
+# 512 experts requires 512 floats + 512 ints in registers per thread — too large.
+# Fall back to MLX ops for this config.
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -391,8 +392,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         _kernel = None
         if self.num_experts == 128 and k == 8 and _fused_moe_route_128_8 is not None:
             _kernel = _fused_moe_route_128_8
-        elif self.num_experts == 512 and k == 10 and _fused_moe_route_512_10 is not None:
-            _kernel = _fused_moe_route_512_10
 
         if _kernel is not None:
             logits_flat = gates.reshape(-1, self.num_experts)
