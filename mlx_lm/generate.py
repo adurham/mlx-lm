@@ -487,147 +487,69 @@ def generate_step(
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
         _log(f"first _step graph built in {(time.perf_counter() - _t0)*1000:.1f}ms")
 
-    # Build compiled decode step AFTER prefill so cache is populated (keys != None)
+    # Detect pipeline parallelism (independent of compile — PP phase separation
+    # is needed for speculation regardless of whether mx.compile is used).
     _pp_info = None
+    _pp_spec_enabled = False
     _hidden_idx = -1
-    if _use_compiled_decode:
-        # Detect pipeline parallelism
-        try:
-            from exo.worker.engines.mlx.auto_parallel import (
-                get_inner_model,
-                get_pipeline_info,
-                set_pipeline_compiled_decode,
-                set_pipeline_speculative_mode,
-            )
-            _pp_info = get_pipeline_info(model)
-        except ImportError:
-            _pp_info = None
+    try:
+        from exo.worker.engines.mlx.auto_parallel import (
+            get_inner_model,
+            get_pipeline_info,
+            set_pipeline_compiled_decode,
+            set_pipeline_speculative_mode,
+        )
+        _pp_info = get_pipeline_info(model)
+    except ImportError:
+        _pp_info = None
 
+    if _pp_info is not None:
+        # PP detected: use phase-separated decode (recv → compute → send → all_gather).
+        # PipelineLastLayer in _compiled_decode_active mode writes hidden to
+        # _cache_state and returns without send/all_gather — we handle those explicitly.
         _cache_state = [c.state for c in prompt_cache]
+        _inner = get_inner_model(model)
+        hidden_size = getattr(_inner.embed_tokens, "dims", _inner.embed_tokens.weight.shape[1])  # type: ignore
+        _hidden_idx = len(_cache_state)
+        _cache_state.append(mx.zeros((1, 1, hidden_size), dtype=mx.bfloat16))
+        set_pipeline_compiled_decode(model, True, _cache_state, _hidden_idx)
 
-        if _pp_info is not None:
-            _inner = get_inner_model(model)
-            hidden_size = getattr(_inner.embed_tokens, "dims", _inner.embed_tokens.weight.shape[1])  # type: ignore
-            _hidden_idx = len(_cache_state)
-            _cache_state.append(mx.zeros((1, 1, hidden_size), dtype=mx.bfloat16))
-            set_pipeline_compiled_decode(model, True, _cache_state, _hidden_idx)
+        _is_non_last_rank = _pp_info.rank != _pp_info.world_size - 1
+        if _is_non_last_rank:
+            model._skip_lm_head = True  # type: ignore
 
-            _is_non_last_rank = _pp_info.rank != _pp_info.world_size - 1
-            if _is_non_last_rank:
-                model._skip_lm_head = True  # type: ignore
+        _pp_rank = _pp_info.rank
+        _pp_world_size = _pp_info.world_size
+        _pp_group = _pp_info.group
+        _pp_recv_from = _pp_info.recv_from
 
-            _pp_rank = _pp_info.rank
-            _pp_world_size = _pp_info.world_size
-            _pp_group = _pp_info.group
-            _pp_recv_from = _pp_info.recv_from
+        # --- Idle-time speculation state ---
+        _pp_spec_enabled = _is_non_last_rank and pp_draft_model is not None
+        _spec_draft_token: list[int | None] = [None]
+        _spec_snap: list[Any] = [None]
+        _spec_hidden: list[Any] = [None]
+        _spec_accepted = [0]
+        _spec_rejected = [0]
+        _spec_total = [0]
 
-            # --- Idle-time speculation state ---
-            _pp_spec_enabled = _is_non_last_rank and pp_draft_model is not None
-            _spec_draft_token: list[int | None] = [None]
-            _spec_snap: list[Any] = [None]
-            _spec_hidden: list[Any] = [None]
-            _spec_accepted = [0]
-            _spec_rejected = [0]
-            _spec_total = [0]
+        if _pp_spec_enabled:
+            _log(f"PP idle-time speculation enabled on rank {_pp_rank}")
 
-            # When speculation is active, skip mx.compile on rank 0: compile
-            # produces lazy output arrays unusable in the uncompiled speculative
-            # forward. The ~1ms graph-build savings isn't worth the boundary issues.
-            if _pp_spec_enabled:
-                _log(f"PP idle-time speculation enabled on rank {_pp_rank}")
-
-            # Skip mx.compile on ALL PP ranks when speculation is active (pp_no_compile).
-            # Compiled decode produces lazy output arrays that poison the KV prefix
-            # cache — rank 1 crashes on the next request when it loads stale compile
-            # artifacts. Cost: ~1ms/step graph-build overhead per rank.
-            if _pp_spec_enabled or pp_no_compile:
-                def _pp_compiled_compute(y):
-                    with mx.stream(generation_stream):
-                        logits = model(y[None], cache=prompt_cache)
-                        logits = logits[:, -1, :]
-                        logprobs = logits - mx.logsumexp(logits, keepdims=True)
-                        sampled = sampler(logprobs)
-                        return sampled, logprobs.squeeze(0)
-            else:
-                @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
-                def _pp_compiled_compute(y):
-                    with mx.stream(generation_stream):
-                        logits = model(y[None], cache=prompt_cache)
-                        logits = logits[:, -1, :]
-                        logprobs = logits - mx.logsumexp(logits, keepdims=True)
-                        sampled = sampler(logprobs)
-                        return sampled, logprobs.squeeze(0)
-
-            def _speculate(real_token_id: int):
-                _log(f"[spec] draft start tok={real_token_id}")
-                draft_logits = pp_draft_model(mx.array([[real_token_id]]), cache=pp_draft_cache)  # type: ignore
-                mx.eval(draft_logits)
-                draft_tok = int(draft_logits[0, -1].argmax().item())
-                _spec_draft_token[0] = draft_tok
-                _log(f"[spec] draft done pred={draft_tok}, snapshotting")
-                _spec_snap[0] = snapshot_cache(prompt_cache)
-                _log("[spec] spec forward start")
-                set_pipeline_speculative_mode(model, True)
-                model(mx.array([[draft_tok]]), cache=prompt_cache)
-                _spec_hidden[0] = _cache_state[_hidden_idx]
-                set_pipeline_speculative_mode(model, False)
-                _log("[spec] spec forward done")
-
-            def _compiled_step(y):
-                _n = _spec_total[0]
-                # Phase 0: Check previous speculation
-                if _pp_spec_enabled and _spec_draft_token[0] is not None:
-                    real_token_id = y.item()
-                    if real_token_id == _spec_draft_token[0]:
-                        _spec_accepted[0] += 1
-                        _cache_state[_hidden_idx] = _spec_hidden[0]
-                        sampled = y
-                        logprobs = mx.zeros(1)
-                        _log(f"[spec] n={_n} ACCEPT tok={real_token_id}")
-                    else:
-                        _spec_rejected[0] += 1
-                        restore_cache(prompt_cache, _spec_snap[0])
-                        _log(f"[spec] n={_n} REJECT draft={_spec_draft_token[0]} real={real_token_id}")
-                        if _pp_rank != 0:
-                            received = mx.distributed.recv_like(_cache_state[_hidden_idx], _pp_recv_from, group=_pp_group)
-                            mx.eval(received)
-                            _cache_state[_hidden_idx] = received
-                        _log(f"[spec] n={_n} compute start")
-                        sampled, logprobs = _pp_compiled_compute(y)
-                        _log(f"[spec] n={_n} compute done")
-                    _spec_draft_token[0] = None
-                else:
-                    _log(f"[spec] n={_n} normal path")
-                    if _pp_rank != 0:
-                        received = mx.distributed.recv_like(_cache_state[_hidden_idx], _pp_recv_from, group=_pp_group)
-                        mx.eval(received)
-                        _cache_state[_hidden_idx] = received
-                    sampled, logprobs = _pp_compiled_compute(y)
-
-                # Phase 3: Send + speculate + all_gather
-                if _is_non_last_rank:
-                    _log(f"[spec] n={_n} send start")
-                    mx.eval(_cache_state[_hidden_idx])
-                    sent = mx.distributed.send(_cache_state[_hidden_idx], (_pp_rank + 1) % _pp_world_size, group=_pp_group)
-                    mx.eval(sent)
-                    _log(f"[spec] n={_n} send done, speculating")
-                    if _pp_spec_enabled:
-                        _spec_total[0] += 1
-                        try:
-                            _speculate(y.item())
-                        except Exception as e:
-                            _log(f"[spec] ERROR: {e}")
-                            _spec_draft_token[0] = None
-
-                _log(f"[spec] n={_n} all_gather start")
-                gathered = mx.distributed.all_gather(sampled.reshape(1), group=_pp_group)
-                mx.eval(gathered)
-                sampled = gathered[-1:]
-                _log(f"[spec] n={_n} all_gather done tok={sampled.item()}")
-                return sampled, logprobs
-        else:
+        # Compute function: optionally compiled. Skip compile on rank 0 when
+        # speculation is active (compile produces lazy arrays unusable in the
+        # uncompiled speculative forward).
+        _use_pp_compile = _use_compiled_decode and not _pp_spec_enabled and not pp_no_compile
+        if _use_pp_compile:
             @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
-            def _compiled_step(y):
+            def _pp_compute(y):
+                with mx.stream(generation_stream):
+                    logits = model(y[None], cache=prompt_cache)
+                    logits = logits[:, -1, :]
+                    logprobs = logits - mx.logsumexp(logits, keepdims=True)
+                    sampled = sampler(logprobs)
+                    return sampled, logprobs.squeeze(0)
+        else:
+            def _pp_compute(y):
                 with mx.stream(generation_stream):
                     logits = model(y[None], cache=prompt_cache)
                     logits = logits[:, -1, :]
@@ -635,10 +557,89 @@ def generate_step(
                     sampled = sampler(logprobs)
                     return sampled, logprobs.squeeze(0)
 
+        def _speculate(real_token_id: int):
+            _log(f"[spec] draft start tok={real_token_id}")
+            draft_logits = pp_draft_model(mx.array([[real_token_id]]), cache=pp_draft_cache)  # type: ignore
+            mx.eval(draft_logits)
+            draft_tok = int(draft_logits[0, -1].argmax().item())
+            _spec_draft_token[0] = draft_tok
+            _log(f"[spec] draft done pred={draft_tok}, snapshotting")
+            _spec_snap[0] = snapshot_cache(prompt_cache)
+            _log("[spec] spec forward start")
+            set_pipeline_speculative_mode(model, True)
+            model(mx.array([[draft_tok]]), cache=prompt_cache)
+            _spec_hidden[0] = _cache_state[_hidden_idx]
+            set_pipeline_speculative_mode(model, False)
+            _log("[spec] spec forward done")
+
+        def _pp_step(y):
+            _n = _spec_total[0]
+            # Phase 0: Check previous speculation
+            if _pp_spec_enabled and _spec_draft_token[0] is not None:
+                real_token_id = y.item()
+                if real_token_id == _spec_draft_token[0]:
+                    _spec_accepted[0] += 1
+                    _cache_state[_hidden_idx] = _spec_hidden[0]
+                    sampled = y
+                    logprobs = mx.zeros(1)
+                    _log(f"[spec] n={_n} ACCEPT tok={real_token_id}")
+                else:
+                    _spec_rejected[0] += 1
+                    restore_cache(prompt_cache, _spec_snap[0])
+                    _log(f"[spec] n={_n} REJECT draft={_spec_draft_token[0]} real={real_token_id}")
+                    if _pp_rank != 0:
+                        received = mx.distributed.recv_like(_cache_state[_hidden_idx], _pp_recv_from, group=_pp_group)
+                        mx.eval(received)
+                        _cache_state[_hidden_idx] = received
+                    sampled, logprobs = _pp_compute(y)
+                _spec_draft_token[0] = None
+            else:
+                if _pp_rank != 0:
+                    received = mx.distributed.recv_like(_cache_state[_hidden_idx], _pp_recv_from, group=_pp_group)
+                    mx.eval(received)
+                    _cache_state[_hidden_idx] = received
+                sampled, logprobs = _pp_compute(y)
+
+            # Phase 3: Send + speculate + all_gather
+            if _is_non_last_rank:
+                mx.eval(_cache_state[_hidden_idx])
+                sent = mx.distributed.send(_cache_state[_hidden_idx], (_pp_rank + 1) % _pp_world_size, group=_pp_group)
+                mx.eval(sent)
+                if _pp_spec_enabled:
+                    _spec_total[0] += 1
+                    try:
+                        _speculate(y.item())
+                    except Exception as e:
+                        _log(f"[spec] ERROR: {e}")
+                        _spec_draft_token[0] = None
+
+            gathered = mx.distributed.all_gather(sampled.reshape(1), group=_pp_group)
+            mx.eval(gathered)
+            sampled = gathered[-1:]
+            return sampled, logprobs
+
+    # Build compiled decode step for non-PP cases
+    if _use_compiled_decode and _pp_info is None:
+        _cache_state = [c.state for c in prompt_cache]
+        @partial(mx.compile, inputs=_cache_state, outputs=_cache_state)
+        def _compiled_step(y):
+            with mx.stream(generation_stream):
+                logits = model(y[None], cache=prompt_cache)
+                logits = logits[:, -1, :]
+                logprobs = logits - mx.logsumexp(logits, keepdims=True)
+                sampled = sampler(logprobs)
+                return sampled, logprobs.squeeze(0)
+
     mx.async_eval(y, logprobs)
-    _decode_fn = _compiled_step if _use_compiled_decode else _step
-    if _use_compiled_decode:
-        _log(f"decode: using mx.compile (PP={_pp_info is not None})")
+    # Priority: PP step > compiled step > basic step
+    if _pp_info is not None:
+        _decode_fn = _pp_step
+    elif _use_compiled_decode:
+        _decode_fn = _compiled_step
+    else:
+        _decode_fn = _step
+    if _pp_info is not None or _use_compiled_decode:
+        _log(f"decode: PP={_pp_info is not None}, compile={_use_compiled_decode and _pp_info is None}, spec={_pp_spec_enabled}")
         model._compiled_decode_active = True  # type: ignore
 
     # CPU draft state
@@ -719,29 +720,28 @@ def generate_step(
             y, logprobs = next_y, next_logprobs
             n += 1
     finally:
-        if _use_compiled_decode:
-            model._compiled_decode_active = False  # type: ignore
-            if _pp_info is not None:
-                try:
-                    from exo.worker.engines.mlx.auto_parallel import set_pipeline_compiled_decode
-                    set_pipeline_compiled_decode(model, False)
-                except ImportError:
-                    pass
-                model._skip_lm_head = False  # type: ignore
-                # Clean up pending speculation: the last step may have speculatively
-                # advanced rank 0's cache by one token that rank 1 never saw. Restore
-                # from snapshot so both ranks' caches match for KV prefix reuse.
-                if _pp_spec_enabled and _spec_draft_token[0] is not None:
-                    restore_cache(prompt_cache, _spec_snap[0])
-                    _spec_draft_token[0] = None
-                if _pp_spec_enabled and _spec_total[0] > 0:
-                    _rate = _spec_accepted[0] / _spec_total[0] * 100
-                    sys.stderr.write(
-                        f"[pp-spec] {_spec_total[0]} steps, "
-                        f"{_spec_accepted[0]} accepted ({_rate:.1f}%), "
-                        f"{_spec_rejected[0]} rejected\n"
-                    )
-                    sys.stderr.flush()
+        model._compiled_decode_active = False  # type: ignore
+        if _pp_info is not None:
+            try:
+                from exo.worker.engines.mlx.auto_parallel import set_pipeline_compiled_decode
+                set_pipeline_compiled_decode(model, False)
+            except ImportError:
+                pass
+            model._skip_lm_head = False  # type: ignore
+            # Clean up pending speculation: the last step may have speculatively
+            # advanced rank 0's cache by one token that rank 1 never saw. Restore
+            # from snapshot so both ranks' caches match for KV prefix reuse.
+            if _pp_spec_enabled and _spec_draft_token[0] is not None:
+                restore_cache(prompt_cache, _spec_snap[0])
+                _spec_draft_token[0] = None
+            if _pp_spec_enabled and _spec_total[0] > 0:
+                _rate = _spec_accepted[0] / _spec_total[0] * 100
+                sys.stderr.write(
+                    f"[pp-spec] {_spec_total[0]} steps, "
+                    f"{_spec_accepted[0]} accepted ({_rate:.1f}%), "
+                    f"{_spec_rejected[0]} rejected\n"
+                )
+                sys.stderr.flush()
         if _draft_thread is not None and _draft_thread.is_alive():
             _draft_thread.join(timeout=1.0)
 
