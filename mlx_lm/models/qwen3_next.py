@@ -300,6 +300,64 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         return self.out_proj(out.reshape(B, S, -1))
 
 
+def _make_fused_moe_routing_kernel(num_experts: int, top_k: int):
+    """Create a fused softmax+top-k+normalize kernel at module level.
+
+    One dispatch instead of ~4 (softmax, argpartition, take_along_axis, normalize).
+    Selection sort on num_experts values for top_k — single GPU thread per batch element.
+    """
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name=f"fused_moe_route_{num_experts}_{top_k}",
+        input_names=["logits"],
+        output_names=["out_inds", "out_scores"],
+        source=f"""
+            uint batch_idx = thread_position_in_grid.x;
+            const int N = {num_experts};
+            const int K = {top_k};
+
+            float vals[{num_experts}];
+            int ids[{num_experts}];
+            float max_val = -1e10f;
+            for (int i = 0; i < N; i++) {{
+                vals[i] = (float)logits[batch_idx * N + i];
+                ids[i] = i;
+                if (vals[i] > max_val) max_val = vals[i];
+            }}
+            float exp_sum = 0;
+            for (int i = 0; i < N; i++) {{
+                vals[i] = metal::exp(vals[i] - max_val);
+                exp_sum += vals[i];
+            }}
+            float inv_sum = 1.0f / exp_sum;
+            for (int i = 0; i < N; i++) vals[i] *= inv_sum;
+
+            for (int i = 0; i < K; i++) {{
+                int best = i;
+                float best_val = vals[i];
+                for (int j = i + 1; j < N; j++) {{
+                    if (vals[j] > best_val) {{ best_val = vals[j]; best = j; }}
+                }}
+                float tv = vals[i]; vals[i] = vals[best]; vals[best] = tv;
+                int ti = ids[i]; ids[i] = ids[best]; ids[best] = ti;
+            }}
+
+            float topk_sum = 0;
+            for (int i = 0; i < K; i++) topk_sum += vals[i];
+            float topk_inv = 1.0f / topk_sum;
+            for (int i = 0; i < K; i++) {{
+                out_inds[batch_idx * K + i] = ids[i];
+                out_scores[batch_idx * K + i] = vals[i] * topk_inv;
+            }}
+        """,
+    )
+
+
+# Module-level kernel creation (JIT-compiled on first use, like gated_delta kernels)
+_fused_moe_route_128_8 = _make_fused_moe_routing_kernel(128, 8)
+
+
 class Qwen3NextSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -327,13 +385,30 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / scores.sum(axis=-1, keepdims=True)
+        _kernel = _fused_moe_route_128_8 if (
+            self.num_experts == 128 and k == 8 and _fused_moe_route_128_8 is not None
+        ) else None
+
+        if _kernel is not None:
+            logits_flat = gates.reshape(-1, self.num_experts)
+            batch = logits_flat.shape[0]
+            inds, scores = _kernel(
+                inputs=[logits_flat],
+                output_shapes=[(batch, k), (batch, k)],
+                output_dtypes=[mx.int32, mx.float32],
+                grid=(batch, 1, 1),
+                threadgroup=(1, 1, 1),
+            )
+            inds = inds.reshape(gates.shape[:-1] + (k,))
+            scores = scores.reshape(gates.shape[:-1] + (k,))
+        else:
+            gates = mx.softmax(gates, axis=-1, precise=True)
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            if self.norm_topk_prob:
+                scores = scores / scores.sum(axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
