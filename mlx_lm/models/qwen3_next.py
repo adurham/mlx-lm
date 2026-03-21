@@ -311,67 +311,67 @@ def _make_fused_moe_routing_kernel(num_experts: int, top_k: int):
         return None
     return mx.fast.metal_kernel(
         name=f"fused_moe_route_{num_experts}_{top_k}",
-        input_names=["logits"],
+        input_names=["logits", "params"],
         output_names=["out_inds", "out_scores"],
-        source=f"""
+        source="""
             uint batch_idx = thread_position_in_grid.x;
             uint tid = thread_position_in_threadgroup.x;
-            const int N = {num_experts};
-            const int K = {top_k};
+            // Runtime constants — prevents Metal compiler from unrolling
+            const int N = (int)params[0];
+            const int K = (int)params[1];
 
-            // Use threadgroup memory — no register pressure
-            threadgroup float vals[{num_experts}];
-            threadgroup int ids[{num_experts}];
+            // Threadgroup memory for cooperative processing
+            threadgroup float vals[""" + str(num_experts) + """];
+            threadgroup int ids[""" + str(num_experts) + """];
 
-            // Cooperative load (32 threads each load N/32 values)
-            for (int i = tid; i < N; i += 32) {{
+            // Cooperative load
+            for (int i = tid; i < N; i += 32) {
                 vals[i] = (float)logits[batch_idx * N + i];
                 ids[i] = i;
-            }}
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Cooperative softmax: parallel max
+            // Cooperative softmax
             float local_max = -1e10f;
-            for (int i = tid; i < N; i += 32) {{
+            for (int i = tid; i < N; i += 32) {
                 local_max = metal::max(local_max, vals[i]);
-            }}
+            }
             float global_max = simd_max(local_max);
 
-            // Parallel exp + sum
             float local_sum = 0;
-            for (int i = tid; i < N; i += 32) {{
+            for (int i = tid; i < N; i += 32) {
                 vals[i] = metal::exp(vals[i] - global_max);
                 local_sum += vals[i];
-            }}
+            }
             float global_sum = simd_sum(local_sum);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             float inv_sum = 1.0f / global_sum;
-            for (int i = tid; i < N; i += 32) {{
+            for (int i = tid; i < N; i += 32) {
                 vals[i] *= inv_sum;
-            }}
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Selection sort top-K on thread 0 (operates on threadgroup memory)
-            if (tid == 0) {{
-                for (int i = 0; i < K; i++) {{
+            // Selection sort top-K on thread 0
+            if (tid == 0) {
+                for (int i = 0; i < K; i++) {
                     int best = i;
                     float best_val = vals[i];
-                    for (int j = i + 1; j < N; j++) {{
-                        if (vals[j] > best_val) {{ best_val = vals[j]; best = j; }}
-                    }}
+                    for (int j = i + 1; j < N; j++) {
+                        if (vals[j] > best_val) { best_val = vals[j]; best = j; }
+                    }
                     float tv = vals[i]; vals[i] = vals[best]; vals[best] = tv;
                     int ti = ids[i]; ids[i] = ids[best]; ids[best] = ti;
-                }}
+                }
 
                 float topk_sum = 0;
                 for (int i = 0; i < K; i++) topk_sum += vals[i];
                 float topk_inv = 1.0f / topk_sum;
-                for (int i = 0; i < K; i++) {{
+                for (int i = 0; i < K; i++) {
                     out_inds[batch_idx * K + i] = ids[i];
                     out_scores[batch_idx * K + i] = vals[i] * topk_inv;
-                }}
-            }}
+                }
+            }
         """,
     )
 
@@ -419,8 +419,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if _kernel is not None:
             logits_flat = gates.reshape(-1, self.num_experts)
             batch = logits_flat.shape[0]
+            params = mx.array([self.num_experts, k], dtype=mx.float32)
             inds, scores = _kernel(
-                inputs=[logits_flat],
+                inputs=[logits_flat, params],
                 output_shapes=[(batch, k), (batch, k)],
                 output_dtypes=[mx.int32, mx.float32],
                 grid=(batch, 1, 1),
