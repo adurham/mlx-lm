@@ -109,6 +109,17 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def snapshot_cache(cache: List[Any]) -> List[Any]:
+    """Save per-layer snapshots for rollback."""
+    return [c.snapshot() for c in cache]
+
+
+def restore_cache(cache: List[Any], snaps: List[Any]):
+    """Restore all layers from snapshots."""
+    for c, s in zip(cache, snaps):
+        c.restore(s)
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool = False, window_size: Optional[int] = None
 ):
@@ -327,6 +338,16 @@ class KVCache(_BaseCache):
         self.keys = None
         self.values = None
         self.offset = 0
+
+    def snapshot(self):
+        """Save offset for rollback. KV data is written in-place to pre-allocated
+        buffers; decrementing offset effectively discards the speculative entries
+        (they're masked out by the attention mask)."""
+        return self.offset
+
+    def restore(self, snap):
+        """Restore offset from snapshot."""
+        self.offset = snap
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
@@ -601,6 +622,16 @@ class ArraysCache(_BaseCache):
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
+    def snapshot(self):
+        """Save references to current state arrays. gated_delta_update and conv1d
+        create NEW arrays each step (no in-place mutation), so the originals in
+        the snapshot survive unmodified."""
+        return list(self.cache)
+
+    def restore(self, snap):
+        """Restore from snapshot."""
+        self.cache = snap
+
     def __setitem__(self, idx, value):
         self.cache[idx] = value
 
@@ -776,6 +807,13 @@ class CacheList(_BaseCache):
         for c in self.caches:
             m = c.trim(n)
         return m
+
+    def snapshot(self):
+        return [c.snapshot() for c in self.caches]
+
+    def restore(self, snap):
+        for c, s in zip(self.caches, snap):
+            c.restore(s)
 
     @property
     def state(self):
