@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import os
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -334,10 +335,18 @@ class QuantizedKVCache(_BaseCache):
 class KVCache(_BaseCache):
     step = 256
 
-    def __init__(self):
+    # Pre-allocate KV buffers to this many tokens on first use to avoid
+    # mx.concatenate growth.  Each concat leaks the old buffer in MLX's
+    # Metal allocator (2× memory).  Set via EXO_KV_CACHE_PRE_SIZE or
+    # the pre_size constructor arg.  Falls back to incremental step=256
+    # growth when unset (0).
+    _default_pre_size: int = int(os.environ.get("EXO_KV_CACHE_PRE_SIZE", "0"))
+
+    def __init__(self, pre_size: int | None = None):
         self.keys = None
         self.values = None
         self.offset = 0
+        self._pre_size = pre_size if pre_size is not None else self._default_pre_size
 
     def snapshot(self):
         return self.offset
@@ -350,9 +359,15 @@ class KVCache(_BaseCache):
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
-            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            if self.keys is None and self._pre_size > 0:
+                # First allocation: pre-allocate to target size to avoid
+                # future concat (which leaks old buffers in MLX Metal).
+                alloc_size = max(self._pre_size, keys.shape[2])
+            else:
+                n_steps = (self.step + keys.shape[2] - 1) // self.step
+                alloc_size = n_steps * self.step
+            k_shape = (B, n_kv_heads, alloc_size, k_head_dim)
+            v_shape = (B, n_kv_heads, alloc_size, v_head_dim)
             new_k = mx.zeros(k_shape, keys.dtype)
             new_v = mx.zeros(v_shape, values.dtype)
             if self.keys is not None:
