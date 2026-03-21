@@ -714,6 +714,8 @@ def generate_step(
                 # Start next CPU draft in background (runs during GPU's next step)
                 _start_cpu_draft(_y_item)
 
+            if _pp_info is not None and n < 10:
+                _log(f"[generate_step] yield n={n} tok={_y_item}")
             yield _y_item, logprobs
             if n % 256 == 0:
                 mx.clear_cache()
@@ -1058,6 +1060,8 @@ def stream_generate(
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
             if token in tokenizer.eos_token_ids:
+                sys.stderr.write(f"[stream_generate] EOS hit: token={token}, eos_ids={tokenizer.eos_token_ids}\n")
+                sys.stderr.flush()
                 break
 
             detokenizer.add_token(token)
