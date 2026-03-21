@@ -378,7 +378,8 @@ def _make_fused_moe_routing_kernel(num_experts: int, top_k: int):
 
 # Module-level kernel creation (JIT-compiled on first use, like gated_delta kernels)
 _fused_moe_route_128_8 = _make_fused_moe_routing_kernel(128, 8)
-_fused_moe_route_512_10 = _make_fused_moe_routing_kernel(512, 10)
+# 512-expert kernel: Metal compiler hangs on large threadgroup arrays + selection sort.
+# Fall back to MLX ops for num_experts > 256.
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -410,31 +411,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         gates = self.gate(x)
 
         k = self.top_k
-        _kernel = None
-        if self.num_experts == 128 and k == 8 and _fused_moe_route_128_8 is not None:
-            _kernel = _fused_moe_route_128_8
-        elif self.num_experts == 512 and k == 10 and _fused_moe_route_512_10 is not None:
-            _kernel = _fused_moe_route_512_10
+        gates = mx.softmax(gates, axis=-1, precise=True)
 
-        if _kernel is not None:
-            logits_flat = gates.reshape(-1, self.num_experts)
-            batch = logits_flat.shape[0]
-            params = mx.array([self.num_experts, k], dtype=mx.float32)
-            inds, scores = _kernel(
-                inputs=[logits_flat, params],
-                output_shapes=[(batch, k), (batch, k)],
-                output_dtypes=[mx.int32, mx.float32],
-                grid=(batch, 1, 1),
-                threadgroup=(32, 1, 1),
-            )
-            inds = inds.reshape(gates.shape[:-1] + (k,))
-            scores = scores.reshape(gates.shape[:-1] + (k,))
-        else:
-            gates = mx.softmax(gates, axis=-1, precise=True)
-            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-            scores = mx.take_along_axis(gates, inds, axis=-1)
-            if self.norm_topk_prob:
-                scores = scores / scores.sum(axis=-1, keepdims=True)
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
