@@ -647,8 +647,9 @@ def generate_step(
                     _update_adaptive_k(True)
                     _K_actual = len(draft_tokens)
                     _log(f"[spec-k] n={_n} ACCEPT d1={real_token_id} K={_K_actual}")
-                    if _pp_draft_k == 1:
-                        # K=1 fast path: use pre-computed hidden, skip compute
+                    if _K_actual == 1:
+                        # K=1 fast path (static K=1 or adaptive eff_k=1):
+                        # use pre-computed hidden, skip batch verify entirely
                         _k1_accepted = True
                         _cache_state[_hidden_idx] = _spec_hiddens[0]
                         sampled = y
