@@ -523,17 +523,21 @@ def generate_step(
         _pp_group = _pp_info.group
         _pp_recv_from = _pp_info.recv_from
 
-        # --- Idle-time speculation state ---
+        # --- Idle-time speculation state (K>=1) ---
+        _pp_draft_k = int(os.environ.get("EXO_PP_DRAFT_K", "1"))
         _pp_spec_enabled = _is_non_last_rank and pp_draft_model is not None
-        _spec_draft_token: list[int | None] = [None]
-        _spec_snap: list[Any] = [None]
-        _spec_hidden: list[Any] = [None]
+        _spec_draft_tokens: list[list[int] | None] = [None]   # K draft token IDs
+        _spec_snap: list[Any] = [None]                         # main cache snapshot
+        _spec_draft_snap: list[Any] = [None]                   # draft cache snapshot
+        _spec_hiddens: list[mx.array | None] = [None]          # (1, K, H) hidden states
         _spec_accepted = [0]
         _spec_rejected = [0]
         _spec_total = [0]
+        _spec_token_buffer: list[tuple[int, mx.array]] = []    # extra tokens from K>1
+        _next_rank = (_pp_rank + 1) % _pp_world_size
 
         if _pp_spec_enabled:
-            _log(f"PP idle-time speculation enabled on rank {_pp_rank}")
+            _log(f"PP idle-time speculation enabled on rank {_pp_rank}, K={_pp_draft_k}")
 
         # Compute function: optionally compiled. Skip compile on rank 0 when
         # speculation is active (compile produces lazy arrays unusable in the
@@ -557,45 +561,190 @@ def generate_step(
                     sampled = sampler(logprobs)
                     return sampled, logprobs.squeeze(0)
 
-        def _speculate(real_token_id: int):
-            _log(f"[spec] draft start tok={real_token_id}")
+        def _speculate_k(real_token_id: int):
+            """Draft K tokens and batch-forward through rank 0's layers."""
+            K = _pp_draft_k
+            _log(f"[spec-k] draft K={K} from tok={real_token_id}")
+            # First draft call: process real_token_id (= current y) through draft model
             draft_logits = pp_draft_model(mx.array([[real_token_id]]), cache=pp_draft_cache)  # type: ignore
             mx.eval(draft_logits)
-            draft_tok = int(draft_logits[0, -1].argmax().item())
-            _spec_draft_token[0] = draft_tok
-            _log(f"[spec] draft done pred={draft_tok}, snapshotting")
+            tok = int(draft_logits[0, -1].argmax().item())
+            draft_tokens: list[int] = [tok]  # d1
+            # Snapshot draft cache AFTER processing real_token_id — aligns with
+            # main cache snapshot (also taken after real_token_id was processed).
+            _spec_draft_snap[0] = snapshot_cache(pp_draft_cache)  # type: ignore
+            # Continue drafting d2..dK
+            for _ in range(K - 1):
+                draft_logits = pp_draft_model(mx.array([[tok]]), cache=pp_draft_cache)  # type: ignore
+                mx.eval(draft_logits)
+                tok = int(draft_logits[0, -1].argmax().item())
+                draft_tokens.append(tok)
+            _log(f"[spec-k] drafted {draft_tokens}")
+            # Snapshot main cache before speculative forward
             _spec_snap[0] = snapshot_cache(prompt_cache)
-            _log("[spec] spec forward start")
+            # Batch-forward all K tokens through rank 0's layers (speculative mode = no send)
             set_pipeline_speculative_mode(model, True)
-            model(mx.array([[draft_tok]]), cache=prompt_cache)
-            _spec_hidden[0] = _cache_state[_hidden_idx]
+            model(mx.array([draft_tokens]), cache=prompt_cache)
+            _spec_hiddens[0] = _cache_state[_hidden_idx]  # (1, K, H)
             set_pipeline_speculative_mode(model, False)
-            _log("[spec] spec forward done")
+            _spec_draft_tokens[0] = draft_tokens
+            _log("[spec-k] done")
 
         def _pp_step(y):
             _n = _spec_total[0]
-            # Phase 0: Check previous speculation
-            if _pp_spec_enabled and _spec_draft_token[0] is not None:
+
+            # --- Buffer drain: return buffered tokens from K>1 (no distributed comms) ---
+            if _spec_token_buffer:
+                tok_id, tok_lp = _spec_token_buffer.pop(0)
+                return mx.array([tok_id]), tok_lp
+
+            # --- Phase 0: Check previous speculation ---
+            _batch_verify = False
+            _k1_accepted = False
+            draft_tokens: list[int] = []
+
+            if _pp_spec_enabled and _spec_draft_tokens[0] is not None:
                 real_token_id = y.item()
-                if real_token_id == _spec_draft_token[0]:
+                draft_tokens = _spec_draft_tokens[0]
+                _spec_draft_tokens[0] = None
+
+                if real_token_id == draft_tokens[0]:
                     _spec_accepted[0] += 1
-                    _cache_state[_hidden_idx] = _spec_hidden[0]
-                    sampled = y
-                    logprobs = mx.zeros(1)
-                    _log(f"[spec] n={_n} ACCEPT tok={real_token_id}")
+                    _log(f"[spec-k] n={_n} ACCEPT d1={real_token_id} K={_pp_draft_k}")
+                    if _pp_draft_k == 1:
+                        # K=1 fast path: use pre-computed hidden, skip compute
+                        _k1_accepted = True
+                        _cache_state[_hidden_idx] = _spec_hiddens[0]
+                        sampled = y
+                        logprobs = mx.zeros(1)
+                    else:
+                        _batch_verify = True
                 else:
                     _spec_rejected[0] += 1
                     restore_cache(prompt_cache, _spec_snap[0])
-                    _log(f"[spec] n={_n} REJECT draft={_spec_draft_token[0]} real={real_token_id}")
-                    if _pp_rank != 0:
-                        received = mx.distributed.recv_like(_cache_state[_hidden_idx], _pp_recv_from, group=_pp_group)
-                        mx.eval(received)
-                        _cache_state[_hidden_idx] = received
-                    sampled, logprobs = _pp_compute(y)
-                _spec_draft_token[0] = None
-            else:
+                    if _spec_draft_snap[0] is not None:
+                        restore_cache(pp_draft_cache, _spec_draft_snap[0])  # type: ignore
+                    _log(f"[spec-k] n={_n} REJECT d1={draft_tokens[0]} real={real_token_id}")
+
+            # --- K>1 header exchange: tell rank 1 whether this is batch verify or normal ---
+            if _pp_draft_k > 1:
+                if _is_non_last_rank:
+                    if _batch_verify:
+                        header = mx.array([_pp_draft_k] + draft_tokens, dtype=mx.int32)
+                    else:
+                        header = mx.zeros(_pp_draft_k + 1, dtype=mx.int32)
+                    sent = mx.distributed.send(header, _next_rank, group=_pp_group)
+                    mx.eval(sent)
+                else:
+                    header = mx.distributed.recv_like(
+                        mx.zeros(_pp_draft_k + 1, dtype=mx.int32), _pp_recv_from, group=_pp_group
+                    )
+                    mx.eval(header)
+                    _batch_verify = int(header[0].item()) > 0
+                    if _batch_verify:
+                        draft_tokens = [int(header[i + 1].item()) for i in range(_pp_draft_k)]
+
+            # =================================================================
+            # PATH A: K>1 batch verify
+            # =================================================================
+            if _batch_verify:
+                K = _pp_draft_k
+
+                if _is_non_last_rank:
+                    # Rank 0: send K hidden states to rank 1
+                    _cache_state[_hidden_idx] = _spec_hiddens[0]  # (1, K, H)
+                    mx.eval(_cache_state[_hidden_idx])
+                    sent = mx.distributed.send(_cache_state[_hidden_idx], _next_rank, group=_pp_group)
+                    mx.eval(sent)
+                    # Rank 0 placeholder for all_gather
+                    r_result = mx.zeros(2, dtype=mx.int32)
+                else:
+                    # Rank 1: receive K hidden states and batch-verify
+                    hidden_template = mx.zeros((1, K, hidden_size), dtype=mx.bfloat16)
+                    received_hiddens = mx.distributed.recv_like(hidden_template, _pp_recv_from, group=_pp_group)
+                    mx.eval(received_hiddens)
+
+                    # Snapshot rank 1's cache before batch forward
+                    snap_r1 = snapshot_cache(prompt_cache)
+
+                    # Process K tokens through rank 1's layers (batch SDPA!)
+                    _cache_state[_hidden_idx] = received_hiddens
+                    logits_all = model(mx.array([draft_tokens]), cache=prompt_cache)  # (1, K, vocab)
+                    mx.eval(logits_all)
+
+                    # Verify: target's prediction at position i should match draft[i+1]
+                    num_accepted = K
+                    bonus = int(logits_all[0, K - 1].argmax().item())
+                    for i in range(K - 1):
+                        predicted = int(logits_all[0, i].argmax().item())
+                        if predicted != draft_tokens[i + 1]:
+                            num_accepted = i + 1
+                            bonus = predicted
+                            break
+
+                    _log(f"[spec-k] VERIFY {num_accepted}/{K} accepted, bonus={bonus}")
+
+                    # Rollback rank 1's cache on partial acceptance
+                    if num_accepted < K:
+                        restore_cache(prompt_cache, snap_r1)
+                        if num_accepted > 0:
+                            _cache_state[_hidden_idx] = received_hiddens[:, :num_accepted, :]
+                            model(mx.array([draft_tokens[:num_accepted]]), cache=prompt_cache)
+                            mx.eval([c.state for c in prompt_cache])
+
+                    r_result = mx.array([num_accepted, bonus], dtype=mx.int32)
+
+                # All_gather: rank 1 sends [num_accepted, bonus]
+                gathered = mx.distributed.all_gather(r_result.reshape(2), group=_pp_group)
+                mx.eval(gathered)
+                r1_data = gathered[-2:]
+                num_accepted = int(r1_data[0].item())
+                bonus = int(r1_data[1].item())
+                _log(f"[spec-k] result: {num_accepted}/{K} accepted, bonus={bonus}")
+
+                # Rank 0: rollback main cache + fix draft cache
+                if _is_non_last_rank:
+                    if num_accepted < K:
+                        restore_cache(prompt_cache, _spec_snap[0])
+                        if num_accepted > 0:
+                            set_pipeline_speculative_mode(model, True)
+                            model(mx.array([draft_tokens[:num_accepted]]), cache=prompt_cache)
+                            set_pipeline_speculative_mode(model, False)
+                            mx.eval([c.state for c in prompt_cache])
+                    # Fix draft cache to match main cache (both at: y + accepted drafts).
+                    # Draft snapshot was taken AFTER y, so restore puts us at y.
+                    # DON'T add bonus — it's processed by next _speculate_k.
+                    if num_accepted < K:
+                        # Partial: restore to after-y, re-process accepted tokens
+                        restore_cache(pp_draft_cache, _spec_draft_snap[0])  # type: ignore
+                        for tok in draft_tokens[:num_accepted]:
+                            pp_draft_model(mx.array([[tok]]), cache=pp_draft_cache)  # type: ignore
+                    else:
+                        # Full: draft cache has y, d1..d_{K-1}. Add d_K (last prediction).
+                        pp_draft_model(mx.array([[draft_tokens[-1]]]), cache=pp_draft_cache)  # type: ignore
+                    mx.eval([c.state for c in pp_draft_cache])  # type: ignore
+
+                # Reset hidden state to (1,1,H) so next step's recv_like gets the right shape
+                _cache_state[_hidden_idx] = mx.zeros((1, 1, hidden_size), dtype=mx.bfloat16)
+
+                # Populate token buffer with intermediate accepted drafts (d2..d_{num_accepted}).
+                # d1 is already the current y (yielded by generator as previous token).
+                # bonus becomes next_y → yielded in the NEXT generator iteration.
+                # Buffer is drained between yielding d1 and yielding bonus.
+                # Order: d1, [d2, d3, ...], bonus, next_real_token, ...
+                for i in range(1, num_accepted):
+                    _spec_token_buffer.append((draft_tokens[i], mx.zeros(1)))
+
+                return mx.array([bonus]), mx.zeros(1)
+
+            # =================================================================
+            # PATH B: Normal step (K=1 reject/no-spec, or K>1 reject/no-spec)
+            # =================================================================
+            if not _k1_accepted:
                 if _pp_rank != 0:
-                    received = mx.distributed.recv_like(_cache_state[_hidden_idx], _pp_recv_from, group=_pp_group)
+                    received = mx.distributed.recv_like(
+                        _cache_state[_hidden_idx], _pp_recv_from, group=_pp_group
+                    )
                     mx.eval(received)
                     _cache_state[_hidden_idx] = received
                 sampled, logprobs = _pp_compute(y)
@@ -603,19 +752,27 @@ def generate_step(
             # Phase 3: Send + speculate + all_gather
             if _is_non_last_rank:
                 mx.eval(_cache_state[_hidden_idx])
-                sent = mx.distributed.send(_cache_state[_hidden_idx], (_pp_rank + 1) % _pp_world_size, group=_pp_group)
+                sent = mx.distributed.send(_cache_state[_hidden_idx], _next_rank, group=_pp_group)
                 mx.eval(sent)
                 if _pp_spec_enabled:
                     _spec_total[0] += 1
                     try:
-                        _speculate(y.item())
+                        _speculate_k(y.item())
                     except Exception as e:
-                        _log(f"[spec] ERROR: {e}")
-                        _spec_draft_token[0] = None
+                        _log(f"[spec-k] ERROR: {e}")
+                        _spec_draft_tokens[0] = None
 
-            gathered = mx.distributed.all_gather(sampled.reshape(1), group=_pp_group)
-            mx.eval(gathered)
-            sampled = gathered[-1:]
+            if _pp_draft_k > 1:
+                # K>1: all_gather 2 values — [0, sampled_token]
+                s_val = int(sampled.item()) if not _k1_accepted else 0
+                r_result = mx.array([0, s_val], dtype=mx.int32)
+                gathered = mx.distributed.all_gather(r_result.reshape(2), group=_pp_group)
+                mx.eval(gathered)
+                sampled = gathered[-1:]  # rank 1's token
+            else:
+                gathered = mx.distributed.all_gather(sampled.reshape(1), group=_pp_group)
+                mx.eval(gathered)
+                sampled = gathered[-1:]
             return sampled, logprobs
 
     # Build compiled decode step for non-PP cases
@@ -717,10 +874,20 @@ def generate_step(
             if _pp_info is not None and n < 10:
                 _log(f"[generate_step] yield n={n} tok={_y_item}")
             yield _y_item, logprobs
+            n += 1
+            # Drain K>1 token buffer (accepted drafts + bonus from batch verify)
+            if _pp_info is not None and _spec_token_buffer:
+                for _buf_tok, _buf_lp in _spec_token_buffer:
+                    if n == max_tokens:
+                        break
+                    if _pp_info is not None and n < 10:
+                        _log(f"[generate_step] yield n={n} tok={_buf_tok} (buffer)")
+                    yield _buf_tok, _buf_lp
+                    n += 1
+                _spec_token_buffer.clear()
             if n % 256 == 0:
                 mx.clear_cache()
             y, logprobs = next_y, next_logprobs
-            n += 1
     finally:
         model._compiled_decode_active = False  # type: ignore
         if _pp_info is not None:
@@ -731,15 +898,16 @@ def generate_step(
                 pass
             model._skip_lm_head = False  # type: ignore
             # Clean up pending speculation: the last step may have speculatively
-            # advanced rank 0's cache by one token that rank 1 never saw. Restore
+            # advanced rank 0's cache by K tokens that rank 1 never saw. Restore
             # from snapshot so both ranks' caches match for KV prefix reuse.
-            if _pp_spec_enabled and _spec_draft_token[0] is not None:
+            if _pp_spec_enabled and _spec_draft_tokens[0] is not None:
                 restore_cache(prompt_cache, _spec_snap[0])
-                _spec_draft_token[0] = None
+                _spec_draft_tokens[0] = None
+            _spec_token_buffer.clear()
             if _pp_spec_enabled and _spec_total[0] > 0:
                 _rate = _spec_accepted[0] / _spec_total[0] * 100
                 sys.stderr.write(
-                    f"[pp-spec] {_spec_total[0]} steps, "
+                    f"[pp-spec] K={_pp_draft_k}, {_spec_total[0]} steps, "
                     f"{_spec_accepted[0]} accepted ({_rate:.1f}%), "
                     f"{_spec_rejected[0]} rejected\n"
                 )
