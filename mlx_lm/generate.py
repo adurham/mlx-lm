@@ -777,19 +777,20 @@ def generate_step(
                         # Optimistic MISS or partial accept — undo optimistic speculation
                         if _optimistic:
                             _spec_draft_tokens[0] = None
-                        # Clear orig_snap — speculation is fully resolved, nothing to undo
-                        _orig_snap[0] = None
-                        _orig_draft_snap[0] = None
+
+                        # Use _orig_snap if optimistic overwrote _spec_snap, else _spec_snap
+                        _rollback_snap = _orig_snap[0] if _orig_snap[0] is not None else _spec_snap[0]
+                        _rollback_draft = _orig_draft_snap[0] if _orig_draft_snap[0] is not None else _spec_draft_snap[0]
 
                         if num_accepted < K:
-                            # Partial: rollback to ORIGINAL snapshot (before d1..dK)
-                            restore_cache(prompt_cache, _orig_snap[0])
+                            # Partial: rollback to pre-d1..dK snapshot
+                            restore_cache(prompt_cache, _rollback_snap)
                             if num_accepted > 0:
                                 set_pipeline_speculative_mode(model, True)
                                 model(mx.array([draft_tokens[:num_accepted]]), cache=prompt_cache)
                                 set_pipeline_speculative_mode(model, False)
                                 mx.eval([c.state for c in prompt_cache])
-                            restore_cache(pp_draft_cache, _orig_draft_snap[0])  # type: ignore
+                            restore_cache(pp_draft_cache, _rollback_draft)  # type: ignore
                             for tok in draft_tokens[:num_accepted]:
                                 pp_draft_model(mx.array([[tok]]), cache=pp_draft_cache)  # type: ignore
                         else:
@@ -800,6 +801,10 @@ def generate_step(
                             else:
                                 pp_draft_model(mx.array([[draft_tokens[-1]]]), cache=pp_draft_cache)  # type: ignore
                         mx.eval([c.state for c in pp_draft_cache])  # type: ignore
+
+                        # Clear orig_snap — speculation is fully resolved
+                        _orig_snap[0] = None
+                        _orig_draft_snap[0] = None
 
                 _log(f"[spec-k] result: {num_accepted}/{K}, bonus={bonus}, opt={'HIT' if (_optimistic and num_accepted == K and _spec_draft_tokens[0] is not None) else 'miss'}")
                 _log(f"[spec-k-profile] TOTAL batch verify: {(time.perf_counter() - _t_bv)*1000:.1f}ms")
