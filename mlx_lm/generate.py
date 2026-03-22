@@ -792,24 +792,26 @@ def generate_step(
                         _rollback_draft = _orig_draft_snap[0] if _orig_draft_snap[0] is not None else _spec_draft_snap[0]
 
                         if num_accepted < K:
-                            # Partial: rollback to pre-d1..dK snapshot
+                            # Partial: rollback main cache to pre-d1..dK, re-forward accepted
                             restore_cache(prompt_cache, _rollback_snap)
                             if num_accepted > 0:
                                 set_pipeline_speculative_mode(model, True)
                                 model(mx.array([draft_tokens[:num_accepted]]), cache=prompt_cache)
                                 set_pipeline_speculative_mode(model, False)
                                 mx.eval([c.state for c in prompt_cache])
+                            # Draft cache: just restore snapshot. Skip expensive re-processing
+                            # of accepted tokens — draft cache will be slightly behind but the
+                            # draft model is an approximation anyway. Saves ~14ms per partial.
                             restore_cache(pp_draft_cache, _rollback_draft)  # type: ignore
-                            for tok in draft_tokens[:num_accepted]:
-                                pp_draft_model(mx.array([[tok]]), cache=pp_draft_cache)  # type: ignore
                         else:
                             # Full accept but optimistic miss
                             if _optimistic:
                                 restore_cache(prompt_cache, _spec_snap[0])
                                 restore_cache(pp_draft_cache, _spec_draft_snap[0])  # type: ignore
                             else:
+                                # Add d_K to draft cache (cheap, 1 forward)
                                 pp_draft_model(mx.array([[draft_tokens[-1]]]), cache=pp_draft_cache)  # type: ignore
-                        mx.eval([c.state for c in pp_draft_cache])  # type: ignore
+                                mx.eval([c.state for c in pp_draft_cache])  # type: ignore
 
                         # Clear orig_snap — speculation is fully resolved
                         _orig_snap[0] = None
