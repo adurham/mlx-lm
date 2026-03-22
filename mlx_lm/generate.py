@@ -535,23 +535,29 @@ def generate_step(
         _spec_total = [0]
         _spec_token_buffer: list[tuple[int, mx.array]] = []    # extra tokens from K>1
         _next_rank = (_pp_rank + 1) % _pp_world_size
-        # Adaptive K: rolling d1 acceptance over last 16 checks
-        _adaptive_mask = [0]       # bitmask: 1=accept, 0=reject
-        _adaptive_count = [0]      # samples so far (up to 16)
+        # Adaptive K: rolling d1 acceptance over last 32 checks with cooldown
+        _adaptive_mask = [0]       # bitmask: 1=accept, 0=reject (32 bits)
+        _adaptive_count = [0]      # samples so far (up to 32)
         _effective_k = [_pp_draft_k]  # current effective K (1 or _pp_draft_k)
+        _adaptive_cooldown = [0]   # steps remaining before next switch allowed
 
         def _update_adaptive_k(accepted: bool):
-            m = ((_adaptive_mask[0] << 1) | (1 if accepted else 0)) & 0xFFFF
+            m = ((_adaptive_mask[0] << 1) | (1 if accepted else 0)) & 0xFFFFFFFF
             _adaptive_mask[0] = m
-            _adaptive_count[0] = min(_adaptive_count[0] + 1, 16)
-            if _adaptive_count[0] >= 8:
+            _adaptive_count[0] = min(_adaptive_count[0] + 1, 32)
+            if _adaptive_cooldown[0] > 0:
+                _adaptive_cooldown[0] -= 1
+                return
+            if _adaptive_count[0] >= 16:
                 n_bits = _adaptive_count[0]
                 rate = bin(m & ((1 << n_bits) - 1)).count('1') / n_bits
-                if rate < 0.50 and _effective_k[0] > 1:
+                if rate < 0.45 and _effective_k[0] > 1:
                     _effective_k[0] = 1
+                    _adaptive_cooldown[0] = 32
                     _log(f"[spec-k] adaptive K→1 (rate={rate:.0%})")
-                elif rate > 0.65 and _effective_k[0] == 1:
+                elif rate > 0.75 and _effective_k[0] == 1:
                     _effective_k[0] = _pp_draft_k
+                    _adaptive_cooldown[0] = 32
                     _log(f"[spec-k] adaptive K→{_pp_draft_k} (rate={rate:.0%})")
 
         if _pp_spec_enabled:
