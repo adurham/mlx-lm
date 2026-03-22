@@ -552,18 +552,20 @@ def generate_step(
             if _adaptive_cooldown[0] > 0:
                 _adaptive_cooldown[0] -= 1
                 return
-            # Fast drop: 8-sample window, <50% → K=1 immediately
+            # Fast drop: 8-sample window, <63% → K=1 immediately
+            # Breakeven is ~65-70% acceptance — below that K=3 batch verify
+            # overhead exceeds the batching benefit.
             if _adaptive_count[0] >= 8 and _effective_k[0] > 1:
                 recent_8 = bin(m & 0xFF).count('1')
-                if recent_8 < 4:
+                if recent_8 < 5:  # <63% (4/8 or fewer accepts)
                     _effective_k[0] = 1
                     _adaptive_cooldown[0] = 16
                     _log(f"[spec-k] adaptive K→1 (last8={recent_8}/8)")
                     return
-            # Slow rise: 16-sample window, >75% → K=3
+            # Slow rise: 16-sample window, >81% → K=3
             if _adaptive_count[0] >= 16 and _effective_k[0] == 1:
                 recent_16 = bin(m & 0xFFFF).count('1')
-                if recent_16 >= 12:
+                if recent_16 >= 13:  # >81% (13/16 or more accepts)
                     _effective_k[0] = _pp_draft_k
                     _adaptive_cooldown[0] = 16
                     _log(f"[spec-k] adaptive K→{_pp_draft_k} (last16={recent_16}/16)")
