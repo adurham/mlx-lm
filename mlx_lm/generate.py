@@ -535,6 +535,24 @@ def generate_step(
         _spec_total = [0]
         _spec_token_buffer: list[tuple[int, mx.array]] = []    # extra tokens from K>1
         _next_rank = (_pp_rank + 1) % _pp_world_size
+        # Adaptive K: rolling d1 acceptance over last 16 checks
+        _adaptive_mask = [0]       # bitmask: 1=accept, 0=reject
+        _adaptive_count = [0]      # samples so far (up to 16)
+        _effective_k = [_pp_draft_k]  # current effective K (1 or _pp_draft_k)
+
+        def _update_adaptive_k(accepted: bool):
+            m = ((_adaptive_mask[0] << 1) | (1 if accepted else 0)) & 0xFFFF
+            _adaptive_mask[0] = m
+            _adaptive_count[0] = min(_adaptive_count[0] + 1, 16)
+            if _adaptive_count[0] >= 8:
+                n_bits = _adaptive_count[0]
+                rate = bin(m & ((1 << n_bits) - 1)).count('1') / n_bits
+                if rate < 0.50 and _effective_k[0] > 1:
+                    _effective_k[0] = 1
+                    _log(f"[spec-k] adaptive K→1 (rate={rate:.0%})")
+                elif rate > 0.65 and _effective_k[0] == 1:
+                    _effective_k[0] = _pp_draft_k
+                    _log(f"[spec-k] adaptive K→{_pp_draft_k} (rate={rate:.0%})")
 
         if _pp_spec_enabled:
             _log(f"PP idle-time speculation enabled on rank {_pp_rank}, K={_pp_draft_k}")
@@ -563,7 +581,7 @@ def generate_step(
 
         def _speculate_k(real_token_id: int):
             """Draft K tokens and batch-forward through rank 0's layers."""
-            K = _pp_draft_k
+            K = _effective_k[0]
             _log(f"[spec-k] draft K={K} from tok={real_token_id}")
             # First draft call: process real_token_id (= current y) through draft model
             draft_logits = pp_draft_model(mx.array([[real_token_id]]), cache=pp_draft_cache)  # type: ignore
@@ -610,7 +628,9 @@ def generate_step(
 
                 if real_token_id == draft_tokens[0]:
                     _spec_accepted[0] += 1
-                    _log(f"[spec-k] n={_n} ACCEPT d1={real_token_id} K={_pp_draft_k}")
+                    _update_adaptive_k(True)
+                    _K_actual = len(draft_tokens)
+                    _log(f"[spec-k] n={_n} ACCEPT d1={real_token_id} K={_K_actual}")
                     if _pp_draft_k == 1:
                         # K=1 fast path: use pre-computed hidden, skip compute
                         _k1_accepted = True
@@ -621,6 +641,7 @@ def generate_step(
                         _batch_verify = True
                 else:
                     _spec_rejected[0] += 1
+                    _update_adaptive_k(False)
                     restore_cache(prompt_cache, _spec_snap[0])
                     if _spec_draft_snap[0] is not None:
                         restore_cache(pp_draft_cache, _spec_draft_snap[0])  # type: ignore
@@ -630,7 +651,10 @@ def generate_step(
             if _pp_draft_k > 1:
                 if _is_non_last_rank:
                     if _batch_verify:
-                        header = mx.array([_pp_draft_k] + draft_tokens, dtype=mx.int32)
+                        # header[0] = actual K (may differ from _pp_draft_k due to adaptive)
+                        _K_actual = len(draft_tokens)
+                        header_vals = [_K_actual] + draft_tokens + [0] * (_pp_draft_k - _K_actual)
+                        header = mx.array(header_vals, dtype=mx.int32)
                     else:
                         header = mx.zeros(_pp_draft_k + 1, dtype=mx.int32)
                     sent = mx.distributed.send(header, _next_rank, group=_pp_group)
@@ -640,15 +664,16 @@ def generate_step(
                         mx.zeros(_pp_draft_k + 1, dtype=mx.int32), _pp_recv_from, group=_pp_group
                     )
                     mx.eval(header)
-                    _batch_verify = int(header[0].item()) > 0
+                    _K_actual = int(header[0].item())
+                    _batch_verify = _K_actual > 0
                     if _batch_verify:
-                        draft_tokens = [int(header[i + 1].item()) for i in range(_pp_draft_k)]
+                        draft_tokens = [int(header[i + 1].item()) for i in range(_K_actual)]
 
             # =================================================================
-            # PATH A: K>1 batch verify
+            # PATH A: K>1 batch verify (K_actual may be < _pp_draft_k due to adaptive)
             # =================================================================
             if _batch_verify:
-                K = _pp_draft_k
+                K = len(draft_tokens)  # actual K for this step
                 _t_bv = time.perf_counter()
                 _optimistic = False
 
@@ -943,7 +968,7 @@ def generate_step(
             if _pp_spec_enabled and _spec_total[0] > 0:
                 _rate = _spec_accepted[0] / _spec_total[0] * 100
                 sys.stderr.write(
-                    f"[pp-spec] K={_pp_draft_k}, {_spec_total[0]} steps, "
+                    f"[pp-spec] K={_pp_draft_k} eff_k={_effective_k[0]}, {_spec_total[0]} steps, "
                     f"{_spec_accepted[0]} accepted ({_rate:.1f}%), "
                     f"{_spec_rejected[0]} rejected\n"
                 )
