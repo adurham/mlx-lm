@@ -549,10 +549,6 @@ def generate_step(
         _adaptive_cooldown = [0]   # steps remaining before next switch
 
         def _update_adaptive_k(accepted: bool):
-            # While in thinking mode, force K=1 — no adaptive promotion
-            if _in_thinking[0]:
-                _effective_k[0] = 1
-                return
             m = ((_adaptive_mask[0] << 1) | (1 if accepted else 0)) & 0xFFFFFFFF
             _adaptive_mask[0] = m
             _adaptive_count[0] = min(_adaptive_count[0] + 1, 32)
@@ -569,13 +565,17 @@ def generate_step(
                     _adaptive_cooldown[0] = 16
                     _log(f"[spec-k] adaptive K→1 (last8={recent_8}/8)")
                     return
-            # Slow rise: 16-sample window, >81% → K=3
+            # Slow rise: promote to K=3 when acceptance is high enough.
+            # During thinking: need >93% (15/16) — thinking tokens are usually unpredictable,
+            # so only promote if this is clearly easy content (factual thinking).
+            # After </think>: need >81% (13/16) — output tokens are more predictable.
             if _adaptive_count[0] >= 16 and _effective_k[0] == 1:
                 recent_16 = bin(m & 0xFFFF).count('1')
-                if recent_16 >= 13:  # >81% (13/16 or more accepts)
+                rise_threshold = 15 if _in_thinking[0] else 13
+                if recent_16 >= rise_threshold:
                     _effective_k[0] = _pp_draft_k
                     _adaptive_cooldown[0] = 16
-                    _log(f"[spec-k] adaptive K→{_pp_draft_k} (last16={recent_16}/16)")
+                    _log(f"[spec-k] adaptive K→{_pp_draft_k} (last16={recent_16}/16, thinking={_in_thinking[0]})")
 
         if _pp_spec_enabled:
             _log(f"PP idle-time speculation enabled on rank {_pp_rank}, K={_pp_draft_k}")
