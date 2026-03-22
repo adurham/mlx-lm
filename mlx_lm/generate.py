@@ -327,6 +327,7 @@ def generate_step(
     pp_draft_model: Optional[nn.Module] = None,
     pp_draft_cache: Optional[Any] = None,
     pp_no_compile: bool = False,
+    pp_think_end_token: Optional[int] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -537,6 +538,8 @@ def generate_step(
         _orig_snap: list[Any] = [None]                         # pre-optimistic snapshot for finally cleanup
         _orig_draft_snap: list[Any] = [None]                   # pre-optimistic draft snapshot
         _next_rank = (_pp_rank + 1) % _pp_world_size
+        # Thinking-mode: force K=1 until </think> is seen (thinking tokens are unpredictable)
+        _in_thinking = [pp_think_end_token is not None]  # assume thinking if model supports it
         # Adaptive K: start conservative (K=1), promote to K=3 when content is predictable.
         # Thinking tokens are unpredictable — K=3 is SLOWER than K=1 at <60% acceptance
         # due to batch verify overhead. Fast drop, slow rise, short cooldown.
@@ -546,6 +549,10 @@ def generate_step(
         _adaptive_cooldown = [0]   # steps remaining before next switch
 
         def _update_adaptive_k(accepted: bool):
+            # While in thinking mode, force K=1 — no adaptive promotion
+            if _in_thinking[0]:
+                _effective_k[0] = 1
+                return
             m = ((_adaptive_mask[0] << 1) | (1 if accepted else 0)) & 0xFFFFFFFF
             _adaptive_mask[0] = m
             _adaptive_count[0] = min(_adaptive_count[0] + 1, 32)
@@ -958,6 +965,12 @@ def generate_step(
                 # Start next CPU draft in background (runs during GPU's next step)
                 _start_cpu_draft(_y_item)
 
+            # Detect </think> → exit thinking mode, allow adaptive K promotion
+            if _pp_info is not None and _in_thinking[0] and pp_think_end_token is not None and _y_item == pp_think_end_token:
+                _in_thinking[0] = False
+                _adaptive_mask[0] = 0
+                _adaptive_count[0] = 0
+                _log(f"[spec-k] </think> detected at n={n}, thinking mode OFF")
             if _pp_info is not None and n < 10:
                 _log(f"[generate_step] yield n={n} tok={_y_item}")
             yield _y_item, logprobs
