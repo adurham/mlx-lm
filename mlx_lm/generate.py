@@ -736,6 +736,9 @@ def generate_step(
             if _pp_spec_enabled and _spec_draft_token[0] is not None:
                 restore_cache(prompt_cache, _spec_snap[0])
                 _spec_draft_token[0] = None
+            # Flush all Metal streams so the next request's mx.synchronize()
+            # in prefill doesn't block on residual speculation work.
+            mx.synchronize()
             if _pp_spec_enabled and _spec_total[0] > 0:
                 _rate = _spec_accepted[0] / _spec_total[0] * 100
                 sys.stderr.write(
