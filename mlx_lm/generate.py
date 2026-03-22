@@ -534,6 +534,8 @@ def generate_step(
         _spec_rejected = [0]
         _spec_total = [0]
         _spec_token_buffer: list[tuple[int, mx.array]] = []    # extra tokens from K>1
+        _orig_snap: list[Any] = [None]                         # pre-optimistic snapshot for finally cleanup
+        _orig_draft_snap: list[Any] = [None]                   # pre-optimistic draft snapshot
         _next_rank = (_pp_rank + 1) % _pp_world_size
         # Adaptive K: start conservative (K=1), promote to K=3 when content is predictable.
         # Thinking tokens are unpredictable — K=3 is SLOWER than K=1 at <60% acceptance
@@ -692,6 +694,7 @@ def generate_step(
             if _batch_verify:
                 K = len(draft_tokens)  # actual K for this step
                 _t_bv = time.perf_counter()
+                _optimistic = False
 
                 if _is_non_last_rank:
                     # Rank 0: send K hidden states to rank 1
@@ -699,6 +702,24 @@ def generate_step(
                     mx.eval(_cache_state[_hidden_idx])
                     sent = mx.distributed.send(_cache_state[_hidden_idx], _next_rank, group=_pp_group)
                     mx.eval(sent)
+
+                    # Save original snapshots BEFORE optimistic spec overwrites them.
+                    # These are needed for: (a) partial-accept rollback, (b) finally cleanup.
+                    _orig_snap[0] = _spec_snap[0]
+                    _orig_draft_snap[0] = _spec_draft_snap[0]
+
+                    # OPTIMISTIC: while rank 1 batch-verifies (~26ms), speculate
+                    # the NEXT K tokens from d_K. If bonus == our first draft,
+                    # we skip the normal step entirely.
+                    if _pp_spec_enabled:
+                        _spec_total[0] += 1
+                        try:
+                            _speculate_k(draft_tokens[-1])
+                            _optimistic = True
+                        except Exception as e:
+                            _log(f"[spec-k] optimistic ERROR: {e}")
+                            _spec_draft_tokens[0] = None
+
                     r_result = mx.zeros(2, dtype=mx.int32)
                 else:
                     # Rank 1: receive K hidden states and batch-verify
@@ -742,26 +763,45 @@ def generate_step(
                 r1_data = gathered[-2:]
                 num_accepted = int(r1_data[0].item())
                 bonus = int(r1_data[1].item())
-                _log(f"[spec-k] result: {num_accepted}/{K} accepted, bonus={bonus}")
 
-                # Rank 0: rollback main cache + fix draft cache
+                # Rank 0: resolve optimistic speculation + fix caches
                 if _is_non_last_rank:
-                    if num_accepted < K:
-                        restore_cache(prompt_cache, _spec_snap[0])
-                        if num_accepted > 0:
-                            set_pipeline_speculative_mode(model, True)
-                            model(mx.array([draft_tokens[:num_accepted]]), cache=prompt_cache)
-                            set_pipeline_speculative_mode(model, False)
-                            mx.eval([c.state for c in prompt_cache])
-                        # Draft: restore to after-y, re-process accepted
-                        restore_cache(pp_draft_cache, _spec_draft_snap[0])  # type: ignore
-                        for tok in draft_tokens[:num_accepted]:
-                            pp_draft_model(mx.array([[tok]]), cache=pp_draft_cache)  # type: ignore
+                    if num_accepted == K and _optimistic and _spec_draft_tokens[0] is not None and bonus == _spec_draft_tokens[0][0]:
+                        # OPTIMISTIC HIT: bonus matches our first optimistic draft!
+                        # Main cache: [..., d1..dK, e1..eK] — correct for next batch verify.
+                        # Draft cache: [..., d1..dK, e1..e_{K-1}] — correct.
+                        # _spec_snap/draft_snap point to optimistic round — correct.
+                        # _orig_snap still points to pre-d1..dK — correct for finally cleanup.
+                        _log(f"[spec-k] OPTIMISTIC HIT bonus={bonus}")
                     else:
-                        # Full accept: add d_K to draft cache
-                        pp_draft_model(mx.array([[draft_tokens[-1]]]), cache=pp_draft_cache)  # type: ignore
-                    mx.eval([c.state for c in pp_draft_cache])  # type: ignore
+                        # Optimistic MISS or partial accept — undo optimistic speculation
+                        if _optimistic:
+                            _spec_draft_tokens[0] = None
+                        # Clear orig_snap — speculation is fully resolved, nothing to undo
+                        _orig_snap[0] = None
+                        _orig_draft_snap[0] = None
 
+                        if num_accepted < K:
+                            # Partial: rollback to ORIGINAL snapshot (before d1..dK)
+                            restore_cache(prompt_cache, _orig_snap[0])
+                            if num_accepted > 0:
+                                set_pipeline_speculative_mode(model, True)
+                                model(mx.array([draft_tokens[:num_accepted]]), cache=prompt_cache)
+                                set_pipeline_speculative_mode(model, False)
+                                mx.eval([c.state for c in prompt_cache])
+                            restore_cache(pp_draft_cache, _orig_draft_snap[0])  # type: ignore
+                            for tok in draft_tokens[:num_accepted]:
+                                pp_draft_model(mx.array([[tok]]), cache=pp_draft_cache)  # type: ignore
+                        else:
+                            # Full accept but optimistic miss
+                            if _optimistic:
+                                restore_cache(prompt_cache, _spec_snap[0])
+                                restore_cache(pp_draft_cache, _spec_draft_snap[0])  # type: ignore
+                            else:
+                                pp_draft_model(mx.array([[draft_tokens[-1]]]), cache=pp_draft_cache)  # type: ignore
+                        mx.eval([c.state for c in pp_draft_cache])  # type: ignore
+
+                _log(f"[spec-k] result: {num_accepted}/{K}, bonus={bonus}, opt={'HIT' if (_optimistic and num_accepted == K and _spec_draft_tokens[0] is not None) else 'miss'}")
                 _log(f"[spec-k-profile] TOTAL batch verify: {(time.perf_counter() - _t_bv)*1000:.1f}ms")
 
                 # Reset hidden state to (1,1,H) so next step's recv_like gets the right shape
@@ -938,11 +978,14 @@ def generate_step(
                 pass
             model._skip_lm_head = False  # type: ignore
             # Clean up pending speculation: the last step may have speculatively
-            # advanced rank 0's cache by K tokens that rank 1 never saw. Restore
-            # from snapshot so both ranks' caches match for KV prefix reuse.
+            # advanced rank 0's cache. Use _orig_snap if optimistic speculation
+            # overwrote _spec_snap (the bug that caused deadlocks before this fix).
             if _pp_spec_enabled and _spec_draft_tokens[0] is not None:
-                restore_cache(prompt_cache, _spec_snap[0])
+                cleanup_snap = _orig_snap[0] if _orig_snap[0] is not None else _spec_snap[0]
+                restore_cache(prompt_cache, cleanup_snap)
                 _spec_draft_tokens[0] = None
+                _orig_snap[0] = None
+                _orig_draft_snap[0] = None
             _spec_token_buffer.clear()
             if _pp_spec_enabled and _spec_total[0] > 0:
                 _rate = _spec_accepted[0] / _spec_total[0] * 100
