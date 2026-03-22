@@ -538,43 +538,13 @@ def generate_step(
         _orig_snap: list[Any] = [None]                         # pre-optimistic snapshot for finally cleanup
         _orig_draft_snap: list[Any] = [None]                   # pre-optimistic draft snapshot
         _next_rank = (_pp_rank + 1) % _pp_world_size
-        # Thinking-mode: force K=1 until </think> is seen (thinking tokens are unpredictable)
+        # Simple K switching: K=1 during <think>, K=3 after </think>.
+        # No thresholds, no tuning, no exploration.
         _in_thinking = [pp_think_end_token is not None]  # assume thinking if model supports it
-        # Adaptive K: start conservative (K=1), promote to K=3 when content is predictable.
-        # Thinking tokens are unpredictable — K=3 is SLOWER than K=1 at <60% acceptance
-        # due to batch verify overhead. Fast drop, slow rise, short cooldown.
-        _adaptive_mask = [0]       # bitmask: 1=accept, 0=reject
-        _adaptive_count = [0]      # samples so far
-        _effective_k = [1 if _pp_draft_k > 1 else _pp_draft_k]  # start at K=1
-        _adaptive_cooldown = [0]   # steps remaining before next switch
+        _effective_k = [1 if _in_thinking[0] else _pp_draft_k]
 
         def _update_adaptive_k(accepted: bool):
-            m = ((_adaptive_mask[0] << 1) | (1 if accepted else 0)) & 0xFFFFFFFF
-            _adaptive_mask[0] = m
-            _adaptive_count[0] = min(_adaptive_count[0] + 1, 32)
-            if _adaptive_cooldown[0] > 0:
-                _adaptive_cooldown[0] -= 1
-                return
-            # Fast drop: 8-sample window, <63% → K=1 immediately
-            # Breakeven is ~65-70% acceptance — below that K=3 batch verify
-            # overhead exceeds the batching benefit.
-            if _adaptive_count[0] >= 8 and _effective_k[0] > 1:
-                recent_8 = bin(m & 0xFF).count('1')
-                if recent_8 < 5:  # <63% (4/8 or fewer accepts)
-                    _effective_k[0] = 1
-                    _adaptive_cooldown[0] = 16
-                    _log(f"[spec-k] adaptive K→1 (last8={recent_8}/8)")
-                    return
-            # Slow rise: promote to K=3 when acceptance is high enough.
-            # During thinking: need >75% (12/16) — only promote on clearly easy content.
-            # After </think>: need >69% (11/16) — output tokens are more predictable.
-            if _adaptive_count[0] >= 16 and _effective_k[0] == 1:
-                recent_16 = bin(m & 0xFFFF).count('1')
-                rise_threshold = 12 if _in_thinking[0] else 11
-                if recent_16 >= rise_threshold:
-                    _effective_k[0] = _pp_draft_k
-                    _adaptive_cooldown[0] = 16
-                    _log(f"[spec-k] adaptive K→{_pp_draft_k} (last16={recent_16}/16, thinking={_in_thinking[0]})")
+            pass  # K is set deterministically by </think> detection, not acceptance rate
 
         if _pp_spec_enabled:
             _log(f"PP idle-time speculation enabled on rank {_pp_rank}, K={_pp_draft_k}")
@@ -966,12 +936,11 @@ def generate_step(
                 # Start next CPU draft in background (runs during GPU's next step)
                 _start_cpu_draft(_y_item)
 
-            # Detect </think> → exit thinking mode, allow adaptive K promotion
+            # Detect </think> → switch from K=1 to K=3
             if _pp_info is not None and _in_thinking[0] and pp_think_end_token is not None and _y_item == pp_think_end_token:
                 _in_thinking[0] = False
-                _adaptive_mask[0] = 0
-                _adaptive_count[0] = 0
-                _log(f"[spec-k] </think> detected at n={n}, thinking mode OFF")
+                _effective_k[0] = _pp_draft_k
+                _log(f"[spec-k] </think> at n={n}, K→{_pp_draft_k}")
             if _pp_info is not None and n < 10:
                 _log(f"[generate_step] yield n={n} tok={_y_item}")
             yield _y_item, logprobs
