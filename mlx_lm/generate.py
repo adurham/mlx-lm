@@ -589,20 +589,23 @@ def generate_step(
             """Draft K tokens and batch-forward through rank 0's layers."""
             K = _effective_k[0]
             _log(f"[spec-k] draft K={K} from tok={real_token_id}")
-            # First draft call: process real_token_id (= current y) through draft model
-            draft_logits = pp_draft_model(mx.array([[real_token_id]]), cache=pp_draft_cache)  # type: ignore
-            mx.eval(draft_logits)
-            tok = int(draft_logits[0, -1].argmax().item())
-            draft_tokens: list[int] = [tok]  # d1
+            # Build lazy graph: K draft forwards without intermediate GPU syncs.
+            # Keep tokens as mx.arrays — only eval once at the end.
+            tok_arr = mx.array([[real_token_id]])
+            draft_logits = pp_draft_model(tok_arr, cache=pp_draft_cache)  # type: ignore
+            tok_arr = draft_logits[:, -1:, :].argmax(axis=-1)  # (1, 1) lazy
+            draft_tok_arrays = [tok_arr.squeeze()]  # d1
             # Snapshot draft cache AFTER processing real_token_id — aligns with
             # main cache snapshot (also taken after real_token_id was processed).
             _spec_draft_snap[0] = snapshot_cache(pp_draft_cache)  # type: ignore
-            # Continue drafting d2..dK
+            # Continue drafting d2..dK (lazy — no eval between iterations)
             for _ in range(K - 1):
-                draft_logits = pp_draft_model(mx.array([[tok]]), cache=pp_draft_cache)  # type: ignore
-                mx.eval(draft_logits)
-                tok = int(draft_logits[0, -1].argmax().item())
-                draft_tokens.append(tok)
+                draft_logits = pp_draft_model(tok_arr, cache=pp_draft_cache)  # type: ignore
+                tok_arr = draft_logits[:, -1:, :].argmax(axis=-1)  # (1, 1) lazy
+                draft_tok_arrays.append(tok_arr.squeeze())
+            # Single eval materializes all K draft tokens at once
+            mx.eval(*draft_tok_arrays)
+            draft_tokens: list[int] = [int(t.item()) for t in draft_tok_arrays]
             _log(f"[spec-k] drafted {draft_tokens}")
             # Snapshot main cache before speculative forward
             _spec_snap[0] = snapshot_cache(prompt_cache)
