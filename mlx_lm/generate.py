@@ -571,30 +571,18 @@ def generate_step(
                     sampled = sampler(logprobs)
                     return sampled, logprobs.squeeze(0)
 
-        # Compiled draft step: fuse draft model forward + argmax into one Metal graph.
-        # Eliminates ~1.7ms of per-layer dispatch overhead per draft token.
-        _draft_cache_state = [c.state for c in pp_draft_cache] if pp_draft_cache is not None else []  # type: ignore
-        if _pp_spec_enabled and _draft_cache_state:
-            @partial(mx.compile, inputs=_draft_cache_state, outputs=_draft_cache_state)
-            def _compiled_draft_step(tok):
-                logits = pp_draft_model(tok, cache=pp_draft_cache)  # type: ignore
-                return logits[:, -1:, :].argmax(axis=-1)
-        else:
-            _compiled_draft_step = None
-
         def _speculate_k(real_token_id: int):
             """Draft K tokens and batch-forward through rank 0's layers."""
             K = _effective_k[0]
             _log(f"[spec-k] draft K={K} from tok={real_token_id}")
-            # Draft using compiled step (fused forward + argmax, ~1.3ms vs ~3ms uncompiled).
-            # Each call still evals (compile handles cache mutations internally).
-            _draft_fn = _compiled_draft_step if _compiled_draft_step is not None else None
-            tok_input = mx.array([[real_token_id]])
-            if _draft_fn is not None:
-                tok_id = _draft_fn(tok_input)
-            else:
-                draft_logits = pp_draft_model(tok_input, cache=pp_draft_cache)  # type: ignore
-                tok_id = draft_logits[:, -1:, :].argmax(axis=-1)
+            # First draft call: process real_token_id (= current y) through draft model.
+            # Each forward must be eval'd before the next — cache mutations (KV insert,
+            # DeltaNet state update) need materialized arrays for the next forward to read.
+            # NOTE: mx.compile does NOT work for DeltaNet models — ArraysCache mutations
+            # (mx.contiguous assignments) are not tracked correctly between compiled calls,
+            # causing wrong predictions and cratered acceptance rates.
+            draft_logits = pp_draft_model(mx.array([[real_token_id]]), cache=pp_draft_cache)  # type: ignore
+            tok_id = draft_logits[0, -1].argmax()
             mx.eval(tok_id)
             tok = int(tok_id.item())
             draft_tokens: list[int] = [tok]  # d1
@@ -603,12 +591,8 @@ def generate_step(
             _spec_draft_snap[0] = snapshot_cache(pp_draft_cache)  # type: ignore
             # Continue drafting d2..dK
             for _ in range(K - 1):
-                tok_input = mx.array([[tok]])
-                if _draft_fn is not None:
-                    tok_id = _draft_fn(tok_input)
-                else:
-                    draft_logits = pp_draft_model(tok_input, cache=pp_draft_cache)  # type: ignore
-                    tok_id = draft_logits[:, -1:, :].argmax(axis=-1)
+                draft_logits = pp_draft_model(mx.array([[tok]]), cache=pp_draft_cache)  # type: ignore
+                tok_id = draft_logits[0, -1].argmax()
                 mx.eval(tok_id)
                 tok = int(tok_id.item())
                 draft_tokens.append(tok)
