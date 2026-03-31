@@ -157,6 +157,14 @@ class GatedDeltaNet(nn.Module):
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         if cache is not None:
+            # FIX: mx.contiguous breaks a shared-buffer memory leak.
+            # This slice shares the parent conv_input's Data buffer via MLX's
+            # zero-copy slicing (shared_ptr<Data>). Without contiguous, this
+            # 2-position slice keeps the entire conv_input (T+2 positions) alive,
+            # which in turn keeps qkv, the projection outputs, and the full chunk
+            # input alive — ~540 KB/tok leak during prefill. contiguous copies
+            # just the small slice into its own buffer, freeing the parent chain.
+            # See: https://github.com/ml-explore/mlx/discussions/912
             cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
@@ -192,6 +200,9 @@ class GatedDeltaNet(nn.Module):
         )
 
         if cache is not None:
+            # FIX: same shared-buffer leak as cache[0] above. The kernel output
+            # state may share buffers with its inputs, pinning the full forward
+            # pass graph in memory. contiguous creates an independent copy.
             cache[1] = mx.contiguous(state)
             cache.advance(S)
 
