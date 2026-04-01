@@ -1,6 +1,5 @@
 # Copyright © 2026 Apple Inc.
 
-import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
@@ -23,7 +22,6 @@ from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
 
 _profile_level = int(os.environ.get("EXO_PROFILE_LAYERS", "0"))
-_profile_logger = logging.getLogger("exo.profile.layers")
 
 
 @dataclass
@@ -218,7 +216,7 @@ def _mem_snapshot(label: str) -> None:
     mx.eval(mx.zeros(1))
     active = mx.metal.get_active_memory() / 1024**3
     peak = mx.metal.get_peak_memory() / 1024**3
-    _profile_logger.info(f"  {label}: active={active:.3f} GB  peak={peak:.3f} GB")
+    print(f"  {label}: active={active:.3f} GB  peak={peak:.3f} GB")
 
 
 class DecoderLayer(nn.Module):
@@ -307,7 +305,7 @@ class Qwen3_5TextModel(nn.Module):
             mx.eval(hidden_states)
             mx.metal.reset_peak_memory()
             base_active = mx.metal.get_active_memory() / 1024**3
-            _profile_logger.info(
+            print(
                 f"[PROFILE] Starting layer loop: "
                 f"active={base_active:.3f} GB  "
                 f"seq_len={hidden_states.shape[1]}  "
@@ -333,7 +331,7 @@ class Qwen3_5TextModel(nn.Module):
                 active = mx.metal.get_active_memory() / 1024**3
                 peak = mx.metal.get_peak_memory() / 1024**3
                 kind = "DeltaNet" if layer.is_linear else "Attention"
-                _profile_logger.info(
+                print(
                     f"[PROFILE] L{layer.layer_idx:2d} ({kind:8s}): "
                     f"active={active:.3f} GB  "
                     f"peak={peak:.3f} GB  "
