@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -83,6 +84,9 @@ class TextModelArgs(BaseModelArgs):
             self.rope_scaling = self.rope_parameters
 
 
+_FUSE_DELTANET_PROJ = os.environ.get("EXO_FUSE_DELTANET_PROJ", "0") == "1"
+
+
 class GatedDeltaNet(nn.Module):
     def __init__(self, config: TextModelArgs):
         super().__init__()
@@ -111,12 +115,26 @@ class GatedDeltaNet(nn.Module):
             padding=0,
         )
 
-        self.in_proj_qkv = nn.Linear(
-            self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
-        )
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self._fused = _FUSE_DELTANET_PROJ
+        self._qkv_dim = self.key_dim * 2 + self.value_dim
+        self._z_dim = self.value_dim
+        self._b_dim = self.num_v_heads
+        self._a_dim = self.num_v_heads
+        if self._fused:
+            # Single matmul for all projections — fewer kernel dispatches,
+            # less peak memory (1 output tensor vs 4).
+            self.in_proj = nn.Linear(
+                self.hidden_size,
+                self._qkv_dim + self._z_dim + self._b_dim + self._a_dim,
+                bias=False,
+            )
+        else:
+            self.in_proj_qkv = nn.Linear(
+                self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
+            )
+            self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+            self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+            self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
         self.dt_bias = mx.ones(self.num_v_heads)
 
@@ -140,10 +158,19 @@ class GatedDeltaNet(nn.Module):
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        if self._fused:
+            proj = self.in_proj(inputs)
+            qkv, z, b, a = mx.split(
+                proj,
+                [self._qkv_dim, self._qkv_dim + self._z_dim, self._qkv_dim + self._z_dim + self._b_dim],
+                axis=-1,
+            )
+            z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
+        else:
+            qkv = self.in_proj_qkv(inputs)
+            z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
+            b = self.in_proj_b(inputs)
+            a = self.in_proj_a(inputs)
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
@@ -337,6 +364,30 @@ class TextModel(nn.Module):
             if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
+
+        # Fuse DeltaNet projections when EXO_FUSE_DELTANET_PROJ=1.
+        # Concatenates in_proj_qkv + in_proj_z + in_proj_b + in_proj_a → in_proj
+        # on axis=0 (output dimension) for each weight/scale/bias tensor.
+        if _FUSE_DELTANET_PROJ:
+            fusions = []
+            for k in list(weights.keys()):
+                if ".linear_attn.in_proj_qkv." in k:
+                    suffix = k.split(".in_proj_qkv")[-1]  # e.g. ".weight"
+                    prefix = k.split(".in_proj_qkv")[0]
+                    parts = [
+                        f"{prefix}.in_proj_qkv{suffix}",
+                        f"{prefix}.in_proj_z{suffix}",
+                        f"{prefix}.in_proj_b{suffix}",
+                        f"{prefix}.in_proj_a{suffix}",
+                    ]
+                    if all(p in weights for p in parts):
+                        fusions.append((f"{prefix}.in_proj{suffix}", parts))
+            for fused_key, part_keys in fusions:
+                if fused_key not in weights and all(p in weights for p in part_keys):
+                    weights[fused_key] = mx.concatenate(
+                        [weights.pop(p) for p in part_keys], axis=0
+                    )
+
         return weights
 
     @property
