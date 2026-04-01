@@ -277,9 +277,14 @@ class Qwen3_5TextModel(nn.Module):
         fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+            # Eval every 10 layers during prefill to free intermediate
+            # activations. Without this, all 30 layers' computation graphs
+            # accumulate in memory (~6+ GB transient at long contexts).
+            if i % 10 == 9 and hidden_states.shape[1] > 1:
+                mx.eval(hidden_states)
 
         return self.norm(hidden_states)
 
