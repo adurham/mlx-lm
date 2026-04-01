@@ -1,5 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -19,6 +21,9 @@ from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
+
+_profile_level = int(os.environ.get("EXO_PROFILE_LAYERS", "0"))
+_profile_logger = logging.getLogger("exo.profile.layers")
 
 
 @dataclass
@@ -208,9 +213,18 @@ class GatedDeltaNet(nn.Module):
         return out
 
 
+def _mem_snapshot(label: str) -> None:
+    """Force eval and log Metal memory. Only called when EXO_PROFILE_LAYERS >= 2."""
+    mx.eval(mx.zeros(1))
+    active = mx.metal.get_active_memory() / 1024**3
+    peak = mx.metal.get_peak_memory() / 1024**3
+    _profile_logger.info(f"  {label}: active={active:.3f} GB  peak={peak:.3f} GB")
+
+
 class DecoderLayer(nn.Module):
     def __init__(self, args: TextModelArgs, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.is_linear = (layer_idx + 1) % args.full_attention_interval != 0
         if self.is_linear:
             self.linear_attn = GatedDeltaNet(args)
@@ -233,12 +247,29 @@ class DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        profile_ops = _profile_level >= 2
+        kind = "DeltaNet" if self.is_linear else "Attention"
+
+        if profile_ops:
+            mx.eval(x)
+            _mem_snapshot(f"L{self.layer_idx}({kind}) input")
+
         if self.is_linear:
             r = self.linear_attn(self.input_layernorm(x), mask, cache)
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache)
+
+        if profile_ops:
+            mx.eval(r)
+            _mem_snapshot(f"L{self.layer_idx}({kind}) after attn")
+
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
+
+        if profile_ops:
+            mx.eval(out)
+            _mem_snapshot(f"L{self.layer_idx}({kind}) after MoE")
+
         return out
 
 
@@ -270,9 +301,46 @@ class Qwen3_5TextModel(nn.Module):
         fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
+        profile = _profile_level >= 1
+
+        if profile:
+            mx.eval(hidden_states)
+            mx.metal.reset_peak_memory()
+            base_active = mx.metal.get_active_memory() / 1024**3
+            _profile_logger.info(
+                f"[PROFILE] Starting layer loop: "
+                f"active={base_active:.3f} GB  "
+                f"seq_len={hidden_states.shape[1]}  "
+                f"n_layers={len(self.layers)}"
+            )
+
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+
+            if profile:
+                # Force eval to get accurate per-layer readings.
+                # This CHANGES memory behavior (breaks cross-layer graph fusion)
+                # so the absolute peak will differ from production. But the
+                # per-layer DELTAS reveal which layers consume the most.
+                mx.eval(hidden_states)
+                if isinstance(c, ArraysCache):
+                    c.cache = [
+                        mx.contiguous(x) if x is not None else x for x in c.cache
+                    ]
+                    mx.eval(*[x for x in c.cache if x is not None])
+
+                active = mx.metal.get_active_memory() / 1024**3
+                peak = mx.metal.get_peak_memory() / 1024**3
+                kind = "DeltaNet" if layer.is_linear else "Attention"
+                _profile_logger.info(
+                    f"[PROFILE] L{layer.layer_idx:2d} ({kind:8s}): "
+                    f"active={active:.3f} GB  "
+                    f"peak={peak:.3f} GB  "
+                    f"delta_active={active - base_active:+.3f} GB"
+                )
+                mx.metal.reset_peak_memory()
+                base_active = active
 
         return self.norm(hidden_states)
 
