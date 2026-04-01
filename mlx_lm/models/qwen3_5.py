@@ -382,11 +382,15 @@ class TextModel(nn.Module):
                     ]
                     if all(p in weights for p in parts):
                         fusions.append((f"{prefix}.in_proj{suffix}", parts))
+            fused_count = 0
             for fused_key, part_keys in fusions:
                 if fused_key not in weights and all(p in weights for p in part_keys):
                     weights[fused_key] = mx.concatenate(
                         [weights.pop(p) for p in part_keys], axis=0
                     )
+                    fused_count += 1
+            if fused_count:
+                print(f"[DeltaNet fusion] Fused {fused_count} projection groups")
 
         return weights
 
