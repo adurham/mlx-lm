@@ -115,16 +115,20 @@ def scaled_dot_product_attention(
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
     if hasattr(cache, "bits"):
-        if sinks is not None:
-            raise ValueError("Quantized SDPA does not support attention sinks.")
-        return quantized_scaled_dot_product_attention(
+        # Dequantize KV cache and use fused SDPA instead of the unfused
+        # quantized_matmul path. The unfused path materializes a full
+        # [B, H, qL, kL] scores matrix (~9 GB at 73K tokens), while
+        # fused SDPA uses O(1) workspace (FlashAttention). Dequantizing
+        # the KV cache costs ~500 MB at 73K — 18x less than the scores.
+        dk = mx.dequantize(*keys, group_size=cache.group_size, bits=cache.bits)
+        dv = mx.dequantize(*values, group_size=cache.group_size, bits=cache.bits)
+        return mx.fast.scaled_dot_product_attention(
             queries,
-            keys,
-            values,
+            dk,
+            dv,
             scale=scale,
             mask=mask,
-            group_size=cache.group_size,
-            bits=cache.bits,
+            sinks=sinks,
         )
     else:
         return mx.fast.scaled_dot_product_attention(
