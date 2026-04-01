@@ -22,6 +22,7 @@ from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
 
 _profile_level = int(os.environ.get("EXO_PROFILE_LAYERS", "0"))
+_layer_eval_interval = int(os.environ.get("EXO_LAYER_EVAL_INTERVAL", "0"))
 
 
 @dataclass
@@ -312,19 +313,34 @@ class Qwen3_5TextModel(nn.Module):
                 f"n_layers={len(self.layers)}"
             )
 
-        for layer, c in zip(self.layers, cache):
+        # Per-layer eval: force evaluation every N layers during prefill to
+        # cap transient activation memory. Without this, all 30 layers'
+        # intermediates accumulate in one lazy graph (~7 GB peak). With it,
+        # each layer's ~0.4-0.8 GB peak is freed before the next.
+        # Only active during prefill (seq_len > 1) — decode is already cheap.
+        layer_eval = (
+            _layer_eval_interval > 0 and hidden_states.shape[1] > 1
+        )
+
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
-            if profile:
-                # Force eval to get accurate per-layer readings.
-                # This CHANGES memory behavior (breaks cross-layer graph fusion)
-                # so the absolute peak will differ from production. But the
-                # per-layer DELTAS reveal which layers consume the most.
+            if layer_eval and (i + 1) % _layer_eval_interval == 0:
                 mx.eval(hidden_states)
                 if isinstance(c, ArraysCache):
                     c.cache = [
-                        mx.contiguous(x) if x is not None else x for x in c.cache
+                        mx.contiguous(x) if x is not None else x
+                        for x in c.cache
+                    ]
+                    mx.eval(*[x for x in c.cache if x is not None])
+
+            if profile:
+                mx.eval(hidden_states)
+                if isinstance(c, ArraysCache):
+                    c.cache = [
+                        mx.contiguous(x) if x is not None else x
+                        for x in c.cache
                     ]
                     mx.eval(*[x for x in c.cache if x is not None])
 
