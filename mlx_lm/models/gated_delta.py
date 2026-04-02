@@ -159,15 +159,13 @@ def _make_chunkwise_kernel():
 
         constexpr int NPT = Dk / 32;  // n_per_t = 6 for Dk=192
         constexpr int C = CHUNK;
-        constexpr int NITERS = NEUMANN_ITERS;
+        // Forward substitution replaces Neumann series — zero barriers needed
 
         // Shared memory
         threadgroup InT sh_k[C * Dk];        // K chunk (half — cast to float for dots)
         threadgroup float sh_cumlog[C];
         threadgroup float sh_beta[C];
         threadgroup float sh_L[C * C];        // L_strict
-        threadgroup float sh_inv[C * C];      // Neumann inverse
-        threadgroup float sh_pow[C * C];      // Neumann power
 
         // State in registers (same as sequential kernel)
         float state[NPT];
@@ -230,45 +228,11 @@ def _make_chunkwise_kernel():
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // ── STEP 4: Neumann series ──
-            // inv = I, power = -L_strict
-            for (int idx = tid; idx < C * C; idx += 128) {
-                int r = idx / C, c = idx % C;
-                sh_inv[idx] = (r == c && r < cl) ? 1.0f : 0.0f;
-                sh_pow[idx] = -sh_L[idx];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // 5 iterations of: inv += inv @ power, power = power @ power
-            constexpr int ELEMS = (C * C + 127) / 128;  // elements per thread
-            for (int it = 0; it < NITERS; it++) {
-                float reg_inv[ELEMS], reg_pow[ELEMS];
-                for (int e = 0; e < ELEMS; e++) {
-                    int flat = tid + e * 128;
-                    if (flat >= C * C) { reg_inv[e] = 0; reg_pow[e] = 0; continue; }
-                    int r = flat / C, c2 = flat % C;
-                    float si = 0.0f, sp = 0.0f;
-                    for (int kk = 0; kk < cl; kk++) {
-                        float inv_rk = sh_inv[r * C + kk];
-                        float pow_kc = sh_pow[kk * C + c2];
-                        si += inv_rk * pow_kc;
-                        sp += sh_pow[r * C + kk] * pow_kc;
-                    }
-                    reg_inv[e] = si;
-                    reg_pow[e] = sp;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (int e = 0; e < ELEMS; e++) {
-                    int flat = tid + e * 128;
-                    if (flat >= C * C) continue;
-                    sh_inv[flat] += reg_inv[e];
-                    sh_pow[flat] = reg_pow[e];
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-
-            // ── STEP 5: RHS and delta for this dv_idx ──
-            float rhs[C], delta[C];
+            // ── STEP 4+5: RHS and delta via forward substitution ──
+            // Solve (I + L_strict) @ delta = rhs directly. No barriers needed:
+            // all threads in a SIMD group compute the same delta (it only varies
+            // per dv, not per dk), and L_strict is in shared memory (read-only).
+            float delta[C];
             for (int t = 0; t < cl; t++) {
                 float dect = exp(sh_cumlog[t]);
                 // state · k[t]: partial sum + simd reduction
@@ -277,15 +241,12 @@ def _make_chunkwise_kernel():
                     sdk += state[i] * static_cast<float>(sh_k[t * Dk + dk_idx * NPT + i]);
                 sdk = simd_sum(sdk);
                 float vv = static_cast<float>(v_[(cs + t) * Hv * Dv + dv_idx]);
-                rhs[t] = sh_beta[t] * vv - sh_beta[t] * dect * sdk;
-            }
-            for (int t = cl; t < C; t++) rhs[t] = 0.0f;
-            // delta = inv @ rhs
-            for (int t = 0; t < cl; t++) {
-                float s = 0.0f;
-                for (int j = 0; j < cl; j++)
-                    s += sh_inv[t * C + j] * rhs[j];
-                delta[t] = s;
+                float rhs_t = sh_beta[t] * vv - sh_beta[t] * dect * sdk;
+                // Forward sub: delta[t] = rhs[t] - sum_{j<t} L[t,j] * delta[j]
+                float correction = 0.0f;
+                for (int j = 0; j < t; j++)
+                    correction += sh_L[t * C + j] * delta[j];
+                delta[t] = rhs_t - correction;
             }
 
             // ── STEP 6: Output ──
@@ -359,7 +320,6 @@ def gated_delta_chunkwise_kernel(
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     chunk_size = 32
-    neumann_iters = math.ceil(math.log2(max(chunk_size, 2)))
 
     return _chunkwise_kernel(
         inputs=[q, k, v, a, b, A_log, dt_bias, state, T],
@@ -371,7 +331,6 @@ def gated_delta_chunkwise_kernel(
             ("Hk", Hk),
             ("Hv", Hv),
             ("CHUNK", chunk_size),
-            ("NEUMANN_ITERS", neumann_iters),
         ],
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
