@@ -411,27 +411,17 @@ def gated_delta_update(
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
 ) -> Tuple[mx.array, mx.array]:
+    beta = mx.sigmoid(b)
+    g = compute_g(A_log, a, dt_bias)
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    T = q.shape[1]
-    on_gpu = use_kernel and mx.default_device() == mx.gpu and mx.metal.is_available()
-
-    # Chunkwise parallel for scalar-gated prefill (e.g. Qwen3.5)
-    if T > 1 and a.ndim == 3:
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         beta = mx.sigmoid(b.astype(mx.float32))
         g = compute_g(A_log, a, dt_bias)
-        y, state = gated_delta_chunkwise(q, k, v, g, beta, state, mask)
-        return y, state
+        y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
+        return y, state.astype(q.dtype)
 
-    # GPU kernel (decode or vectorized-gating prefill)
-    if on_gpu:
-        return gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
-
-    # CPU/non-kernel fallback
-    beta = mx.sigmoid(b.astype(mx.float32))
-    g = compute_g(A_log, a, dt_bias)
-    y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
-    return y, state.astype(q.dtype)
+    return gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
