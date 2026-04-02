@@ -85,26 +85,30 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         for (int t = 0; t < T; ++t) {{
           if ({mask_source}) {{
             {g_compute}
-            float kv_mem = 0.0f;
+            // Fused 3-way reduction: kv_mem, state·q, k·q in ONE simd_sum
+            float3 partial = float3(0.0f);
             for (int i = 0; i < n_per_t; ++i) {{
               auto s_idx = n_per_t * dk_idx + i;
               {g_per_element}
               state[i] = state[i] * g_val;
-              kv_mem += state[i] * k_[s_idx];
+              float kv = static_cast<float>(k_[s_idx]);
+              float qv = static_cast<float>(q_[s_idx]);
+              partial += float3(state[i] * kv, state[i] * qv, kv * qv);
             }}
-            kv_mem = simd_sum(kv_mem);
+            float3 reduced = simd_sum(partial);
+            // reduced.x = kv_mem, reduced.y = state·q (pre-update), reduced.z = k·q
 
-            auto delta = (v_[dv_idx] - kv_mem) * beta_val;
+            auto delta = (v_[dv_idx] - reduced.x) * beta_val;
 
-            float out = 0.0f;
+            // Output: y = state_decayed·q + delta*(k·q) — NO second simd_sum
+            if (thread_index_in_simdgroup == 0) {{
+              y[dv_idx] = static_cast<InT>(reduced.y + delta * reduced.z);
+            }}
+
+            // State update (independent of output)
             for (int i = 0; i < n_per_t; ++i) {{
               auto s_idx = n_per_t * dk_idx + i;
               state[i] = state[i] + k_[s_idx] * delta;
-              out += state[i] * q_[s_idx];
-            }}
-            out = simd_sum(out);
-            if (thread_index_in_simdgroup == 0) {{
-              y[dv_idx] = static_cast<InT>(out);
             }}
           }}
           // Increment data pointers to next time step
