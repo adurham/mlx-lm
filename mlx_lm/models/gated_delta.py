@@ -140,6 +140,244 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
 
 _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
+
+
+def _make_chunkwise_kernel():
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+        // Thread identity
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        auto dk_idx = thread_position_in_threadgroup.x;   // 0-31 SIMD lane
+        auto dv_local = thread_position_in_threadgroup.y;  // 0-3
+        auto dv_idx = thread_position_in_grid.y;           // 0-(Dv-1)
+        auto tid = dv_local * 32 + dk_idx;                 // 0-127 linear
+
+        constexpr int NPT = Dk / 32;  // n_per_t = 6 for Dk=192
+        constexpr int C = CHUNK;
+        constexpr int NITERS = NEUMANN_ITERS;
+
+        // Shared memory
+        threadgroup InT sh_k[C * Dk];        // K chunk (half — cast to float for dots)
+        threadgroup float sh_cumlog[C];
+        threadgroup float sh_beta[C];
+        threadgroup float sh_L[C * C];        // L_strict
+        threadgroup float sh_inv[C * C];      // Neumann inverse
+        threadgroup float sh_pow[C * C];      // Neumann power
+
+        // State in registers (same as sequential kernel)
+        float state[NPT];
+        auto i_st = state_in + (n * Dv + dv_idx) * Dk;
+        for (int i = 0; i < NPT; i++)
+            state[i] = static_cast<float>(i_st[dk_idx * NPT + i]);
+
+        // Base pointers
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto y_ = y + b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto a_ = a + b_idx * T * Hv;
+        auto b_ = b + b_idx * T * Hv;
+
+        int n_chunks = (T + C - 1) / C;
+
+        for (int ch = 0; ch < n_chunks; ch++) {
+            int cs = ch * C;
+            int cl = min(C, T - cs);  // chunk length (may be < C for last chunk)
+
+            // ── STEP 1: Load K into shared memory (float32 for dot products) ──
+            int k_total = cl * Dk;
+            for (int idx = tid; idx < k_total; idx += 128) {
+                int tl = idx / Dk;
+                int dk = idx % Dk;
+                sh_k[tl * Dk + dk] = k_[(cs + tl) * Hk * Dk + dk];
+            }
+
+            // ── STEP 2: Compute cumlog and beta (single thread) ──
+            if (tid == 0) {
+                float cum = 0.0f;
+                float neg_eA = -exp(static_cast<float>(A_log[hv_idx]));
+                for (int t = 0; t < cl; t++) {
+                    float av = static_cast<float>(a_[(cs + t) * Hv + hv_idx]);
+                    float xg = av + static_cast<float>(dt_bias[hv_idx]);
+                    float sp = (xg > 20.0f) ? xg : log(1.0f + exp(xg));
+                    cum += log(exp(neg_eA * sp) + 1e-38f);
+                    sh_cumlog[t] = cum;
+                    sh_beta[t] = 1.0f / (1.0f + exp(-static_cast<float>(b_[(cs + t) * Hv + hv_idx])));
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ── STEP 3: Compute L_strict (lower triangle) ──
+            for (int idx = tid; idx < C * C; idx += 128)
+                sh_L[idx] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Each of 128 threads handles some (i,j) pairs
+            for (int idx = tid; idx < cl * cl; idx += 128) {
+                int i = idx / cl;
+                int j = idx % cl;
+                if (j >= i) continue;  // strict lower triangle only
+                float dot = 0.0f;
+                for (int d = 0; d < Dk; d++)
+                    dot += static_cast<float>(sh_k[i * Dk + d]) * static_cast<float>(sh_k[j * Dk + d]);
+                float decay = exp(sh_cumlog[i] - sh_cumlog[j]);
+                sh_L[i * C + j] = sh_beta[i] * dot * decay;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ── STEP 4: Neumann series ──
+            // inv = I, power = -L_strict
+            for (int idx = tid; idx < C * C; idx += 128) {
+                int r = idx / C, c = idx % C;
+                sh_inv[idx] = (r == c && r < cl) ? 1.0f : 0.0f;
+                sh_pow[idx] = -sh_L[idx];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // 5 iterations of: inv += inv @ power, power = power @ power
+            constexpr int ELEMS = (C * C + 127) / 128;  // elements per thread
+            for (int it = 0; it < NITERS; it++) {
+                float reg_inv[ELEMS], reg_pow[ELEMS];
+                for (int e = 0; e < ELEMS; e++) {
+                    int flat = tid + e * 128;
+                    if (flat >= C * C) { reg_inv[e] = 0; reg_pow[e] = 0; continue; }
+                    int r = flat / C, c2 = flat % C;
+                    float si = 0.0f, sp = 0.0f;
+                    for (int kk = 0; kk < cl; kk++) {
+                        float inv_rk = sh_inv[r * C + kk];
+                        float pow_kc = sh_pow[kk * C + c2];
+                        si += inv_rk * pow_kc;
+                        sp += sh_pow[r * C + kk] * pow_kc;
+                    }
+                    reg_inv[e] = si;
+                    reg_pow[e] = sp;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int e = 0; e < ELEMS; e++) {
+                    int flat = tid + e * 128;
+                    if (flat >= C * C) continue;
+                    sh_inv[flat] += reg_inv[e];
+                    sh_pow[flat] = reg_pow[e];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // ── STEP 5: RHS and delta for this dv_idx ──
+            float rhs[C], delta[C];
+            for (int t = 0; t < cl; t++) {
+                float dect = exp(sh_cumlog[t]);
+                // state · k[t]: partial sum + simd reduction
+                float sdk = 0.0f;
+                for (int i = 0; i < NPT; i++)
+                    sdk += state[i] * static_cast<float>(sh_k[t * Dk + dk_idx * NPT + i]);
+                sdk = simd_sum(sdk);
+                float vv = static_cast<float>(v_[(cs + t) * Hv * Dv + dv_idx]);
+                rhs[t] = sh_beta[t] * vv - sh_beta[t] * dect * sdk;
+            }
+            for (int t = cl; t < C; t++) rhs[t] = 0.0f;
+            // delta = inv @ rhs
+            for (int t = 0; t < cl; t++) {
+                float s = 0.0f;
+                for (int j = 0; j < cl; j++)
+                    s += sh_inv[t * C + j] * rhs[j];
+                delta[t] = s;
+            }
+
+            // ── STEP 6: Output ──
+            for (int t = 0; t < cl; t++) {
+                float dect = exp(sh_cumlog[t]);
+                auto qt = q_ + (cs + t) * Hk * Dk;
+                // state · q[t]
+                float sdq = 0.0f;
+                for (int i = 0; i < NPT; i++)
+                    sdq += state[i] * static_cast<float>(qt[dk_idx * NPT + i]);
+                sdq = simd_sum(sdq);
+                float y_st = dect * sdq;
+                // intra-chunk: sum_j A[t,j] * delta[j]
+                float y_in = 0.0f;
+                for (int j = 0; j <= t; j++) {
+                    float qdk = 0.0f;
+                    for (int i = 0; i < NPT; i++)
+                        qdk += static_cast<float>(qt[dk_idx * NPT + i]) * static_cast<float>(sh_k[j * Dk + dk_idx * NPT + i]);
+                    qdk = simd_sum(qdk);
+                    float decay_tj = exp(sh_cumlog[t] - sh_cumlog[j]);
+                    y_in += qdk * decay_tj * delta[j];
+                }
+                if (thread_index_in_simdgroup == 0)
+                    y_[(cs + t) * Hv * Dv + dv_idx] = static_cast<InT>(y_st + y_in);
+            }
+
+            // ── STEP 7: State update ──
+            float td = exp(sh_cumlog[cl - 1]);
+            for (int i = 0; i < NPT; i++)
+                state[i] *= td;
+            for (int j = 0; j < cl; j++) {
+                float dte = exp(sh_cumlog[cl - 1] - sh_cumlog[j]);
+                float wd = dte * delta[j];
+                for (int i = 0; i < NPT; i++)
+                    state[i] += wd * static_cast<float>(sh_k[j * Dk + dk_idx * NPT + i]);
+            }
+
+            // Barrier before next chunk overwrites shared memory
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        }  // end chunk loop
+
+        // Write final state
+        auto o_st = state_out + (n * Dv + dv_idx) * Dk;
+        for (int i = 0; i < NPT; i++)
+            o_st[dk_idx * NPT + i] = static_cast<StT>(state[i]);
+    """
+
+    return mx.fast.metal_kernel(
+        name="gated_delta_chunkwise",
+        input_names=["q", "k", "v", "a", "b", "A_log", "dt_bias", "state_in", "T"],
+        output_names=["y", "state_out"],
+        source=source,
+    )
+
+
+_chunkwise_kernel = _make_chunkwise_kernel()
+
+
+def gated_delta_chunkwise_kernel(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: mx.array,
+    mask: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array]:
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    chunk_size = 32
+    neumann_iters = math.ceil(math.log2(max(chunk_size, 2)))
+
+    return _chunkwise_kernel(
+        inputs=[q, k, v, a, b, A_log, dt_bias, state, T],
+        template=[
+            ("InT", q.dtype),
+            ("StT", state.dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+            ("CHUNK", chunk_size),
+            ("NEUMANN_ITERS", neumann_iters),
+        ],
+        grid=(32, Dv, B * Hv),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(B, T, Hv, Dv), state.shape],
+        output_dtypes=[q.dtype, state.dtype],
+    )
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
     has_mask=True, vectorized=True
@@ -422,14 +660,13 @@ def gated_delta_update(
     T = q.shape[1]
     on_gpu = use_kernel and mx.default_device() == mx.gpu and mx.metal.is_available()
 
-    # Chunkwise parallel for scalar-gated prefill (e.g. Qwen3.5)
-    if T > 1 and a.ndim == 3:
-        beta = mx.sigmoid(b.astype(mx.float32))
-        g = compute_g(A_log, a, dt_bias)
-        y, state = gated_delta_chunkwise(q, k, v, g, beta, state, mask)
-        return y, state
+    # Fused chunkwise kernel for scalar-gated prefill (e.g. Qwen3.5)
+    if T > 32 and a.ndim == 3 and on_gpu and mask is None:
+        return gated_delta_chunkwise_kernel(
+            q, k, v, a, b, A_log, dt_bias, state
+        )
 
-    # GPU kernel (decode or vectorized-gating prefill)
+    # GPU kernel (decode, short prefill, masked, or vectorized gating)
     if on_gpu:
         return gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
 
