@@ -142,32 +142,33 @@ _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
 
 
-def _make_chunkwise_kernel():
+def _make_cached_kernel():
+    """Sequential DeltaNet kernel with shared memory K cache.
+
+    Same algorithm as the original sequential kernel — identical recurrence,
+    identical output. The only difference: K is batch-loaded into threadgroup
+    shared memory every CHUNK tokens, so the inner loop reads from shared
+    (~2 cycle latency) instead of global (~100+ cycles).
+    """
     if not mx.metal.is_available():
         return None
 
     source = """
-        // Thread identity
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
         auto hk_idx = hv_idx / (Hv / Hk);
-        auto dk_idx = thread_position_in_threadgroup.x;   // 0-31 SIMD lane
-        auto dv_local = thread_position_in_threadgroup.y;  // 0-3
-        auto dv_idx = thread_position_in_grid.y;           // 0-(Dv-1)
-        auto tid = dv_local * 32 + dk_idx;                 // 0-127 linear
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+        auto tid = thread_position_in_threadgroup.y * 32 + dk_idx;
 
-        constexpr int NPT = Dk / 32;  // n_per_t = 6 for Dk=192
+        constexpr int NPT = Dk / 32;
         constexpr int C = CHUNK;
-        // Forward substitution replaces Neumann series — zero barriers needed
 
-        // Shared memory
-        threadgroup InT sh_k[C * Dk];        // K chunk (half — cast to float for dots)
-        threadgroup float sh_cumlog[C];
-        threadgroup float sh_beta[C];
-        threadgroup float sh_L[C * C];        // L_strict
+        // Shared memory: batch of K vectors
+        threadgroup InT sh_k[C * Dk];
 
-        // State in registers (same as sequential kernel)
+        // State in registers
         float state[NPT];
         auto i_st = state_in + (n * Dv + dv_idx) * Dk;
         for (int i = 0; i < NPT; i++)
@@ -181,113 +182,56 @@ def _make_chunkwise_kernel():
         auto a_ = a + b_idx * T * Hv;
         auto b_ = b + b_idx * T * Hv;
 
-        int n_chunks = (T + C - 1) / C;
+        for (int batch = 0; batch < T; batch += C) {
+            int bl = min(C, T - batch);
 
-        for (int ch = 0; ch < n_chunks; ch++) {
-            int cs = ch * C;
-            int cl = min(C, T - cs);  // chunk length (may be < C for last chunk)
-
-            // ── STEP 1: Load K into shared memory (float32 for dot products) ──
-            int k_total = cl * Dk;
-            for (int idx = tid; idx < k_total; idx += 128) {
+            // Cooperative load: 128 threads load K[batch:batch+bl] into shared
+            int total = bl * Dk;
+            for (int idx = tid; idx < total; idx += 128) {
                 int tl = idx / Dk;
                 int dk = idx % Dk;
-                sh_k[tl * Dk + dk] = k_[(cs + tl) * Hk * Dk + dk];
+                sh_k[tl * Dk + dk] = k_[(batch + tl) * Hk * Dk + dk];
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // ── STEP 2: Compute cumlog and beta (single thread) ──
-            if (tid == 0) {
-                float cum = 0.0f;
-                float neg_eA = -exp(static_cast<float>(A_log[hv_idx]));
-                for (int t = 0; t < cl; t++) {
-                    float av = static_cast<float>(a_[(cs + t) * Hv + hv_idx]);
-                    float xg = av + static_cast<float>(dt_bias[hv_idx]);
-                    float sp = (xg > 20.0f) ? xg : log(1.0f + exp(xg));
-                    cum += log(exp(neg_eA * sp) + 1e-38f);
-                    sh_cumlog[t] = cum;
-                    sh_beta[t] = 1.0f / (1.0f + exp(-static_cast<float>(b_[(cs + t) * Hv + hv_idx])));
+            // Sequential recurrence — identical to original kernel,
+            // but k reads come from shared memory
+            for (int t = 0; t < bl; t++) {
+                int tg = batch + t;
+
+                // Gating (same as original)
+                float a_val = static_cast<float>(a_[tg * Hv + hv_idx]);
+                float dt_val = static_cast<float>(dt_bias[hv_idx]);
+                float x_g = a_val + dt_val;
+                float sp = (x_g > 20.0f) ? x_g : log(1.0f + exp(x_g));
+                float g_val = exp(-exp(static_cast<float>(A_log[hv_idx])) * sp);
+                float beta_val = 1.0f / (1.0f + exp(-static_cast<float>(b_[tg * Hv + hv_idx])));
+
+                // Decay + kv_mem (k from shared memory)
+                float kv_mem = 0.0f;
+                for (int i = 0; i < NPT; i++) {
+                    auto s_idx = dk_idx * NPT + i;
+                    state[i] *= g_val;
+                    kv_mem += state[i] * static_cast<float>(sh_k[t * Dk + s_idx]);
                 }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+                kv_mem = simd_sum(kv_mem);
 
-            // ── STEP 3: Compute L_strict (lower triangle) ──
-            for (int idx = tid; idx < C * C; idx += 128)
-                sh_L[idx] = 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+                auto delta = (static_cast<float>(v_[tg * Hv * Dv + dv_idx]) - kv_mem) * beta_val;
 
-            // Each of 128 threads handles some (i,j) pairs
-            for (int idx = tid; idx < cl * cl; idx += 128) {
-                int i = idx / cl;
-                int j = idx % cl;
-                if (j >= i) continue;  // strict lower triangle only
-                float dot = 0.0f;
-                for (int d = 0; d < Dk; d++)
-                    dot += static_cast<float>(sh_k[i * Dk + d]) * static_cast<float>(sh_k[j * Dk + d]);
-                float decay = exp(sh_cumlog[i] - sh_cumlog[j]);
-                sh_L[i * C + j] = sh_beta[i] * dot * decay;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // ── STEP 4+5: RHS and delta via forward substitution ──
-            // Solve (I + L_strict) @ delta = rhs directly. No barriers needed:
-            // all threads in a SIMD group compute the same delta (it only varies
-            // per dv, not per dk), and L_strict is in shared memory (read-only).
-            float delta[C];
-            for (int t = 0; t < cl; t++) {
-                float dect = exp(sh_cumlog[t]);
-                // state · k[t]: partial sum + simd reduction
-                float sdk = 0.0f;
-                for (int i = 0; i < NPT; i++)
-                    sdk += state[i] * static_cast<float>(sh_k[t * Dk + dk_idx * NPT + i]);
-                sdk = simd_sum(sdk);
-                float vv = static_cast<float>(v_[(cs + t) * Hv * Dv + dv_idx]);
-                float rhs_t = sh_beta[t] * vv - sh_beta[t] * dect * sdk;
-                // Forward sub: delta[t] = rhs[t] - sum_{j<t} L[t,j] * delta[j]
-                float correction = 0.0f;
-                for (int j = 0; j < t; j++)
-                    correction += sh_L[t * C + j] * delta[j];
-                delta[t] = rhs_t - correction;
-            }
-
-            // ── STEP 6: Output ──
-            for (int t = 0; t < cl; t++) {
-                float dect = exp(sh_cumlog[t]);
-                auto qt = q_ + (cs + t) * Hk * Dk;
-                // state · q[t]
-                float sdq = 0.0f;
-                for (int i = 0; i < NPT; i++)
-                    sdq += state[i] * static_cast<float>(qt[dk_idx * NPT + i]);
-                sdq = simd_sum(sdq);
-                float y_st = dect * sdq;
-                // intra-chunk: sum_j A[t,j] * delta[j]
-                float y_in = 0.0f;
-                for (int j = 0; j <= t; j++) {
-                    float qdk = 0.0f;
-                    for (int i = 0; i < NPT; i++)
-                        qdk += static_cast<float>(qt[dk_idx * NPT + i]) * static_cast<float>(sh_k[j * Dk + dk_idx * NPT + i]);
-                    qdk = simd_sum(qdk);
-                    float decay_tj = exp(sh_cumlog[t] - sh_cumlog[j]);
-                    y_in += qdk * decay_tj * delta[j];
+                // State update + output (k from shared, q from global)
+                float out = 0.0f;
+                for (int i = 0; i < NPT; i++) {
+                    auto s_idx = dk_idx * NPT + i;
+                    state[i] += static_cast<float>(sh_k[t * Dk + s_idx]) * delta;
+                    out += state[i] * static_cast<float>(q_[tg * Hk * Dk + s_idx]);
                 }
+                out = simd_sum(out);
                 if (thread_index_in_simdgroup == 0)
-                    y_[(cs + t) * Hv * Dv + dv_idx] = static_cast<InT>(y_st + y_in);
+                    y_[tg * Hv * Dv + dv_idx] = static_cast<InT>(out);
             }
 
-            // ── STEP 7: State update ──
-            float td = exp(sh_cumlog[cl - 1]);
-            for (int i = 0; i < NPT; i++)
-                state[i] *= td;
-            for (int j = 0; j < cl; j++) {
-                float dte = exp(sh_cumlog[cl - 1] - sh_cumlog[j]);
-                float wd = dte * delta[j];
-                for (int i = 0; i < NPT; i++)
-                    state[i] += wd * static_cast<float>(sh_k[j * Dk + dk_idx * NPT + i]);
-            }
-
-            // Barrier before next chunk overwrites shared memory
             threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        }  // end chunk loop
+        }
 
         // Write final state
         auto o_st = state_out + (n * Dv + dv_idx) * Dk;
@@ -296,14 +240,14 @@ def _make_chunkwise_kernel():
     """
 
     return mx.fast.metal_kernel(
-        name="gated_delta_chunkwise",
+        name="gated_delta_cached",
         input_names=["q", "k", "v", "a", "b", "A_log", "dt_bias", "state_in", "T"],
         output_names=["y", "state_out"],
         source=source,
     )
 
 
-_chunkwise_kernel = _make_chunkwise_kernel()
+_cached_kernel = _make_cached_kernel()
 
 
 def gated_delta_chunkwise_kernel(
@@ -321,7 +265,7 @@ def gated_delta_chunkwise_kernel(
     Hv, Dv = v.shape[2:]
     chunk_size = 32
 
-    return _chunkwise_kernel(
+    return _cached_kernel(
         inputs=[q, k, v, a, b, A_log, dt_bias, state, T],
         template=[
             ("InT", q.dtype),
