@@ -321,7 +321,10 @@ def gated_delta_chunkwise(
     q_f = q.astype(mx.float32)
     k_f = k.astype(mx.float32)
     v_f = v.astype(mx.float32)
-    log_g = mx.log(mx.maximum(g.astype(mx.float32), 1e-6))
+    # g = exp(-positive), so g is in (0, 1]. Use tiny epsilon to avoid log(0)
+    # without clamping g itself — a larger clamp (e.g. 1e-6) corrupts gating
+    # for tokens with strong decay (g ≈ 1e-14).
+    log_g = mx.log(g.astype(mx.float32) + 1e-38)
     beta_f = beta.astype(mx.float32)
 
     if mask is not None:
