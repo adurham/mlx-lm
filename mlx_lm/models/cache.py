@@ -317,6 +317,23 @@ class QuantizedKVCache(_BaseCache):
     def empty(self):
         return self.keys is None
 
+    @classmethod
+    def merge(cls, caches):
+        # Dequantize into KVCache objects and delegate to BatchKVCache.merge
+        kv_caches = []
+        for c in caches:
+            kv = KVCache()
+            if c.keys is not None:
+                kv.keys = mx.dequantize(
+                    *c.keys, group_size=c.group_size, bits=c.bits
+                )
+                kv.values = mx.dequantize(
+                    *c.values, group_size=c.group_size, bits=c.bits
+                )
+                kv.offset = c.offset
+            kv_caches.append(kv)
+        return BatchKVCache.merge(kv_caches)
+
     @property
     def nbytes(self):
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
