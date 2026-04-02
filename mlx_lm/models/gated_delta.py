@@ -1,4 +1,3 @@
-import math
 from functools import partial
 from typing import Optional, Tuple
 
@@ -85,30 +84,26 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         for (int t = 0; t < T; ++t) {{
           if ({mask_source}) {{
             {g_compute}
-            // Fused 3-way reduction: kv_mem, state·q, k·q in ONE simd_sum
-            float3 partial = float3(0.0f);
+            float kv_mem = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {{
               auto s_idx = n_per_t * dk_idx + i;
               {g_per_element}
               state[i] = state[i] * g_val;
-              float kv = static_cast<float>(k_[s_idx]);
-              float qv = static_cast<float>(q_[s_idx]);
-              partial += float3(state[i] * kv, state[i] * qv, kv * qv);
+              kv_mem += state[i] * k_[s_idx];
             }}
-            float3 reduced = simd_sum(partial);
-            // reduced.x = kv_mem, reduced.y = state·q (pre-update), reduced.z = k·q
+            kv_mem = simd_sum(kv_mem);
 
-            auto delta = (v_[dv_idx] - reduced.x) * beta_val;
+            auto delta = (v_[dv_idx] - kv_mem) * beta_val;
 
-            // Output: y = state_decayed·q + delta*(k·q) — NO second simd_sum
-            if (thread_index_in_simdgroup == 0) {{
-              y[dv_idx] = static_cast<InT>(reduced.y + delta * reduced.z);
-            }}
-
-            // State update (independent of output)
+            float out = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {{
               auto s_idx = n_per_t * dk_idx + i;
               state[i] = state[i] + k_[s_idx] * delta;
+              out += state[i] * q_[s_idx];
+            }}
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {{
+              y[dv_idx] = static_cast<InT>(out);
             }}
           }}
           // Increment data pointers to next time step
@@ -144,147 +139,6 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
 
 _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
-
-
-def _make_cached_kernel():
-    """Sequential DeltaNet kernel with shared memory K cache.
-
-    Same algorithm as the original sequential kernel — identical recurrence,
-    identical output. The only difference: K is batch-loaded into threadgroup
-    shared memory every CHUNK tokens, so the inner loop reads from shared
-    (~2 cycle latency) instead of global (~100+ cycles).
-    """
-    if not mx.metal.is_available():
-        return None
-
-    source = """
-        auto n = thread_position_in_grid.z;
-        auto b_idx = n / Hv;
-        auto hv_idx = n % Hv;
-        auto hk_idx = hv_idx / (Hv / Hk);
-        auto dk_idx = thread_position_in_threadgroup.x;
-        auto dv_idx = thread_position_in_grid.y;
-        auto tid = thread_position_in_threadgroup.y * 32 + dk_idx;
-
-        constexpr int NPT = Dk / 32;
-        constexpr int C = CHUNK;
-
-        // Shared memory: batch of K vectors
-        threadgroup InT sh_k[C * Dk];
-
-        // State in registers
-        float state[NPT];
-        auto i_st = state_in + (n * Dv + dv_idx) * Dk;
-        for (int i = 0; i < NPT; i++)
-            state[i] = static_cast<float>(i_st[dk_idx * NPT + i]);
-
-        // Base pointers
-        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
-        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
-        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
-        auto y_ = y + b_idx * T * Hv * Dv + hv_idx * Dv;
-        auto a_ = a + b_idx * T * Hv;
-        auto b_ = b + b_idx * T * Hv;
-
-        for (int batch = 0; batch < T; batch += C) {
-            int bl = min(C, T - batch);
-
-            // Cooperative load: 128 threads load K[batch:batch+bl] into shared
-            int total = bl * Dk;
-            for (int idx = tid; idx < total; idx += 128) {
-                int tl = idx / Dk;
-                int dk = idx % Dk;
-                sh_k[tl * Dk + dk] = k_[(batch + tl) * Hk * Dk + dk];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Sequential recurrence — identical to original kernel,
-            // but k reads come from shared memory
-            for (int t = 0; t < bl; t++) {
-                int tg = batch + t;
-
-                // Gating (same as original)
-                float a_val = static_cast<float>(a_[tg * Hv + hv_idx]);
-                float dt_val = static_cast<float>(dt_bias[hv_idx]);
-                float x_g = a_val + dt_val;
-                float sp = (x_g > 20.0f) ? x_g : log(1.0f + exp(x_g));
-                float g_val = exp(-exp(static_cast<float>(A_log[hv_idx])) * sp);
-                float beta_val = 1.0f / (1.0f + exp(-static_cast<float>(b_[tg * Hv + hv_idx])));
-
-                // Decay + kv_mem (k from shared memory)
-                float kv_mem = 0.0f;
-                for (int i = 0; i < NPT; i++) {
-                    auto s_idx = dk_idx * NPT + i;
-                    state[i] *= g_val;
-                    kv_mem += state[i] * static_cast<float>(sh_k[t * Dk + s_idx]);
-                }
-                kv_mem = simd_sum(kv_mem);
-
-                auto delta = (static_cast<float>(v_[tg * Hv * Dv + dv_idx]) - kv_mem) * beta_val;
-
-                // State update + output (k from shared, q from global)
-                float out = 0.0f;
-                for (int i = 0; i < NPT; i++) {
-                    auto s_idx = dk_idx * NPT + i;
-                    state[i] += static_cast<float>(sh_k[t * Dk + s_idx]) * delta;
-                    out += state[i] * static_cast<float>(q_[tg * Hk * Dk + s_idx]);
-                }
-                out = simd_sum(out);
-                if (thread_index_in_simdgroup == 0)
-                    y_[tg * Hv * Dv + dv_idx] = static_cast<InT>(out);
-            }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        // Write final state
-        auto o_st = state_out + (n * Dv + dv_idx) * Dk;
-        for (int i = 0; i < NPT; i++)
-            o_st[dk_idx * NPT + i] = static_cast<StT>(state[i]);
-    """
-
-    return mx.fast.metal_kernel(
-        name="gated_delta_cached",
-        input_names=["q", "k", "v", "a", "b", "A_log", "dt_bias", "state_in", "T"],
-        output_names=["y", "state_out"],
-        source=source,
-    )
-
-
-_cached_kernel = _make_cached_kernel()
-
-
-def gated_delta_chunkwise_kernel(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    a: mx.array,
-    b: mx.array,
-    A_log: mx.array,
-    dt_bias: mx.array,
-    state: mx.array,
-    mask: Optional[mx.array] = None,
-) -> Tuple[mx.array, mx.array]:
-    B, T, Hk, Dk = k.shape
-    Hv, Dv = v.shape[2:]
-    chunk_size = 32
-
-    return _cached_kernel(
-        inputs=[q, k, v, a, b, A_log, dt_bias, state, T],
-        template=[
-            ("InT", q.dtype),
-            ("StT", state.dtype),
-            ("Dk", Dk),
-            ("Dv", Dv),
-            ("Hk", Hk),
-            ("Hv", Hv),
-            ("CHUNK", chunk_size),
-        ],
-        grid=(32, Dv, B * Hv),
-        threadgroup=(32, 4, 1),
-        output_shapes=[(B, T, Hv, Dv), state.shape],
-        output_dtypes=[q.dtype, state.dtype],
-    )
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
     has_mask=True, vectorized=True
@@ -429,124 +283,6 @@ def gated_delta_ops(
     return y, state
 
 
-def gated_delta_chunkwise(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: Optional[mx.array] = None,
-    mask: Optional[mx.array] = None,
-    chunk_size: int = 64,
-) -> Tuple[mx.array, mx.array]:
-    """
-    Chunkwise parallel gated delta rule for prefill.
-
-    Instead of processing tokens sequentially, splits into sub-chunks and
-    uses matrix operations within each chunk. Only supports scalar gating
-    (g: [B, T, Hv]).
-
-    Shapes:
-      q, k: [B, T, Hk, Dk]
-      v: [B, T, Hv, Dv]
-      g: [B, T, Hv]
-      beta: [B, T, Hv]
-      state: [B, Hv, Dv, Dk]
-    """
-    B, T, Hk, Dk = q.shape
-    Hv, Dv = v.shape[2], v.shape[3]
-
-    if (repeat_factor := Hv // Hk) > 1:
-        q = mx.repeat(q, repeat_factor, axis=2)
-        k = mx.repeat(k, repeat_factor, axis=2)
-
-    if state is None:
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-
-    q_f = q.astype(mx.float32)
-    k_f = k.astype(mx.float32)
-    v_f = v.astype(mx.float32)
-    # g = exp(-positive), so g is in (0, 1]. Use tiny epsilon to avoid log(0)
-    # without clamping g itself — a larger clamp (e.g. 1e-6) corrupts gating
-    # for tokens with strong decay (g ≈ 1e-14).
-    log_g = mx.log(g.astype(mx.float32) + 1e-38)
-    beta_f = beta.astype(mx.float32)
-
-    if mask is not None:
-        mask_h = mask[..., None].astype(mx.float32)
-        log_g = log_g * mask_h
-        beta_f = beta_f * mask_h
-
-    ys = []
-    for c_start in range(0, T, chunk_size):
-        C = min(chunk_size, T - c_start)
-
-        # Transpose to heads-first: [B, Hv, C, D]
-        q_t = q_f[:, c_start : c_start + C].transpose(0, 2, 1, 3)
-        k_t = k_f[:, c_start : c_start + C].transpose(0, 2, 1, 3)
-        v_t = v_f[:, c_start : c_start + C].transpose(0, 2, 1, 3)
-        beta_t = beta_f[:, c_start : c_start + C].transpose(0, 2, 1)
-        log_g_t = log_g[:, c_start : c_start + C].transpose(0, 2, 1)
-
-        # Cumulative log decay
-        cumlog = mx.cumsum(log_g_t, axis=-1)
-
-        # Decay matrix (lower triangular): decay[i,j] = prod(g[j+1..i])
-        decay_mat = mx.exp(cumlog[..., :, None] - cumlog[..., None, :])
-        decay_mat = mx.tril(decay_mat)
-
-        # Pairwise key dot products
-        KK = k_t @ k_t.transpose(0, 1, 3, 2)
-
-        # L_strict: correction for intra-chunk self-interference
-        L = beta_t[..., :, None] * KK * decay_mat
-        L_strict = mx.tril(L, -1)
-
-        # RHS = beta*v - beta*decay_to*(state @ k)
-        decay_to = mx.exp(cumlog)
-        Sk = state @ k_t.transpose(0, 1, 3, 2)
-        p = (Sk * (beta_t * decay_to)[..., None, :]).transpose(0, 1, 3, 2)
-        bv = beta_t[..., None] * v_t
-        rhs = bv - p
-
-        # Solve (I + L_strict) @ delta = rhs via Neumann series with doubling.
-        # L_strict is nilpotent (strictly lower triangular), so the series
-        # (I + L)^{-1} = sum_{n>=0} (-L)^n terminates exactly at C-1 terms.
-        n_iter = math.ceil(math.log2(max(C, 2)))
-        inv = mx.eye(C, dtype=mx.float32)
-        power = -L_strict
-        for _ in range(n_iter):
-            inv = inv + inv @ power
-            power = power @ power
-        delta_mat = inv @ rhs
-
-        # Output = state_contribution + intra_chunk_attention
-        Q_decayed = q_t * decay_to[..., None]
-        y_state = (state @ Q_decayed.transpose(0, 1, 3, 2)).transpose(
-            0, 1, 3, 2
-        )
-
-        QK = q_t @ k_t.transpose(0, 1, 3, 2)
-        A = mx.tril(QK * decay_mat)
-        y_intra = A @ delta_mat
-
-        ys.append((y_state + y_intra).transpose(0, 2, 1, 3))
-
-        # State update: S = total_decay * S + sum(decay_to_end * delta outer k)
-        total_decay = mx.exp(cumlog[..., -1:])
-        state = state * total_decay[..., None]
-        decay_to_end = mx.exp(cumlog[..., -1:] - cumlog)
-        delta_weighted = delta_mat * decay_to_end[..., None]
-        state = state + delta_weighted.transpose(0, 1, 3, 2) @ k_t
-
-    y = mx.concatenate(ys, axis=1)
-
-    if mask is not None:
-        y = y * mask[..., None, None].astype(y.dtype)
-
-    return y.astype(q.dtype), state
-
-
 def gated_delta_update(
     q: mx.array,
     k: mx.array,
@@ -559,26 +295,17 @@ def gated_delta_update(
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
 ) -> Tuple[mx.array, mx.array]:
+    beta = mx.sigmoid(b)
+    g = compute_g(A_log, a, dt_bias)
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    T = q.shape[1]
-    on_gpu = use_kernel and mx.default_device() == mx.gpu and mx.metal.is_available()
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        beta = mx.sigmoid(b.astype(mx.float32))
+        g = compute_g(A_log, a, dt_bias)
+        y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
+        return y, state.astype(q.dtype)
 
-    # Fused chunkwise kernel for scalar-gated prefill (e.g. Qwen3.5)
-    if T > 32 and a.ndim == 3 and on_gpu and mask is None:
-        return gated_delta_chunkwise_kernel(
-            q, k, v, a, b, A_log, dt_bias, state
-        )
-
-    # GPU kernel (decode, short prefill, masked, or vectorized gating)
-    if on_gpu:
-        return gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
-
-    # CPU/non-kernel fallback
-    beta = mx.sigmoid(b.astype(mx.float32))
-    g = compute_g(A_log, a, dt_bias)
-    y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
-    return y, state.astype(q.dtype)
+    return gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
