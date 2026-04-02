@@ -11,7 +11,6 @@ from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
-    gated_delta_chunkwise,
     gated_delta_kernel,
     gated_delta_ops,
     gated_delta_update,
@@ -2650,23 +2649,14 @@ class TestModels(unittest.TestCase):
                 q = mx.random.normal(shape=(B, T, Hk, Dk))
                 k = mx.random.normal(shape=(B, T, Hk, Dk))
                 v = mx.random.normal(shape=(B, T, Hv, Dv))
-                a = -7.0 + mx.random.normal(shape=(B, T, Hv)) * 0.3
-                b = mx.random.normal(shape=(B, T, Hv))
-                A_log = mx.zeros((Hv,))
-                dt_bias = mx.ones((Hv,))
-                state = mx.random.normal(shape=(B, Hv, Dv, Dk))
-
-                g = mx.exp(
-                    -mx.exp(A_log) * nn.softplus(a + dt_bias)
-                ).astype(mx.float32)
-                beta = mx.sigmoid(b.astype(mx.float32))
+                g = mx.random.uniform(shape=(B, T, Hv))
+                beta = mx.random.uniform(shape=(B, T, Hv))
+                state = mx.random.normal(shape=(B, Hv, Dk, Dv))
 
                 y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
-                y_k, st_k = gated_delta_kernel(
-                    q, k, v, a, b, A_log, dt_bias, state
-                )
-                self.assertTrue(mx.allclose(y_op, y_k, rtol=1e-4, atol=1e-4))
-                self.assertTrue(mx.allclose(st_op, st_k, rtol=1e-4, atol=1e-4))
+                y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
+                self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
+                self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
 
     def test_gated_delta_precision(self):
         mx.random.seed(42)
@@ -2734,9 +2724,9 @@ class TestModels(unittest.TestCase):
         q = mx.random.normal(shape=(B, T, Hk, Dk))
         k = mx.random.normal(shape=(B, T, Hk, Dk))
         v = mx.random.normal(shape=(B, T, Hv, Dv))
-        g = mx.random.uniform(shape=(B, T, Hv))
-        beta = mx.random.uniform(shape=(B, T, Hv))
-        state = mx.random.normal(shape=(B, Hv, Dv, Dk))
+        g = mx.random.normal(shape=(B, T, Hv))
+        beta = mx.random.normal(shape=(B, T, Hv))
+        state = mx.random.normal(shape=(B, Hv, Dk, Dv))
 
         for s, e, mask in [
             (1, 3, mx.array([[False, True, True]])),
@@ -2750,54 +2740,11 @@ class TestModels(unittest.TestCase):
                 beta[:, s:e],
                 state,
             )
-            for fn, tol in [
-                (gated_delta_ops, (1e-4, 1e-4)),
-                (gated_delta_chunkwise, (1e-3, 5e-3)),
-            ]:
+            for fn in [gated_delta_ops, gated_delta_kernel]:
                 y, st = fn(q, k, v, g, beta, state, mask)
                 y = y[:, s:e]
-                self.assertTrue(
-                    mx.allclose(y, y_gt, rtol=tol[0], atol=tol[1]),
-                    f"{fn.__name__} y: max_diff={mx.abs(y - y_gt).max().item():.6f}",
-                )
-                self.assertTrue(
-                    mx.allclose(st, st_gt, rtol=tol[0], atol=tol[1]),
-                    f"{fn.__name__} st: max_diff={mx.abs(st - st_gt).max().item():.6f}",
-                )
-
-    def test_gated_delta_chunkwise(self):
-        mx.random.seed(42)
-        for B in [1, 2]:
-            for T in [2, 7, 64, 128]:
-                for chunk_size in [4, 64]:
-                    Hk = 4
-                    Hv = 8
-                    Dk = 64
-                    Dv = 64
-
-                    q = mx.random.normal(shape=(B, T, Hk, Dk)) * 0.1
-                    k = mx.random.normal(shape=(B, T, Hk, Dk)) * 0.1
-                    v = mx.random.normal(shape=(B, T, Hv, Dv)) * 0.1
-                    g = mx.random.uniform(shape=(B, T, Hv))
-                    beta = mx.random.uniform(shape=(B, T, Hv))
-                    state = mx.random.normal(shape=(B, Hv, Dv, Dk)) * 0.1
-
-                    y_ref, st_ref = gated_delta_ops(q, k, v, g, beta, state)
-                    y_cw, st_cw = gated_delta_chunkwise(
-                        q, k, v, g, beta, state, chunk_size=chunk_size
-                    )
-                    mx.eval(y_ref, st_ref, y_cw, st_cw)
-
-                    self.assertTrue(
-                        mx.allclose(y_cw, y_ref, rtol=1e-3, atol=1e-3),
-                        f"y mismatch B={B} T={T} C={chunk_size}: "
-                        f"max_diff={mx.abs(y_cw - y_ref).max().item():.6f}",
-                    )
-                    self.assertTrue(
-                        mx.allclose(st_cw, st_ref, rtol=1e-3, atol=1e-3),
-                        f"state mismatch B={B} T={T} C={chunk_size}: "
-                        f"max_diff={mx.abs(st_cw - st_ref).max().item():.6f}",
-                    )
+                self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
+                self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":

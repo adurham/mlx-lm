@@ -1,4 +1,3 @@
-import math
 from functools import partial
 from typing import Optional, Tuple
 
@@ -284,121 +283,6 @@ def gated_delta_ops(
     return y, state
 
 
-def gated_delta_chunkwise(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: Optional[mx.array] = None,
-    mask: Optional[mx.array] = None,
-    chunk_size: int = 64,
-) -> Tuple[mx.array, mx.array]:
-    """
-    Chunkwise parallel gated delta rule for prefill.
-
-    Instead of processing tokens sequentially, splits into sub-chunks and
-    uses matrix operations within each chunk. Only supports scalar gating
-    (g: [B, T, Hv]).
-
-    Shapes:
-      q, k: [B, T, Hk, Dk]
-      v: [B, T, Hv, Dv]
-      g: [B, T, Hv]
-      beta: [B, T, Hv]
-      state: [B, Hv, Dv, Dk]
-    """
-    B, T, Hk, Dk = q.shape
-    Hv, Dv = v.shape[2], v.shape[3]
-
-    if (repeat_factor := Hv // Hk) > 1:
-        q = mx.repeat(q, repeat_factor, axis=2)
-        k = mx.repeat(k, repeat_factor, axis=2)
-
-    if state is None:
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-
-    q_f = q.astype(mx.float32)
-    k_f = k.astype(mx.float32)
-    v_f = v.astype(mx.float32)
-    log_g = mx.log(mx.maximum(g.astype(mx.float32), 1e-6))
-    beta_f = beta.astype(mx.float32)
-
-    if mask is not None:
-        mask_h = mask[..., None].astype(mx.float32)
-        log_g = log_g * mask_h
-        beta_f = beta_f * mask_h
-
-    ys = []
-    for c_start in range(0, T, chunk_size):
-        C = min(chunk_size, T - c_start)
-
-        # Transpose to heads-first: [B, Hv, C, D]
-        q_t = q_f[:, c_start : c_start + C].transpose(0, 2, 1, 3)
-        k_t = k_f[:, c_start : c_start + C].transpose(0, 2, 1, 3)
-        v_t = v_f[:, c_start : c_start + C].transpose(0, 2, 1, 3)
-        beta_t = beta_f[:, c_start : c_start + C].transpose(0, 2, 1)
-        log_g_t = log_g[:, c_start : c_start + C].transpose(0, 2, 1)
-
-        # Cumulative log decay
-        cumlog = mx.cumsum(log_g_t, axis=-1)
-
-        # Decay matrix (lower triangular): decay[i,j] = prod(g[j+1..i])
-        decay_mat = mx.exp(cumlog[..., :, None] - cumlog[..., None, :])
-        decay_mat = mx.tril(decay_mat)
-
-        # Pairwise key dot products
-        KK = k_t @ k_t.transpose(0, 1, 3, 2)
-
-        # L_strict: correction for intra-chunk self-interference
-        L = beta_t[..., :, None] * KK * decay_mat
-        L_strict = mx.tril(L, -1)
-
-        # RHS = beta*v - beta*decay_to*(state @ k)
-        decay_to = mx.exp(cumlog)
-        Sk = state @ k_t.transpose(0, 1, 3, 2)
-        p = (Sk * (beta_t * decay_to)[..., None, :]).transpose(0, 1, 3, 2)
-        bv = beta_t[..., None] * v_t
-        rhs = bv - p
-
-        # Solve (I + L_strict) @ delta = rhs via Neumann series with doubling.
-        # L_strict is nilpotent (strictly lower triangular), so the series
-        # (I + L)^{-1} = sum_{n>=0} (-L)^n terminates exactly at C-1 terms.
-        n_iter = math.ceil(math.log2(max(C, 2)))
-        inv = mx.eye(C, dtype=mx.float32)
-        power = -L_strict
-        for _ in range(n_iter):
-            inv = inv + inv @ power
-            power = power @ power
-        delta_mat = inv @ rhs
-
-        # Output = state_contribution + intra_chunk_attention
-        Q_decayed = q_t * decay_to[..., None]
-        y_state = (state @ Q_decayed.transpose(0, 1, 3, 2)).transpose(
-            0, 1, 3, 2
-        )
-
-        QK = q_t @ k_t.transpose(0, 1, 3, 2)
-        A = mx.tril(QK * decay_mat)
-        y_intra = A @ delta_mat
-
-        ys.append((y_state + y_intra).transpose(0, 2, 1, 3))
-
-        # State update: S = total_decay * S + sum(decay_to_end * delta outer k)
-        total_decay = mx.exp(cumlog[..., -1:])
-        state = state * total_decay[..., None]
-        decay_to_end = mx.exp(cumlog[..., -1:] - cumlog)
-        delta_weighted = delta_mat * decay_to_end[..., None]
-        state = state + delta_weighted.transpose(0, 1, 3, 2) @ k_t
-
-    y = mx.concatenate(ys, axis=1)
-
-    if mask is not None:
-        y = y * mask[..., None, None].astype(y.dtype)
-
-    return y.astype(q.dtype), state
-
-
 def gated_delta_update(
     q: mx.array,
     k: mx.array,
@@ -411,27 +295,17 @@ def gated_delta_update(
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
 ) -> Tuple[mx.array, mx.array]:
+    beta = mx.sigmoid(b)
+    g = compute_g(A_log, a, dt_bias)
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    T = q.shape[1]
-    on_gpu = use_kernel and mx.default_device() == mx.gpu and mx.metal.is_available()
-
-    # Chunkwise parallel for scalar-gated prefill (e.g. Qwen3.5)
-    if T > 1 and a.ndim == 3:
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         beta = mx.sigmoid(b.astype(mx.float32))
         g = compute_g(A_log, a, dt_bias)
-        y, state = gated_delta_chunkwise(q, k, v, g, beta, state, mask)
-        return y, state
+        y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
+        return y, state.astype(q.dtype)
 
-    # GPU kernel (decode or vectorized-gating prefill)
-    if on_gpu:
-        return gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
-
-    # CPU/non-kernel fallback
-    beta = mx.sigmoid(b.astype(mx.float32))
-    g = compute_g(A_log, a, dt_bias)
-    y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
-    return y, state.astype(q.dtype)
+    return gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
