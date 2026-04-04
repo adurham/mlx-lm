@@ -380,8 +380,8 @@ class TextModel(nn.Module):
         input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
         out = self.model(inputs, cache, input_embeddings=input_embeddings)
-        if getattr(self, '_skip_lm_head', False):
-            return out
+        # if getattr(self, '_skip_lm_head', False):
+        #     return out
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
