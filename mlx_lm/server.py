@@ -10,7 +10,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -78,7 +78,14 @@ class ToolCallFormatter:
 
         result = []
         for tool_text in tool_calls:
-            parsed = self._tool_parser(tool_text, self._tools)
+            try:
+                parsed = self._tool_parser(tool_text, self._tools)
+            except (ValueError, json.JSONDecodeError) as e:
+                logging.warning(
+                    f"Failed to parse tool call ({type(e).__name__}: {e}) — "
+                    f"tool text was likely truncated mid-generation."
+                )
+                continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
@@ -225,6 +232,22 @@ class Response:
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
+
+
+def _process_control_tokens(ctx, token_stream):
+    buffer_size = max(len(s) for s in ctx.sequences)
+    buffered_stream = deque()
+
+    for tok in token_stream:
+        buffered_stream.append(tok)
+        if tok.match is not None:
+            popped = [buffered_stream.pop() for _ in tok.match]
+            for t in reversed(popped):
+                buffered_stream.append(replace(t, text=""))
+        if len(buffered_stream) >= buffer_size:
+            yield buffered_stream.popleft()
+    while len(buffered_stream) > 0:
+        yield buffered_stream.popleft()
 
 
 class TimeBudget:
@@ -651,10 +674,11 @@ class ResponseGenerator:
             ts = tokenizer.tool_call_start_tokens
             te = tokenizer.tool_call_end_tokens
             transitions["normal"].append((ts, "tool"))
-            transitions["tool"] = [(te, "normal")]
+            transitions["tool"] = [(te, "normal")] if te else []
             transitions["tool"].extend(common_stops)
             sequences[ts] = tokenizer.tool_call_start
-            sequences[te] = tokenizer.tool_call_end
+            if te:
+                sequences[te] = tokenizer.tool_call_end
 
         sm = SequenceStateMachine(transitions, initial=initial_state)
         if len(self._state_machine_cache) > 100:
@@ -1017,20 +1041,6 @@ class ResponseGenerator:
                         progress_callback(*response)
                     continue
                 yield response
-
-        def _process_control_tokens(ctx, token_stream):
-            buffer_size = max(len(s) for s in ctx.sequences)
-            buffered_stream = deque()
-
-            for tok in token_stream:
-                buffered_stream.append(tok)
-                if tok.match is not None:
-                    for _ in tok.match:
-                        buffered_stream.pop()
-                if len(buffered_stream) >= buffer_size:
-                    yield buffered_stream.popleft()
-            while len(buffered_stream) > 0:
-                yield buffered_stream.popleft()
 
         ctx = response_queue.get()
         if isinstance(ctx, Exception):
