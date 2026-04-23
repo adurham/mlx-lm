@@ -1,5 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, List, Optional
@@ -9,7 +10,10 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .minimax_trace import finalize, span
 from .switch_layers import SwitchGLU
+
+_NOOP_ALLSUM: bool = os.environ.get("EXO_MINIMAX_NOOP_ALLSUM", "0") == "1"
 
 
 @dataclass
@@ -126,37 +130,40 @@ class MiniMaxAttention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        B, L, D = x.shape
+        with span("attn"):
+            B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+            queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        if self.use_qk_norm:
-            queries = self.q_norm(queries)
-            keys = self.k_norm(keys)
+            if self.use_qk_norm:
+                queries = self.q_norm(queries)
+                keys = self.k_norm(keys)
 
-        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(
-            0, 2, 1, 3
-        )
-        keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
-            0, 2, 1, 3
-        )
+            queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(
+                0, 2, 1, 3
+            )
+            keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(
+                0, 2, 1, 3
+            )
+            values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+                0, 2, 1, 3
+            )
 
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            if cache is not None:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+                keys, values = cache.update_and_fetch(keys, values)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
 
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output)
+            return finalize(self.o_proj(output))
 
 
 class MiniMaxSparseMoeBlock(nn.Module):
@@ -175,24 +182,34 @@ class MiniMaxSparseMoeBlock(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        gates = self.gate(x.astype(mx.float32))
+        with span("moe.router_topk"):
+            gates = self.gate(x.astype(mx.float32))
 
-        scores = mx.sigmoid(gates)
-        orig_scores = scores
-        scores = scores + self.e_score_correction_bias
+            scores = mx.sigmoid(gates)
+            orig_scores = scores
+            scores = scores + self.e_score_correction_bias
 
-        k = self.num_experts_per_tok
-        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+            k = self.num_experts_per_tok
+            inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+            scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
-        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-        scores = scores.astype(x.dtype)
+            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+            scores = scores.astype(x.dtype)
+            finalize(inds)
+            finalize(scores)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        with span("moe.switch_mlp"):
+            y = finalize(self.switch_mlp(x, inds))
+
+        with span("moe.weighted_reduce"):
+            y = finalize((y * scores[..., None]).sum(axis=-2))
 
         if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
+            with span("moe.all_sum"):
+                if _NOOP_ALLSUM:
+                    y = finalize(y)
+                else:
+                    y = finalize(mx.distributed.all_sum(y, group=self.sharding_group))
 
         return y
 
