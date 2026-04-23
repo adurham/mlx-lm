@@ -115,11 +115,28 @@ def scaled_dot_product_attention(
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
     if hasattr(cache, "bits"):
-        # Dequantize KV cache and use fused SDPA instead of the unfused
-        # quantized_matmul path. The unfused path materializes a full
-        # [B, H, qL, kL] scores matrix (~9 GB at 73K tokens), while
-        # fused SDPA uses O(1) workspace (FlashAttention). Dequantizing
-        # the KV cache costs ~500 MB at 73K — 18x less than the scores.
+        # Fused quantized-KV SDPA. The kernel reads packed K/V and
+        # dequantizes in-register per tile, avoiding the ~540 MB/layer
+        # dequant-write + SDPA-read round trip of the two-step path.
+        # MLX routes unsupported configs (bits ∉ {4,5,8}, head_dim ∉
+        # {64,128}, group_size != 64, or q_seq_len != 1) through an
+        # internal fallback that dequantizes and calls the standard
+        # SDPA primitive — so this entry is safe to call whenever the
+        # mask is compatible with the kernel's (None | "causal") +
+        # sinks interface.
+        if mask is None or (isinstance(mask, str) and mask == "causal"):
+            return mx.fast.scaled_dot_product_attention_quant(
+                queries,
+                *keys,
+                *values,
+                scale=scale,
+                group_size=cache.group_size,
+                bits=cache.bits,
+                do_causal=mask == "causal",
+                sinks=sinks,
+            )
+        # Array / window-size masks aren't accepted by the quant entry;
+        # keep the dequantize + fused-SDPA path for those callers.
         dk = mx.dequantize(*keys, group_size=cache.group_size, bits=cache.bits)
         dv = mx.dequantize(*values, group_size=cache.group_size, bits=cache.bits)
         return mx.fast.scaled_dot_product_attention(
