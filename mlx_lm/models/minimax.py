@@ -232,9 +232,16 @@ class MiniMaxDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        r = x + self.self_attn(self.input_layernorm(x), mask, cache)
-        r = r + self.block_sparse_moe(self.post_attention_layernorm(r))
-        return r
+        with span("layer.input_norm"):
+            normed = finalize(self.input_layernorm(x))
+        attn_out = self.self_attn(normed, mask, cache)
+        with span("layer.attn_residual"):
+            r = finalize(x + attn_out)
+        with span("layer.post_attn_norm"):
+            normed2 = finalize(self.post_attention_layernorm(r))
+        moe_out = self.block_sparse_moe(normed2)
+        with span("layer.moe_residual"):
+            return finalize(r + moe_out)
 
 
 class MiniMaxModel(nn.Module):
@@ -254,17 +261,20 @@ class MiniMaxModel(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        h = self.embed_tokens(inputs)
+        with span("model.embed"):
+            h = finalize(self.embed_tokens(inputs))
 
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        with span("model.attn_mask"):
+            mask = finalize(create_attention_mask(h, cache[0]))
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
 
-        return self.norm(h)
+        with span("model.final_norm"):
+            return finalize(self.norm(h))
 
 
 class Model(nn.Module):
@@ -283,10 +293,11 @@ class Model(nn.Module):
         cache: Optional[Any] = None,
     ):
         out = self.model(inputs=inputs, mask=mask, cache=cache)
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
+        with span("model.lm_head"):
+            if self.args.tie_word_embeddings:
+                out = finalize(self.model.embed_tokens.as_linear(out))
+            else:
+                out = finalize(self.lm_head(out))
         return out
 
     def sanitize(self, weights):
