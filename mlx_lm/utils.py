@@ -347,11 +347,16 @@ def load_model(
 
     def _quantize(quantization):
         def class_predicate(p, m):
+            # Skip layers already quantized at construction time (e.g.
+            # DSv4's switch_mlp pre-quantized to mxfp4). Without this
+            # the per-layer override branch below would try to re-quantize
+            # them and `nn.quantize` raises "Unable to quantize model
+            # of type Quantized*".
+            if not hasattr(m, "to_quantized"):
+                return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
             return f"{p}.scales" in weights
 
         nn.quantize(
