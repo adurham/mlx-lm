@@ -199,6 +199,116 @@ class SwitchGLU(nn.Module):
         return x.squeeze(-2)
 
 
+class BatchedSwitchGLU(SwitchGLU):
+    """SwitchGLU variant that fuses gate+up into a single ``gather_qmm``.
+
+    Vanilla :class:`SwitchGLU` issues two ``gather_qmm`` dispatches (one
+    for ``gate_proj``, one for ``up_proj``) before the SwiGLU activation.
+    When the projections are quantised with the same group size, mode and
+    bits, the two weight buffers can be concatenated along the output
+    dimension and dispatched together — halving the gather/dispatch cost
+    in the routed-expert path.
+
+    Call :meth:`fuse_weights` once after the underlying
+    ``QuantizedSwitchLinear`` projections have been initialised (i.e.
+    after ``nn.quantize``). After that, ``__call__`` uses the fused fast
+    path. Until ``fuse_weights`` runs, ``__call__`` falls back to the
+    vanilla two-dispatch path so the class is safe to instantiate before
+    weights are loaded.
+
+    The fused-weight attributes (``_fused_w_gu``, ``_fused_s_gu``,
+    ``_fused_b_gu``, ``_fused_n_inter``, ``_fused_k_hidden``,
+    ``_fused_group_size``) are written on ``self`` so that downstream MoE
+    kernels which read them (e.g. a routed-experts dispatch that wants to
+    reuse the concatenated gate+up buffers) can find them in a single
+    well-known place.
+    """
+
+    def fuse_weights(self) -> None:
+        """Concatenate quantised gate+up weights into the fused-path buffers.
+
+        Idempotent: re-running rebuilds the fused buffers from the current
+        ``gate_proj`` / ``up_proj`` weights. Requires both projections to
+        be quantised (i.e. expose ``.weight`` / ``.scales`` / ``.biases``)
+        and to share the same ``group_size`` / ``bits`` / ``mode`` — a
+        plain :class:`SwitchLinear` (un-quantised) does not.
+        """
+        gate_proj = self.gate_proj
+        up_proj = self.up_proj
+        for proj_name, proj in (("gate_proj", gate_proj), ("up_proj", up_proj)):
+            for attr in ("scales", "biases", "group_size", "bits"):
+                if not hasattr(proj, attr):
+                    raise TypeError(
+                        f"BatchedSwitchGLU.fuse_weights(): {proj_name} is "
+                        f"missing '{attr}'. Both projections must be quantised "
+                        f"(QuantizedSwitchLinear) before calling fuse_weights()."
+                    )
+        if gate_proj.group_size != up_proj.group_size:  # type: ignore[attr-defined]
+            raise ValueError(
+                "BatchedSwitchGLU.fuse_weights(): gate_proj and up_proj must "
+                "share group_size."
+            )
+        if gate_proj.bits != up_proj.bits:  # type: ignore[attr-defined]
+            raise ValueError(
+                "BatchedSwitchGLU.fuse_weights(): gate_proj and up_proj must "
+                "share bits."
+            )
+
+        self._fused_w_gu = mx.concatenate(
+            [gate_proj.weight, up_proj.weight], axis=1
+        )
+        self._fused_s_gu = mx.concatenate(  # type: ignore[attr-defined]
+            [gate_proj.scales, up_proj.scales], axis=1
+        )
+        self._fused_b_gu = mx.concatenate(  # type: ignore[attr-defined]
+            [gate_proj.biases, up_proj.biases], axis=1
+        )
+        self._fused_n_inter = gate_proj.output_dims
+        self._fused_k_hidden = gate_proj.input_dims
+        self._fused_group_size = gate_proj.group_size  # type: ignore[attr-defined]
+        mx.eval(self._fused_w_gu, self._fused_s_gu, self._fused_b_gu)
+
+    def __call__(self, x, indices) -> mx.array:
+        if not hasattr(self, "_fused_w_gu"):
+            return super().__call__(x, indices)
+
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+
+        n_inter = self._fused_n_inter
+
+        gu = mx.gather_qmm(
+            x,
+            self._fused_w_gu,
+            self._fused_s_gu,
+            self._fused_b_gu,
+            rhs_indices=idx,
+            transpose=True,
+            group_size=self._fused_group_size,
+            bits=self.gate_proj.bits,  # type: ignore[attr-defined]
+            mode=self.gate_proj.mode,  # type: ignore[attr-defined]
+            sorted_indices=do_sort,
+        )
+
+        x_gate = gu[..., :n_inter]
+        x_up = gu[..., n_inter:]
+        x = self.down_proj(
+            self.activation(x_up, x_gate),
+            idx,
+            sorted_indices=do_sort,
+        )
+
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
+
+
 class SwitchMLP(nn.Module):
     def __init__(
         self,

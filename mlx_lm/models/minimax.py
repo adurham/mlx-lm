@@ -10,7 +10,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .minimax_trace import finalize, span
+from ..profiler import finalize, span
 from .switch_layers import SwitchGLU
 
 _NOOP_ALLSUM: bool = os.environ.get("EXO_MINIMAX_NOOP_ALLSUM", "0") == "1"
