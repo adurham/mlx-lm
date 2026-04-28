@@ -12,6 +12,8 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .cache import BatchRotatingKVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU, _scatter_unsort
+from ..profiler import finalize as _finalize
+from ..profiler import span as _span
 
 
 @dataclass
@@ -876,12 +878,22 @@ class DeepseekV4MoE(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        inds, scores = self.gate(x, input_ids)
-        y = self.switch_mlp(x, inds, scores)
-        y = y + self.shared_experts(x)
+        with _span("moe_gate"):
+            inds, scores = self.gate(x, input_ids)
+            inds = _finalize(inds)
+            scores = _finalize(scores)
+        with _span("moe_switch_mlp"):
+            y = self.switch_mlp(x, inds, scores)
+            y = _finalize(y)
+        with _span("moe_shared"):
+            shared = self.shared_experts(x)
+            shared = _finalize(shared)
+        y = y + shared
 
         if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
+            with _span("moe_all_sum"):
+                y = mx.distributed.all_sum(y, group=self.sharding_group)
+                y = _finalize(y)
         return y
 
 
@@ -1719,18 +1731,27 @@ class V4Attention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         if isinstance(offset, mx.array):
             offset = offset + 0
-        q_residual = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
-        self._ensure_cached(q.dtype)
-        q = mx.fast.rms_norm(q, self._q_norm_weight_cached, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+        with _span("attn_q_lora"):
+            q_residual = self.q_norm(self.wq_a(x))
+            q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
+            self._ensure_cached(q.dtype)
+            q = mx.fast.rms_norm(q, self._q_norm_weight_cached, self.config.rms_norm_eps)
+            q = q.transpose(0, 2, 1, 3)
+            q = _finalize(q)
+        with _span("attn_kv_proj"):
+            kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+            kv = _finalize(kv)
 
-        q = _apply_partial_rope(q, self.rope, offset)
-        kv = _apply_partial_rope(kv, self.rope, offset)
+        with _span("attn_rope"):
+            q = _apply_partial_rope(q, self.rope, offset)
+            kv = _apply_partial_rope(kv, self.rope, offset)
+            q = _finalize(q)
+            kv = _finalize(kv)
 
-        if local_cache is not None:
-            kv, _ = local_cache.update_and_fetch(kv, kv)
+        with _span("attn_cache_update"):
+            if local_cache is not None:
+                kv, _ = local_cache.update_and_fetch(kv, kv)
+                kv = _finalize(kv)
         full_kv = kv
         local_kv_len = kv.shape[2]
 
@@ -1741,7 +1762,9 @@ class V4Attention(nn.Module):
         sparse_pooled_mask = None
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
-            pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
+            with _span("attn_compressor"):
+                pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
+                pooled = _finalize(pooled)
             if pooled.shape[1] > 0:
                 lengths = (
                     v4_cache.pooled_lengths("compressor_state")
@@ -1762,9 +1785,12 @@ class V4Attention(nn.Module):
                             mx.arange(pooled.shape[2]) < lengths[:, None]
                         ).reshape(B, 1, 1, -1)
                 elif use_indexer:
-                    topk = self.indexer(
-                        x, q_residual, self.compress_rope, self.rope, v4_cache, offset
-                    )
+                    with _span("attn_indexer"):
+                        topk = self.indexer(
+                            x, q_residual, self.compress_rope, self.rope, v4_cache, offset
+                        )
+                        if topk is not None:
+                            topk = _finalize(topk)
                     if topk is not None:
                         if L > 1:
                             sparse_pooled = pooled
@@ -1775,23 +1801,25 @@ class V4Attention(nn.Module):
                                     topk < lengths[:, None, None]
                                 ).reshape(B, 1, L, -1)
                         else:
-                            if lengths is not None:
-                                lengths = mx.array(lengths)
-                                pooled_mask = (topk < lengths[:, None, None]).reshape(
-                                    B, 1, 1, -1
+                            with _span("attn_gather"):
+                                if lengths is not None:
+                                    lengths = mx.array(lengths)
+                                    pooled_mask = (topk < lengths[:, None, None]).reshape(
+                                        B, 1, 1, -1
+                                    )
+                                expanded = mx.broadcast_to(
+                                    pooled[:, None, None, :, :],
+                                    (B, 1, L, pooled.shape[1], self.head_dim),
                                 )
-                            expanded = mx.broadcast_to(
-                                pooled[:, None, None, :, :],
-                                (B, 1, L, pooled.shape[1], self.head_dim),
-                            )
-                            idx = topk[:, None, :, :, None]
-                            pooled = mx.take_along_axis(
-                                expanded,
-                                mx.broadcast_to(
-                                    idx, idx.shape[:-1] + (self.head_dim,)
-                                ),
-                                axis=3,
-                            ).reshape(B, 1, -1, self.head_dim)
+                                idx = topk[:, None, :, :, None]
+                                pooled = mx.take_along_axis(
+                                    expanded,
+                                    mx.broadcast_to(
+                                        idx, idx.shape[:-1] + (self.head_dim,)
+                                    ),
+                                    axis=3,
+                                ).reshape(B, 1, -1, self.head_dim)
+                                pooled = _finalize(pooled)
                     else:
                         pooled = pooled[:, None]
                 else:
@@ -1808,16 +1836,18 @@ class V4Attention(nn.Module):
             mask = mask[..., -local_kv_len:]
 
         if sparse_topk is not None:
-            out = _sparse_pooled_attention(
-                q,
-                full_kv,
-                sparse_pooled,
-                sparse_topk,
-                mask,
-                sparse_pooled_mask,
-                self.scale,
-                self._attn_sink_cached,
-            )
+            with _span("attn_sdpa_sparse"):
+                out = _sparse_pooled_attention(
+                    q,
+                    full_kv,
+                    sparse_pooled,
+                    sparse_topk,
+                    mask,
+                    sparse_pooled_mask,
+                    self.scale,
+                    self._attn_sink_cached,
+                )
+                out = _finalize(out)
         else:
             if mask is not None and full_kv.shape[2] > mask.shape[-1]:
                 pad_shape = mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],)
@@ -1851,18 +1881,22 @@ class V4Attention(nn.Module):
                             ),
                         )
                 mask = mx.concatenate([mask, pad], axis=-1)
-            out = scaled_dot_product_attention(
-                q,
-                full_kv,
-                full_kv,
-                cache=local_cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=self._attn_sink_cached,
-            )
-        out = _apply_partial_rope(out, self.rope, offset, inverse=True)
-        out = self._grouped_output_projection(out)
-        return self.wo_b(out)
+            with _span("attn_sdpa_dense"):
+                out = scaled_dot_product_attention(
+                    q,
+                    full_kv,
+                    full_kv,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=self._attn_sink_cached,
+                )
+                out = _finalize(out)
+        with _span("attn_o_proj"):
+            out = _apply_partial_rope(out, self.rope, offset, inverse=True)
+            out = self._grouped_output_projection(out)
+            out = self.wo_b(out)
+            return _finalize(out)
 
 
 class DeepseekV4Block(nn.Module):
