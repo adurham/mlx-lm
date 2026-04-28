@@ -1606,11 +1606,9 @@ class Indexer(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = _apply_partial_rope(q, position_rope, offset)
 
-        scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(
-            mx.float32
-        )
+        scores = q @ pooled[:, None].swapaxes(-1, -2)
         scores = mx.maximum(scores, 0) * self.scale
-        weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
+        weights = self.weights_proj(x) * (self.n_heads**-0.5)
         scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
         lengths = cache.pooled_lengths("indexer_state") if cache is not None else None
         if lengths is not None:
