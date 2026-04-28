@@ -808,7 +808,7 @@ class MoEGate(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.norm_topk_prob = config.norm_topk_prob
         self.weight = mx.zeros((self.num_experts, self.hidden_dim))
-        self._weight_T_f32 = None
+        self._weight_T = None
         if self.hash:
             self.tid2eid = mx.zeros((config.vocab_size, self.top_k), dtype=mx.int32)
         else:
@@ -818,9 +818,9 @@ class MoEGate(nn.Module):
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
         flat = x.reshape(-1, self.hidden_dim)
-        if self._weight_T_f32 is None:
-            self._weight_T_f32 = self.weight.T.astype(mx.float32)
-        logits = flat.astype(mx.float32) @ self._weight_T_f32
+        if self._weight_T is None:
+            self._weight_T = self.weight.T
+        logits = flat @ self._weight_T
 
         if self.hash:
             if input_ids is None:
@@ -1555,9 +1555,7 @@ class Compressor(nn.Module):
             if self.overlap:
                 kv = self._overlap_transform(kv, 0.0)
                 gate = self._overlap_transform(gate, -float("inf"))
-            weights = mx.softmax(gate.astype(mx.float32), axis=2, precise=True).astype(
-                kv.dtype
-            )
+            weights = mx.softmax(gate, axis=2, precise=True).astype(kv.dtype)
             new_pooled = (kv * weights).sum(axis=2)
             new_pooled = self.norm(new_pooled.astype(x.dtype))
             positions = mx.arange(new_pooled.shape[1], dtype=mx.float32)
