@@ -315,7 +315,14 @@ def _sparse_pooled_attention(
     q_scaled = q * scale
     local_scores = q_scaled @ local_kv.swapaxes(-1, -2)
     local_scores = _apply_score_mask(local_scores, local_mask)
-    pooled_scores = (q_scaled[:, :, :, None] * pooled).sum(axis=-1)
+    # Batched matmul over L instead of broadcast-multiply-then-sum.
+    # The previous form materialized a (B, H, L, k, D) intermediate; the matmul
+    # walks tiles of (H × D) × (D × k) per L-position, never materializing the
+    # full 5-D tensor. Equivalent up to FP-accumulation order.
+    pooled_squeezed = pooled[:, 0]
+    pooled_scores = (
+        q_scaled.transpose(0, 2, 1, 3) @ pooled_squeezed.swapaxes(-1, -2)
+    ).transpose(0, 2, 1, 3)
     pooled_scores = _apply_score_mask(pooled_scores, pooled_mask)
 
     scores = mx.concatenate([local_scores, pooled_scores], axis=-1)
@@ -331,7 +338,11 @@ def _sparse_pooled_attention(
     pooled_weights = weights[..., sink_offset + local_len :]
 
     out = local_weights @ local_kv
-    out = out + (pooled_weights[..., None] * pooled).sum(axis=-2)
+    # Batched matmul over L mirrors the score path above — avoids the
+    # (B, H, L, k, D) broadcast-multiply intermediate.
+    out = out + (
+        pooled_weights.transpose(0, 2, 1, 3) @ pooled_squeezed
+    ).transpose(0, 2, 1, 3)
     return out.astype(q.dtype)
 
 
