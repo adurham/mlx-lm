@@ -294,6 +294,28 @@ def _apply_score_mask(scores: mx.array, mask: Optional[mx.array]) -> mx.array:
     return scores + mask.astype(scores.dtype)
 
 
+@mx.compile
+def _indexer_score_collapse(
+    q: mx.array, pooled: mx.array, weights: mx.array, scale: float
+) -> mx.array:
+    """Indexer hot block: score matmul + ReLU + scale + weighted head-sum.
+
+    Shape contract:
+      q       : (B, H_local, L, D_idx)
+      pooled  : (B, P, D_idx)
+      weights : (B, L, H_local)  — already pre-scaled by 1/sqrt(global_H)
+      out     : (B, L, P)
+
+    Wrapping the four ops in a single compiled function lets MLX fuse the
+    relu+scale+broadcast+sum pipeline and avoid materializing the full
+    (B, H, L, P) intermediate the Python form produces.
+    """
+    scores = q @ pooled[:, None].swapaxes(-1, -2)
+    scores = mx.maximum(scores, 0) * scale
+    return (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
+
+
+@mx.compile
 def _sparse_pooled_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -1606,14 +1628,12 @@ class Indexer(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = _apply_partial_rope(q, position_rope, offset)
 
-        scores = q @ pooled[:, None].swapaxes(-1, -2)
-        scores = mx.maximum(scores, 0) * self.scale
         # weights_proj is sharded by output (heads) when sharding_group is set.
         # The (global_n_heads**-0.5) normalization is sharding-invariant — it
         # uses the global head count so the sum-over-ranks gives the same
         # result as the unsharded computation.
         weights = self.weights_proj(x) * (self.global_n_heads**-0.5)
-        scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
+        scores = _indexer_score_collapse(q, pooled, weights, self.scale)
         if self.sharding_group is not None and self.sharding_group.size() > 1:
             scores = mx.distributed.all_sum(scores, group=self.sharding_group)
         lengths = cache.pooled_lengths("indexer_state") if cache is not None else None
