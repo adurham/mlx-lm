@@ -1595,8 +1595,14 @@ class Compressor(nn.Module):
 
 
 class Indexer(nn.Module):
-    def __init__(self, config: ModelArgs, compress_ratio: int):
+    def __init__(
+        self,
+        config: ModelArgs,
+        compress_ratio: int,
+        layer_idx: Optional[int] = None,
+    ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.n_heads = config.index_n_heads
         self.global_n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
@@ -1611,14 +1617,38 @@ class Indexer(nn.Module):
         # Top-k indices returned in full-pooled coordinate space so the
         # downstream `_sparse_pooled_attention` gather still works on the
         # untouched V4Attention pooled cache.
+        # EXO_DSV4_INDEXER_WINDOW_LATE optionally tightens the window for
+        # the latter half of indexer-equipped layers (layer_idx ≥ N/2).
+        # Heuristic: late layers are doing refinement and may tolerate a
+        # smaller routing window than early aggregation layers. Validate
+        # quality before relying on this.
         import os as _os
         _topk_override = _os.environ.get("EXO_DSV4_INDEX_TOPK")
         self.index_topk = (
             int(_topk_override) if _topk_override else config.index_topk
         )
-        _window_override = _os.environ.get("EXO_DSV4_INDEXER_WINDOW")
+        _window_default = _os.environ.get("EXO_DSV4_INDEXER_WINDOW")
+        _window_late = _os.environ.get("EXO_DSV4_INDEXER_WINDOW_LATE")
+        # Determine which W applies to THIS layer based on its position
+        # relative to the indexer-equipped layer count.
+        is_late_layer = False
+        if layer_idx is not None and _window_late is not None:
+            try:
+                indexer_layers = [
+                    i
+                    for i, r in enumerate(config.compress_ratios)
+                    if r == 4
+                ]
+                if indexer_layers:
+                    # "Late" = positioned in the second half of the
+                    # indexer-equipped layer subset.
+                    midpoint = indexer_layers[len(indexer_layers) // 2]
+                    is_late_layer = layer_idx >= midpoint
+            except Exception:
+                is_late_layer = False
+        _chosen_window = _window_late if is_late_layer else _window_default
         self.indexer_window = (
-            int(_window_override) if _window_override else 0
+            int(_chosen_window) if _chosen_window is not None else 0
         )
         self.wq_b = nn.Linear(
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False
@@ -1734,7 +1764,7 @@ class V4Attention(nn.Module):
         if self.compress_ratio:
             self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
             if self.compress_ratio == 4:
-                self.indexer = Indexer(config, self.compress_ratio)
+                self.indexer = Indexer(config, self.compress_ratio, layer_idx)
 
     def _ensure_cached(self, dtype):
         dtype_key = str(dtype)
