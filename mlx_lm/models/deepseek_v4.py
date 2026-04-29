@@ -1576,6 +1576,7 @@ class Indexer(nn.Module):
     def __init__(self, config: ModelArgs, compress_ratio: int):
         super().__init__()
         self.n_heads = config.index_n_heads
+        self.global_n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.index_topk = config.index_topk
         self.wq_b = nn.Linear(
@@ -1584,6 +1585,7 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
+        self.sharding_group: Optional[mx.distributed.Group] = None
 
     def __call__(
         self,
@@ -1606,8 +1608,14 @@ class Indexer(nn.Module):
 
         scores = q @ pooled[:, None].swapaxes(-1, -2)
         scores = mx.maximum(scores, 0) * self.scale
-        weights = self.weights_proj(x) * (self.n_heads**-0.5)
+        # weights_proj is sharded by output (heads) when sharding_group is set.
+        # The (global_n_heads**-0.5) normalization is sharding-invariant — it
+        # uses the global head count so the sum-over-ranks gives the same
+        # result as the unsharded computation.
+        weights = self.weights_proj(x) * (self.global_n_heads**-0.5)
         scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
+        if self.sharding_group is not None and self.sharding_group.size() > 1:
+            scores = mx.distributed.all_sum(scores, group=self.sharding_group)
         lengths = cache.pooled_lengths("indexer_state") if cache is not None else None
         if lengths is not None:
             lengths = mx.array(lengths)
@@ -2178,6 +2186,19 @@ class Model(nn.Module):
                 layer.attn.wo_b, "sharded-to-all", group=group
             )
             layer.attn.n_heads //= N
+
+            # Indexer's wq_b/weights_proj match V4Attention's "all-to-sharded"
+            # output-split pattern. Each rank computes scores for n_heads/N
+            # heads and contributes its partial sum to the head reduction;
+            # the all_sum lives inside Indexer.__call__ at the reduction site.
+            indexer = getattr(layer.attn, "indexer", None)
+            if indexer is not None and N > 1:
+                indexer.wq_b = shard_linear(indexer.wq_b, "all-to-sharded", group=group)
+                indexer.weights_proj = shard_linear(
+                    indexer.weights_proj, "all-to-sharded", group=group
+                )
+                indexer.n_heads //= N
+                indexer.sharding_group = group
 
             layer.ffn.sharding_group = group
             shard_inplace(
