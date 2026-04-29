@@ -346,6 +346,42 @@ def load_model(
         weights = model.sanitize(weights)
 
     def _quantize(quantization):
+        # Detect mxfp4-stored layers that the top-level config doesn't
+        # acknowledge. DSv4-Flash 8-bit ships switch_mlp.{gate,up,down}_proj
+        # as 4-bit mxfp4 (group_size=32, no biases) while top-level config
+        # claims 8-bit affine — without per-layer overrides mlx-lm would
+        # initialize biases at the wrong group_size and gather_qmm would
+        # hit "Scales and biases should have the same shape". Heuristic:
+        # if a quantized layer has `.scales` in weights but no `.biases`,
+        # treat it as mxfp4 group_size=32. Compute group_size from the
+        # actual scales shape so this also picks up other group_sizes if
+        # a future checkpoint ships them.
+        for wkey in list(weights.keys()):
+            if not wkey.endswith(".scales"):
+                continue
+            base = wkey[: -len(".scales")]
+            if f"{base}.biases" in weights:
+                continue
+            if base in config["quantization"]:
+                continue
+            scales = weights[wkey]
+            weight = weights.get(f"{base}.weight")
+            if weight is None or scales.ndim < 2 or weight.ndim < 2:
+                continue
+            scales_groups = scales.shape[-1]
+            # weight stored as packed U32: input_dim = last_dim * 32 / bits.
+            # Solve: group_size = input_dim / scales_groups. Probe bits=4
+            # which is the only mxfp4 option in MLX today.
+            mxfp4_input_dim = weight.shape[-1] * 32 // 4
+            inferred_group = mxfp4_input_dim // scales_groups
+            if inferred_group <= 0:
+                continue
+            config["quantization"][base] = {
+                "group_size": inferred_group,
+                "bits": 4,
+                "mode": "mxfp4",
+            }
+
         def class_predicate(p, m):
             # Skip layers already quantized at construction time (e.g.
             # DSv4's switch_mlp pre-quantized to mxfp4). Without this
