@@ -1600,7 +1600,14 @@ class Indexer(nn.Module):
         self.n_heads = config.index_n_heads
         self.global_n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
-        self.index_topk = config.index_topk
+        # Reduce indexer topk vs config (512 → configurable via
+        # EXO_DSV4_INDEX_TOPK env). Smaller topk shrinks sparse SDPA cost
+        # roughly linearly. Quality trade-off — validate coherence.
+        import os as _os
+        _topk_override = _os.environ.get("EXO_DSV4_INDEX_TOPK")
+        self.index_topk = (
+            int(_topk_override) if _topk_override else config.index_topk
+        )
         self.wq_b = nn.Linear(
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
