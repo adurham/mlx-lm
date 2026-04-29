@@ -1600,13 +1600,25 @@ class Indexer(nn.Module):
         self.n_heads = config.index_n_heads
         self.global_n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
-        # Reduce indexer topk vs config (512 → configurable via
-        # EXO_DSV4_INDEX_TOPK env). Smaller topk shrinks sparse SDPA cost
-        # roughly linearly. Quality trade-off — validate coherence.
+        # EXO_DSV4_INDEX_TOPK overrides config.index_topk (default 512).
+        # Smaller topk shrinks sparse-SDPA cost linearly but degrades
+        # quality once cumulative pooled grows large.
+        # EXO_DSV4_INDEXER_WINDOW bounds how many trailing pooled entries
+        # the indexer scores Q against. Without it, indexer cost scales
+        # O(L × cumulative_pooled) per chunk — total prefill is O(N²).
+        # With window=W and cumulative pooled > W, indexer cost is bounded
+        # at O(L × W) per chunk → total prefill is O(N × W) (linear).
+        # Top-k indices returned in full-pooled coordinate space so the
+        # downstream `_sparse_pooled_attention` gather still works on the
+        # untouched V4Attention pooled cache.
         import os as _os
         _topk_override = _os.environ.get("EXO_DSV4_INDEX_TOPK")
         self.index_topk = (
             int(_topk_override) if _topk_override else config.index_topk
+        )
+        _window_override = _os.environ.get("EXO_DSV4_INDEXER_WINDOW")
+        self.indexer_window = (
+            int(_window_override) if _window_override else 0
         )
         self.wq_b = nn.Linear(
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False
@@ -1630,6 +1642,16 @@ class Indexer(nn.Module):
         if pooled.shape[1] == 0:
             return None
 
+        # Sliding-window slicing: when cumulative pooled exceeds the window,
+        # only score Q against the last `indexer_window` pooled entries.
+        # This breaks the O(N²) growth — indexer cost per chunk is bounded
+        # by O(L × W) instead of O(L × P_cumulative).
+        full_pooled_len = pooled.shape[1]
+        offset_in_full = 0
+        if self.indexer_window > 0 and full_pooled_len > self.indexer_window:
+            offset_in_full = full_pooled_len - self.indexer_window
+            pooled = pooled[:, offset_in_full:]
+
         offset = start_pos
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
         q = q.transpose(0, 2, 1, 3)
@@ -1643,13 +1665,23 @@ class Indexer(nn.Module):
         scores = _indexer_score_collapse(q, pooled, weights, self.scale)
         if self.sharding_group is not None and self.sharding_group.size() > 1:
             scores = mx.distributed.all_sum(scores, group=self.sharding_group)
+        # Length masking handles variable-length batched prompts. With a
+        # sliding window the per-batch `lengths` may straddle the slice
+        # boundary; translate them into the local (sliced) coordinate
+        # frame before applying.
         lengths = cache.pooled_lengths("indexer_state") if cache is not None else None
         if lengths is not None:
-            lengths = mx.array(lengths)
+            lengths = mx.array(lengths) - offset_in_full
             valid = mx.arange(pooled.shape[1]) < lengths[:, None]
             scores = mx.where(valid[:, None], scores, mx.finfo(scores.dtype).min)
         k = min(self.index_topk, pooled.shape[1])
-        return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        local_topk = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        # Translate indices back to full-pooled coordinates so downstream
+        # code (V4Attention's _sparse_pooled_attention gather) works on
+        # the untouched full pooled cache.
+        if offset_in_full > 0:
+            local_topk = local_topk + offset_in_full
+        return local_topk
 
 
 class V4Attention(nn.Module):
