@@ -521,7 +521,7 @@ class Compressor(nn.Module):
         return new_pooled
 
 
-@mx.compile
+@partial(mx.compile, shapeless=True)
 def _indexer_score(
     q: mx.array,
     pooled: mx.array,
@@ -530,6 +530,12 @@ def _indexer_score(
     n_heads_inv_sqrt: float,
 ):
     """Compiled score-and-collapse for the DSv4 Indexer hot path.
+
+    `pooled.shape[1]` grows by 1 every `compress_ratio` decode tokens, so
+    `shapeless=True` is required — without it MLX recompiles a fresh Metal
+    pipeline per distinct pool size, accumulates all of them in the
+    process-wide compile cache (no eviction), and OOMs at ~94K decoded
+    Think-mode tokens with ~24K cached pipelines.
 
     Replaces lines:
       scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(mx.float32)
