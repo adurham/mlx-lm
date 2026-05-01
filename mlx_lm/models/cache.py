@@ -921,9 +921,23 @@ class PoolingCache(_BaseCache):
     """Cache for pooled (compressed) KV tokens with a remainder buffer.
 
     Stores two things:
-      1. A growing pool of compressed tokens (step-allocated).
+      1. A growing pool of compressed tokens, step-allocated in chunks of
+         ``step`` so writes are in-place after the initial allocation.
+         ``self.pooled`` is exposed as a property that returns the valid
+         prefix view of the underlying storage.
       2. A small remainder buffer of tokens not yet forming a full window.
+
+    Step allocation matters for long-decode workloads: the previous
+    implementation reallocated ``self.pooled`` on every flush via
+    ``mx.concatenate``, which caused the GPU allocator to hold both the
+    old and new tensors in flight during eval and inflated peak working
+    set. Step allocation makes ``update_and_fetch`` a slice-assign in
+    the steady state, with a single 2× realloc only when the buffer
+    fills. Behavior (data + dtype + shape returned to callers) is
+    unchanged.
     """
+
+    step: int = 256
 
     def __init__(self, ratio: int):
         self.ratio = ratio
@@ -932,11 +946,30 @@ class PoolingCache(_BaseCache):
         self.buf_gate = None
         self.remainder = 0
 
-        self.pooled = None
+        self._pool_storage = None
+        self._pool_offset = 0
+
+    @property
+    def pooled(self):
+        if self._pool_storage is None or self._pool_offset == 0:
+            return None
+        return self._pool_storage[:, : self._pool_offset]
+
+    @pooled.setter
+    def pooled(self, v):
+        if v is None:
+            self._pool_storage = None
+            self._pool_offset = 0
+            return
+        B, P, D = v.shape
+        new_size = max(self.step, P)
+        self._pool_storage = mx.zeros((B, new_size, D), dtype=v.dtype)
+        self._pool_storage[:, :P] = v
+        self._pool_offset = P
 
     @property
     def offset(self):
-        return 0 if self.pooled is None else self.pooled.shape[1]
+        return self._pool_offset
 
     def accumulate_windows(self, kv: mx.array, gate: mx.array, offset):
         B, L, D1 = kv.shape
@@ -1002,15 +1035,27 @@ class PoolingCache(_BaseCache):
 
     def update_and_fetch(self, px: mx.array):
         if px.shape[1] == 0:
-            if self.pooled is None:
+            if self._pool_storage is None:
                 return mx.zeros((px.shape[0], 0, px.shape[-1]), dtype=px.dtype)
-            return self.pooled
+            return self._pool_storage[:, : self._pool_offset]
 
-        if self.pooled is None:
-            self.pooled = px
-        else:
-            self.pooled = mx.concatenate([self.pooled, px], axis=1)
-        return self.pooled
+        B, num_new, D = px.shape
+        new_offset = self._pool_offset + num_new
+
+        if self._pool_storage is None:
+            new_size = max(self.step, num_new)
+            self._pool_storage = mx.zeros((B, new_size, D), dtype=px.dtype)
+        elif new_offset > self._pool_storage.shape[1]:
+            current_size = self._pool_storage.shape[1]
+            grow_by = max(self.step, new_offset - current_size)
+            new_size = current_size + grow_by
+            old = self._pool_storage
+            self._pool_storage = mx.zeros((B, new_size, D), dtype=px.dtype)
+            self._pool_storage[:, : self._pool_offset] = old[:, : self._pool_offset]
+
+        self._pool_storage[:, self._pool_offset : new_offset] = px
+        self._pool_offset = new_offset
+        return self._pool_storage[:, : self._pool_offset]
 
     def make_mask(self, L: int = 1, offset: int = 0):
         """Build a causal validity mask for pooled positions.
