@@ -971,6 +971,31 @@ class Compressor(nn.Module):
         return new_pooled
 
 
+@mx.compile
+def _indexer_score(
+    q: mx.array,
+    pooled: mx.array,
+    weights_x: mx.array,
+    scale: float,
+    n_heads_inv_sqrt: float,
+):
+    """Compiled score-and-collapse for the DSv4 Indexer hot path.
+
+    Replaces lines:
+      scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(mx.float32)
+      scores = mx.maximum(scores, 0) * self.scale
+      weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
+      scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
+    Runs every decode step on every indexer-equipped layer (~21 layers).
+    """
+    qf = q.astype(mx.float32)
+    pf = pooled[:, None].astype(mx.float32)
+    scores = qf @ pf.swapaxes(-1, -2)
+    scores = mx.maximum(scores, 0) * scale
+    w = weights_x.astype(mx.float32) * n_heads_inv_sqrt
+    return (scores * w.swapaxes(-1, -2)[..., None]).sum(axis=1)
+
+
 class Indexer(nn.Module):
     def __init__(self, config: ModelArgs, compress_ratio: int):
         super().__init__()
@@ -1007,12 +1032,13 @@ class Indexer(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = position_rope(q, offset)
 
-        scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(
-            mx.float32
+        scores = _indexer_score(
+            q,
+            pooled,
+            self.weights_proj(x),
+            self.scale,
+            self.n_heads**-0.5,
         )
-        scores = mx.maximum(scores, 0) * self.scale
-        weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
-        scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
         pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
         if pmask is not None:
             scores = mx.where(
