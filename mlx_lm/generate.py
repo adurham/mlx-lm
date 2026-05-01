@@ -1305,18 +1305,39 @@ class GenerationBatch:
         self.state_machines.extend(batch.state_machines)
         if self._current_tokens is None:
             self._current_tokens = batch._current_tokens
-            self._current_logprobs = batch._current_logprobs
+            # Coerce to list — _current_logprobs is a Python list of mx.array
+            # per-token logprobs in steady state (line 1372: list(logprobs)),
+            # but PromptProcessingBatch hands in a single mx.array. If we
+            # assign that array directly here, the next .extend() call below
+            # crashes with "'mlx.core.array' object has no attribute 'extend'".
+            if isinstance(batch._current_logprobs, mx.array):
+                self._current_logprobs = list(batch._current_logprobs)
+            else:
+                self._current_logprobs = batch._current_logprobs
         elif batch._current_tokens is not None:
             self._current_tokens = mx.concatenate(
                 [self._current_tokens, batch._current_tokens]
             )
-            self._current_logprobs.extend(batch._current_logprobs)
+            if not isinstance(self._current_logprobs, list):
+                self._current_logprobs = list(self._current_logprobs)
+            _other = batch._current_logprobs
+            self._current_logprobs.extend(
+                list(_other) if isinstance(_other, mx.array) else _other
+            )
         if self._next_tokens is None:
             self._next_tokens = batch._next_tokens
-            self._next_logprobs = batch._next_logprobs
+            if isinstance(batch._next_logprobs, mx.array):
+                self._next_logprobs = list(batch._next_logprobs)
+            else:
+                self._next_logprobs = batch._next_logprobs
         elif batch._next_tokens is not None:
             self._next_tokens = mx.concatenate([self._next_tokens, batch._next_tokens])
-            self._next_logprobs.extend(batch._next_logprobs)
+            if not isinstance(self._next_logprobs, list):
+                self._next_logprobs = list(self._next_logprobs)
+            _other = batch._next_logprobs
+            self._next_logprobs.extend(
+                list(_other) if isinstance(_other, mx.array) else _other
+            )
         self._token_context.extend(batch._token_context)
         self._num_tokens.extend(batch._num_tokens)
         self._matcher_states.extend(batch._matcher_states)
