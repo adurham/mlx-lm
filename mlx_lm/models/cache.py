@@ -38,6 +38,24 @@ _EAGER_DETACH_CACHES = _eager_detach_caches_enabled()
 _HAS_DETACH = hasattr(mx, "detach")
 
 
+def _eager_eval_caches_enabled() -> bool:
+    """Stronger version of the detach hook: force a synchronous mx.eval on
+    cache state per step. Materializes the SliceUpdate chain (status →
+    evaluated) which then triggers eval's internal detach. More expensive
+    than mx.detach (kicks GPU work + waits for fence) but works even when
+    the cache state isn't reached by the regular per-step async_eval —
+    e.g. when TP shards the per-step graph across nodes and the local
+    cache primitive runs on the other rank.
+
+    Default off. Set MLX_LM_EAGER_EVAL_CACHES=1 to enable.
+    """
+    val = os.environ.get("MLX_LM_EAGER_EVAL_CACHES", "0")
+    return val not in ("0", "", "false", "False")
+
+
+_EAGER_EVAL_CACHES = _eager_eval_caches_enabled()
+
+
 # Cache instance attributes that may hold mx.array (or tuples / lists of
 # them) and benefit from eager detach. Keeping this as a module-level
 # allowlist avoids walking every Python attribute (slow, surprises) and
@@ -70,25 +88,10 @@ def _flatten_arrays(value: Any, out: list[Any]) -> None:
             _flatten_arrays(v, out)
 
 
-def eager_detach_caches(caches: Any) -> None:
-    """Walk a list of cache objects and detach their mx.array attributes.
-
-    Must be called AFTER mx.eval has fired for the current step, otherwise
-    eval crashes with "Attempting to eval an array without a primitive"
-    on the next step.
-
-    Iterates the well-known cache attributes (keys, values, plus a few
-    PoolingCache fields) on each leaf cache instance. CacheList containers
-    are recursed into via their inner caches. Non-cache objects are
-    silently skipped.
-
-    No-op on upstream MLX (no mx.detach binding) or when
-    MLX_LM_EAGER_DETACH_CACHES=0.
-    """
-    if not (_EAGER_DETACH_CACHES and _HAS_DETACH):
-        return
+def _collect_cache_arrays(caches: Any) -> list[Any]:
+    """Walk the cache list and return the keys/values mx.array leaves."""
     if caches is None:
-        return
+        return []
     arrays: list[Any] = []
     stack: list[Any] = list(caches) if isinstance(caches, (list, tuple)) else [caches]
     while stack:
@@ -107,8 +110,47 @@ def eager_detach_caches(caches: Any) -> None:
         for name in _CACHE_DETACH_ATTRS:
             if hasattr(c, name):
                 _flatten_arrays(getattr(c, name), arrays)
+    return arrays
+
+
+def eager_detach_caches(caches: Any) -> None:
+    """Walk a list of cache objects and detach their keys/values arrays.
+
+    Must be called AFTER mx.eval has fired for the current step, otherwise
+    eval crashes with "Attempting to eval an array without a primitive"
+    on the next step.
+
+    No-op on upstream MLX (no mx.detach binding) or when
+    MLX_LM_EAGER_DETACH_CACHES=0.
+    """
+    if not (_EAGER_DETACH_CACHES and _HAS_DETACH):
+        return
+    arrays = _collect_cache_arrays(caches)
     if arrays:
         mx.detach(*arrays)
+
+
+def eager_eval_caches(caches: Any) -> None:
+    """Force a synchronous mx.eval on cache state per step.
+
+    Stronger than eager_detach_caches: by materializing the SliceUpdate
+    chain (status -> evaluated), eval's internal detach pass clears the
+    primitive and inputs on every reachable graph node. Empirically this
+    is what breaks the per-step leak when async_eval's traversal doesn't
+    reach the cache (e.g. under TP, or when the eval target only depends
+    on a subset of cache attributes).
+
+    Cost: one extra GPU fence per decode step. The cache state is already
+    written by the previous mx.eval; this call should be effectively free
+    (data already on GPU, just waits for fence + walks graph).
+
+    No-op when MLX_LM_EAGER_EVAL_CACHES=0 (default).
+    """
+    if not _EAGER_EVAL_CACHES:
+        return
+    arrays = _collect_cache_arrays(caches)
+    if arrays:
+        mx.eval(*arrays)
 
 
 def make_prompt_cache(
