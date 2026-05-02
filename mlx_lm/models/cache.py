@@ -36,7 +36,6 @@ def _eager_detach_caches_enabled() -> bool:
 
 _EAGER_DETACH_CACHES = _eager_detach_caches_enabled()
 _HAS_DETACH = hasattr(mx, "detach")
-_DETACH_DIAG_LOGGED = False
 
 
 # Cache instance attributes that may hold mx.array (or tuples / lists of
@@ -86,13 +85,11 @@ def eager_detach_caches(caches: Any) -> None:
     if caches is None:
         return
     arrays: list[Any] = []
-    visited_classes: list[str] = []
     stack: list[Any] = list(caches) if isinstance(caches, (list, tuple)) else [caches]
     while stack:
         c = stack.pop()
         if c is None:
             continue
-        visited_classes.append(type(c).__name__)
         # CacheList: recurse into its inner caches. CacheList exposes
         # `self.caches` as a tuple. We can't use isinstance(c, CacheList)
         # here because the class is defined later in this module — match
@@ -105,22 +102,6 @@ def eager_detach_caches(caches: Any) -> None:
         for name in _CACHE_DETACH_ATTRS:
             if hasattr(c, name):
                 _flatten_arrays(getattr(c, name), arrays)
-    # First-call diagnostic: log what classes we visited and how many
-    # arrays we found. Helps confirm the helper is reaching the cache
-    # state. Throttled to once per process.
-    global _DETACH_DIAG_LOGGED
-    if not _DETACH_DIAG_LOGGED:
-        _DETACH_DIAG_LOGGED = True
-        from collections import Counter as _Counter
-        cls_counts = _Counter(visited_classes)
-        try:
-            with open("/tmp/eager_detach_diag.log", "a") as _df:
-                _df.write(
-                    f"[eager_detach_caches] first call: classes={dict(cls_counts)} "
-                    f"detached_arrays={len(arrays)}\n"
-                )
-        except Exception:
-            pass
     if arrays:
         mx.detach(*arrays)
 

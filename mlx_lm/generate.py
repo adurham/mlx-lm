@@ -1397,33 +1397,16 @@ class GenerationBatch:
         # them to self.tokens so that it always represents the tokens contained
         # in the KV Cache.
         mx.eval(inputs, self._current_logprobs)
-        # Eager-detach the prompt cache state: by this point the previous
-        # step's SliceUpdate is fully evaluated, and mx.eval's internal
-        # detach should have fired during graph traversal — but in practice
-        # the cache chain survives across step boundaries and per-step
-        # ArrayDesc count grows by ~one quad per layer per token. Forcing
-        # an explicit detach here breaks that chain unconditionally.
-        # No-op on upstream MLX or when MLX_LM_EAGER_DETACH_CACHES=0.
-        if not getattr(self, "_step_diag_logged", False):
-            self._step_diag_logged = True
-            try:
-                with open("/tmp/eager_detach_diag.log", "a") as _df:
-                    _df.write(
-                        f"[GenerationBatch._step] reached eager-detach hook; "
-                        f"cache_len={len(self.prompt_cache) if self.prompt_cache else 0} "
-                        f"cache_types={[type(c).__name__ for c in (self.prompt_cache or [])][:3]}\n"
-                    )
-            except Exception:
-                pass
-        try:
-            from .models.cache import eager_detach_caches
-            eager_detach_caches(self.prompt_cache)
-        except Exception as e:
-            try:
-                with open("/tmp/eager_detach_diag.log", "a") as _df:
-                    _df.write(f"[GenerationBatch._step] eager_detach raised: {e!r}\n")
-            except Exception:
-                pass
+        # Eager-detach the prompt cache state. By this point the previous
+        # step's graph is materialized, and mx.eval's internal detach should
+        # have fired — but in practice the cache chain (each step's
+        # SliceUpdate retains the previous step's output as an input) tends
+        # to survive across step boundaries and per-step ArrayDesc count
+        # grows by ~one quad per layer per token. Forcing an explicit detach
+        # here breaks that chain unconditionally. No-op on upstream MLX
+        # (no mx.detach binding) or when MLX_LM_EAGER_DETACH_CACHES=0.
+        from .models.cache import eager_detach_caches
+        eager_detach_caches(self.prompt_cache)
         inputs = inputs.tolist()
         for sti, ti in zip(self.tokens, inputs):
             sti.append(ti)
