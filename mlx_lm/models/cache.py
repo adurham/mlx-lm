@@ -42,14 +42,19 @@ _HAS_DETACH = hasattr(mx, "detach")
 # them) and benefit from eager detach. Keeping this as a module-level
 # allowlist avoids walking every Python attribute (slow, surprises) and
 # avoids detaching attrs that aren't supposed to be detached.
+#
+# Restricted to keys/values: those are the canonical KV cache attributes on
+# RotatingKVCache / KVCache / QuantizedKVCache, and they're the ones whose
+# SliceUpdate chain accumulates per step. PoolingCache fields
+# (_pool_storage, buf_kv, etc.) are intentionally NOT detached here:
+# eager-detaching them between steps caused
+#   RuntimeError: [eval] Attempting to eval an array without a primitive
+# on the next forward pass — the staging buffers are populated speculatively
+# and aren't always in the current async_eval's dependency tree, so the
+# detach can clear an unscheduled primitive that a later step still needs.
 _CACHE_DETACH_ATTRS = (
     "keys",
     "values",
-    # PoolingCache
-    "_pool_storage",
-    "buf_kv",
-    "buf_gate",
-    "pooled",
 )
 
 
