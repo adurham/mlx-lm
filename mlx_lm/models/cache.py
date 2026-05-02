@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -10,6 +11,49 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
+
+
+# Eager detach of cache state at the end of every update_and_fetch.
+# Defaults on. Without this, RotatingKVCache (and its peers) accumulate a
+# graph chain back through every prior decode step in self.keys / self.values:
+# each step's SliceUpdate has the previous step's SliceUpdate output as an
+# input, and that previous output's primitive + inputs aren't cleared if the
+# array is never visited by a synchronous mx.eval whose dependency tree
+# reaches it. Forcing a metadata-only detach after each update breaks the
+# chain immediately and bounds per-step ArrayDesc growth.
+#
+# Cost: one Python call to a fork-only mx.detach() binding (a few hundred
+# nanoseconds on the GIL hot path). No GPU work.
+#
+# Set MLX_LM_EAGER_DETACH_CACHES=0 to disable (e.g. for A/B regression check
+# against a build that doesn't have the fix).
+def _eager_detach_caches_enabled() -> bool:
+    val = os.environ.get("MLX_LM_EAGER_DETACH_CACHES", "1")
+    return val not in ("0", "", "false", "False")
+
+
+_EAGER_DETACH_CACHES = _eager_detach_caches_enabled()
+_HAS_DETACH = hasattr(mx, "detach")
+
+
+def _detach_if_available(*arrays: Any) -> None:
+    """Best-effort eager detach. No-ops on upstream MLX (no detach binding)
+    or when MLX_LM_EAGER_DETACH_CACHES=0. Filters out None and non-array
+    leaves so callers can pass tuples / lists / Nones uniformly."""
+    if not (_EAGER_DETACH_CACHES and _HAS_DETACH):
+        return
+    flat: list[mx.array] = []
+    stack: list[Any] = list(arrays)
+    while stack:
+        x = stack.pop()
+        if x is None:
+            continue
+        if isinstance(x, mx.array):
+            flat.append(x)
+        elif isinstance(x, (list, tuple)):
+            stack.extend(x)
+    if flat:
+        mx.detach(*flat)
 
 
 def make_prompt_cache(
@@ -280,7 +324,9 @@ class QuantizedKVCache(_BaseCache):
             self.keys[i][..., prev : self.offset, :] = keys[i]
             self.values[i][..., prev : self.offset, :] = values[i]
 
-        return tree_map(lambda x: x[..., : self.offset, :], (self.keys, self.values))
+        out = tree_map(lambda x: x[..., : self.offset, :], (self.keys, self.values))
+        _detach_if_available(self.keys, self.values)
+        return out
 
     @property
     def state(self):
@@ -369,6 +415,7 @@ class KVCache(_BaseCache):
         self.offset += keys.shape[2]
         self.keys[..., prev : self.offset, :] = keys
         self.values[..., prev : self.offset, :] = values
+        _detach_if_available(self.keys, self.values)
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
     def size(self):
@@ -528,8 +575,11 @@ class RotatingKVCache(_BaseCache):
 
     def update_and_fetch(self, keys, values):
         if keys.shape[2] == 1:
-            return self._update_in_place(keys, values)
-        return self._update_concat(keys, values)
+            out = self._update_in_place(keys, values)
+        else:
+            out = self._update_concat(keys, values)
+        _detach_if_available(self.keys, self.values)
+        return out
 
     def size(self):
         return min(self.offset, self.max_size)
