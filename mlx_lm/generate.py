@@ -1404,15 +1404,26 @@ class GenerationBatch:
         # ArrayDesc count grows by ~one quad per layer per token. Forcing
         # an explicit detach here breaks that chain unconditionally.
         # No-op on upstream MLX or when MLX_LM_EAGER_DETACH_CACHES=0.
-        import sys as _sys
         if not getattr(self, "_step_diag_logged", False):
             self._step_diag_logged = True
-            print(f"[GenerationBatch._step] reached eager-detach hook; cache_len={len(self.prompt_cache) if self.prompt_cache else 0}", file=_sys.stderr, flush=True)
+            try:
+                with open("/tmp/eager_detach_diag.log", "a") as _df:
+                    _df.write(
+                        f"[GenerationBatch._step] reached eager-detach hook; "
+                        f"cache_len={len(self.prompt_cache) if self.prompt_cache else 0} "
+                        f"cache_types={[type(c).__name__ for c in (self.prompt_cache or [])][:3]}\n"
+                    )
+            except Exception:
+                pass
         try:
             from .models.cache import eager_detach_caches
             eager_detach_caches(self.prompt_cache)
         except Exception as e:
-            print(f"[GenerationBatch._step] eager_detach raised: {e!r}", file=_sys.stderr, flush=True)
+            try:
+                with open("/tmp/eager_detach_diag.log", "a") as _df:
+                    _df.write(f"[GenerationBatch._step] eager_detach raised: {e!r}\n")
+            except Exception:
+                pass
         inputs = inputs.tolist()
         for sti, ti in zip(self.tokens, inputs):
             sti.append(ti)

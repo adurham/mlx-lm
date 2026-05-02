@@ -111,15 +111,16 @@ def eager_detach_caches(caches: Any) -> None:
     global _DETACH_DIAG_LOGGED
     if not _DETACH_DIAG_LOGGED:
         _DETACH_DIAG_LOGGED = True
-        import sys as _sys
         from collections import Counter as _Counter
         cls_counts = _Counter(visited_classes)
-        print(
-            f"[eager_detach_caches] first call: classes={dict(cls_counts)} "
-            f"detached_arrays={len(arrays)}",
-            file=_sys.stderr,
-            flush=True,
-        )
+        try:
+            with open("/tmp/eager_detach_diag.log", "a") as _df:
+                _df.write(
+                    f"[eager_detach_caches] first call: classes={dict(cls_counts)} "
+                    f"detached_arrays={len(arrays)}\n"
+                )
+        except Exception:
+            pass
     if arrays:
         mx.detach(*arrays)
 
