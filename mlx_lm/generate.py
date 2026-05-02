@@ -1397,6 +1397,15 @@ class GenerationBatch:
         # them to self.tokens so that it always represents the tokens contained
         # in the KV Cache.
         mx.eval(inputs, self._current_logprobs)
+        # Eager-detach the prompt cache state: by this point the previous
+        # step's SliceUpdate is fully evaluated, and mx.eval's internal
+        # detach should have fired during graph traversal — but in practice
+        # the cache chain survives across step boundaries and per-step
+        # ArrayDesc count grows by ~one quad per layer per token. Forcing
+        # an explicit detach here breaks that chain unconditionally.
+        # No-op on upstream MLX or when MLX_LM_EAGER_DETACH_CACHES=0.
+        from .models.cache import eager_detach_caches
+        eager_detach_caches(self.prompt_cache)
         inputs = inputs.tolist()
         for sti, ti in zip(self.tokens, inputs):
             sti.append(ti)
