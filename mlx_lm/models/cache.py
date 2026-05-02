@@ -383,6 +383,10 @@ class QuantizedKVCache(_BaseCache):
     def update_and_fetch(self, keys, values):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
+        # Skip values write entirely when zero-shape — see KVCache for
+        # the explanation (degenerate slice_update of zero-element data
+        # leaks 3 ArrayDescs per call).
+        skip_values = v_head_dim == 0
         prev = self.offset
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
@@ -416,10 +420,12 @@ class QuantizedKVCache(_BaseCache):
         self.offset += num_steps
 
         keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
-        values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+        if not skip_values:
+            values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
         for i in range(len(self.keys)):
             self.keys[i][..., prev : self.offset, :] = keys[i]
-            self.values[i][..., prev : self.offset, :] = values[i]
+            if not skip_values:
+                self.values[i][..., prev : self.offset, :] = values[i]
 
         return tree_map(lambda x: x[..., : self.offset, :], (self.keys, self.values))
 
@@ -509,7 +515,16 @@ class KVCache(_BaseCache):
 
         self.offset += keys.shape[2]
         self.keys[..., prev : self.offset, :] = keys
-        self.values[..., prev : self.offset, :] = values
+        # Skip the SliceUpdate when values are zero-shape (DSv4 passes
+        # mx.zeros((B, 1, L, 0)) as a "values" placeholder for layers that
+        # don't separate K/V). The degenerate slice_update generates a
+        # Full + Broadcast + SliceUpdate triple that's never freed —
+        # primitive ArrayDescs build up at 3 per call indefinitely.
+        # Verified in mlx-lm@0d9066c: 200 update_and_fetch calls with
+        # values.shape[-1]=0 leaks 200 of each; with non-zero values, no
+        # leak.
+        if values.shape[-1] != 0:
+            self.values[..., prev : self.offset, :] = values
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
     def size(self):
@@ -658,7 +673,13 @@ class RotatingKVCache(_BaseCache):
 
         # Assign
         self.keys[..., self._idx : self._idx + S, :] = keys
-        self.values[..., self._idx : self._idx + S, :] = values
+        # Skip the SliceUpdate when values are zero-shape (DSv4 passes
+        # mx.zeros((B, 1, L, 0)) as a "values" placeholder for layers that
+        # don't separate K/V). The degenerate slice_update would generate
+        # an unfreeable Full + Broadcast + SliceUpdate triple per call —
+        # see KVCache.update_and_fetch for the full explanation.
+        if values.shape[-1] != 0:
+            self.values[..., self._idx : self._idx + S, :] = values
         self.offset += S
         self._idx += S
 
