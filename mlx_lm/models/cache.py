@@ -90,11 +90,15 @@ def eager_detach_caches(caches: Any) -> None:
         c = stack.pop()
         if c is None:
             continue
-        # CacheList: recurse into its inner caches.
-        inner = getattr(c, "_caches", None)
-        if inner is not None and isinstance(inner, (list, tuple)):
-            stack.extend(inner)
-            continue
+        # CacheList: recurse into its inner caches. CacheList exposes
+        # `self.caches` as a tuple. We can't use isinstance(c, CacheList)
+        # here because the class is defined later in this module — match
+        # by class name + duck-type the attribute instead.
+        if type(c).__name__ == "CacheList":
+            inner = getattr(c, "caches", None)
+            if isinstance(inner, (list, tuple)):
+                stack.extend(inner)
+                continue
         for name in _CACHE_DETACH_ATTRS:
             if hasattr(c, name):
                 _flatten_arrays(getattr(c, name), arrays)
