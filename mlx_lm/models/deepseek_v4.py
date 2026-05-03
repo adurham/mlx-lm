@@ -1086,17 +1086,22 @@ class DeepseekV4MTPModule(nn.Module):
         prev_hidden: mx.array,
         next_token: mx.array,
         embed_tokens: nn.Embedding,
-        final_norm: nn.RMSNorm,
+        final_norm: nn.RMSNorm,  # unused for DSv4 — kept for API parity
         lm_head: nn.Linear,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         return_hidden: bool = False,
     ) -> Any:
-        # 1. Embed the "current" token and combine with prev_hidden.
+        del final_norm  # MTP uses its OWN self.norm as the final norm
+        # 1. Embed the "current" token and project both inputs.
+        #    (Equivalent to DSv3's M_k @ concat(hnorm(h), enorm(e)) when
+        #    h_proj + e_proj are seen as the two halves of M_k.) No
+        #    intermediate norm here — Qwen3.5's MTPPredictor uses the
+        #    same pattern and treats `mtp.norm` as the FINAL norm.
         emb = embed_tokens(next_token)  # (B, L, hidden_size)
         e_normed = self.enorm(emb)
         h_normed = self.hnorm(prev_hidden)
-        x = self.norm(self.e_proj(e_normed) + self.h_proj(h_normed))
+        x = self.e_proj(e_normed) + self.h_proj(h_normed)
 
         # 2. Broadcast into hc_mult parallel streams (matching main model).
         x = mx.broadcast_to(
@@ -1118,13 +1123,17 @@ class DeepseekV4MTPModule(nn.Module):
 
         # 4. Reduce hc_mult → 1 via this MTP block's own HyperHead.
         x = self.hc_head(x)  # (B, L, hidden_size)
-        # `x` here is the post-hc_head, pre-final-norm hidden — the
-        # exact shape and semantics that the target model captures and
-        # feeds back as `prev_hidden` for the next chained draft step.
+        # post-hc_head, pre-final-norm hidden state — matches the
+        # `pre_norm` capture from the target model so chained draft
+        # steps can feed it back in as `prev_hidden`.
         pre_norm_out = x
 
-        # 5. Apply target's final norm + lm_head.
-        x = final_norm(x)
+        # 5. Apply MTP's OWN final norm (loaded from `mtp.{idx}.norm.weight`)
+        #    and the shared lm_head. The target model's final_norm is
+        #    deliberately bypassed — that one's for the target's main
+        #    hidden state, not the MTP head's output. Same pattern as
+        #    Qwen3.5 MTPPredictor.predict() in the speculative module.
+        x = self.norm(x)
         logits = lm_head(x)
 
         if return_hidden:
