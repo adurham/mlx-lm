@@ -2348,10 +2348,21 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
 
         self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
 
-        return (
-            self.keys[..., : self._offset, :],
-            self.values[..., : self._offset, :],
-        )
+        ret_keys = self.keys[..., : self._offset, :]
+        ret_values = self.values[..., : self._offset, :]
+        # Debug log (set EXO_DSV4_PSCACHE_DEBUG=1 to enable)
+        import os as _os
+        if _os.environ.get("EXO_DSV4_PSCACHE_DEBUG", "0") == "1":
+            import sys as _sys
+            _sys.stderr.write(
+                f"[PSCACHE update] B={B} S={S} "
+                f"pre_offset={offsets} max_after={max_after} "
+                f"self._offset={self._offset} "
+                f"buf_shape={self.keys.shape} ret_shape={ret_keys.shape} "
+                f"new_offset={self.offset.tolist()}\n"
+            )
+            _sys.stderr.flush()
+        return (ret_keys, ret_values)
 
     def make_mask(
         self,
@@ -2364,13 +2375,23 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         # [left_padding[b], offset[b] + N).
         right_pad = physical - self.offset
 
-        return create_causal_mask(
+        m = create_causal_mask(
             N,
             offset=physical,
             window_size=window_size or self.max_size,
             right_padding=right_pad,
             left_padding=self.left_padding,
         )
+        import os as _os
+        if _os.environ.get("EXO_DSV4_PSCACHE_DEBUG", "0") == "1":
+            import sys as _sys
+            _sys.stderr.write(
+                f"[PSCACHE mask] N={N} physical={physical} "
+                f"offset={self.offset.tolist()} right_pad={right_pad.tolist()} "
+                f"left_padding={self.left_padding.tolist()} mask.shape={m.shape}\n"
+            )
+            _sys.stderr.flush()
+        return m
 
     def trim_per_stream(self, n_per_stream: mx.array) -> None:
         """Decrement ``self.offset`` per-stream without touching the
