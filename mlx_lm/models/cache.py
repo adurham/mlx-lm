@@ -2370,7 +2370,13 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         window_size: Optional[int] = None,
         return_array: bool = False,
     ):
-        physical = self._offset
+        # IMPORTANT: use max(self.offset), not self._offset.
+        # `self._offset` may be stale after `trim_per_stream` (which
+        # only updates the per-stream array, not the scalar). Next
+        # update_and_fetch uses `max(self.offset) + S` for max_after,
+        # so the mask must be sized off the same max to match the
+        # returned key shape.
+        physical = int(mx.max(self.offset).item())
         # Per-stream right-padding: stream b's allowed positions are
         # [left_padding[b], offset[b] + N).
         right_pad = physical - self.offset
@@ -2394,12 +2400,15 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         return m
 
     def trim_per_stream(self, n_per_stream: mx.array) -> None:
-        """Decrement ``self.offset`` per-stream without touching the
-        physical buffer max. Subsequent writes for each stream land at
-        its own offset slot, naturally overwriting any garbage from
-        rejected-draft positions.
+        """Decrement ``self.offset`` per-stream. Also updates
+        ``self._offset`` to the new max across streams so subsequent
+        ``make_mask`` and ``update_and_fetch`` agree on the physical
+        max. Subsequent per-stream writes land at each stream's own
+        (post-trim) offset, naturally overwriting any rejected-draft
+        positions left in the buffer.
         """
         self.offset = mx.maximum(mx.zeros_like(self.offset), self.offset - n_per_stream)
+        self._offset = int(mx.max(self.offset).item())
 
 
 class TokenBuffer:
