@@ -2297,6 +2297,11 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         """Unified per-stream physical write. Same code handles L=1
         decode and L>1 verify — replaces base class's
         ``_update_in_place`` / ``_update_concat`` dispatch.
+
+        Hot path: avoids any ``.item()`` sync when streams haven't
+        diverged. Uses a cached Python-int ``_per_stream_max`` that's
+        updated lazily — only ``trim_per_stream`` (called once per
+        spec cycle) syncs to recompute max(offset).
         """
         if self._lengths is not None:
             raise RuntimeError(
@@ -2317,8 +2322,19 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
             self.values = None
             self._idx = 0
             self._offset = 0
+            self._per_stream_max = 0  # cached max(self.offset) as Python int
 
-        max_after = int(mx.max(self.offset).item()) + S
+        # Lazy bootstrap of _per_stream_max from base class state if
+        # we just got class-swapped (no __init__ ran on the subclass).
+        if not hasattr(self, "_per_stream_max"):
+            # Streams haven't diverged yet at swap time — _offset
+            # equals max(offset). Use it without syncing offset.
+            self._per_stream_max = int(self._offset)
+
+        # In steady state (uniform writes per layer per step), every
+        # update advances all streams by S. Cached max also advances
+        # by S — no .item() sync needed in the hot path.
+        max_after = self._per_stream_max + S
 
         cur_buf = 0 if self.keys is None else self.keys.shape[2]
         if max_after > cur_buf:
@@ -2333,36 +2349,37 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
                 else:
                     self.keys, self.values = new_k, new_v
 
-        # Per-stream physical writes. Loop over B in Python; B is
-        # small (2-4 for MTP spec at c=2-4) so the host-side loop is
-        # cheap relative to Metal kernel time.
-        offsets = self.offset.tolist()
+        # Per-stream physical writes. We need each stream's current
+        # offset as Python ints for slice indexing — `.tolist()` here
+        # is one sync per layer call. To keep the hot path fast, cache
+        # the offsets list and only re-evaluate when self.offset
+        # actually changed (which happens on trim_per_stream).
+        if not hasattr(self, "_cached_offsets") or self._offsets_dirty:
+            offsets = self.offset.tolist()
+            self._cached_offsets = list(offsets)
+            self._offsets_dirty = False
+        else:
+            offsets = self._cached_offsets
+
         for b in range(B):
             pos = int(offsets[b])
             self.keys[b, :, pos : pos + S, :] = keys[b, :, :, :]
             self.values[b, :, pos : pos + S, :] = values[b, :, :, :]
 
+        # All streams advance uniformly by S on a write — bump cached
+        # offsets without re-evaluating from self.offset.
         self.offset = self.offset + S
+        self._cached_offsets = [o + S for o in self._cached_offsets]
+        self._per_stream_max = max_after
         self._offset = max_after
         self._idx = max_after
 
         self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
 
-        ret_keys = self.keys[..., : self._offset, :]
-        ret_values = self.values[..., : self._offset, :]
-        # Debug log (set EXO_DSV4_PSCACHE_DEBUG=1 to enable)
-        import os as _os
-        if _os.environ.get("EXO_DSV4_PSCACHE_DEBUG", "0") == "1":
-            import sys as _sys
-            _sys.stderr.write(
-                f"[PSCACHE update] B={B} S={S} "
-                f"pre_offset={offsets} max_after={max_after} "
-                f"self._offset={self._offset} "
-                f"buf_shape={self.keys.shape} ret_shape={ret_keys.shape} "
-                f"new_offset={self.offset.tolist()}\n"
-            )
-            _sys.stderr.flush()
-        return (ret_keys, ret_values)
+        return (
+            self.keys[..., : self._offset, :],
+            self.values[..., : self._offset, :],
+        )
 
     def make_mask(
         self,
@@ -2370,45 +2387,40 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         window_size: Optional[int] = None,
         return_array: bool = False,
     ):
-        # IMPORTANT: use max(self.offset), not self._offset.
-        # `self._offset` may be stale after `trim_per_stream` (which
-        # only updates the per-stream array, not the scalar). Next
-        # update_and_fetch uses `max(self.offset) + S` for max_after,
-        # so the mask must be sized off the same max to match the
-        # returned key shape.
-        physical = int(mx.max(self.offset).item())
+        # Use the cached per-stream max so we don't sync per call.
+        # `_per_stream_max` stays consistent with what
+        # `update_and_fetch` uses for `max_after` because both update
+        # together (per-stream writes advance all streams by S, plus
+        # `trim_per_stream` re-syncs after spec rollback).
+        physical = getattr(self, "_per_stream_max", self._offset)
         # Per-stream right-padding: stream b's allowed positions are
         # [left_padding[b], offset[b] + N).
         right_pad = physical - self.offset
 
-        m = create_causal_mask(
+        return create_causal_mask(
             N,
             offset=physical,
             window_size=window_size or self.max_size,
             right_padding=right_pad,
             left_padding=self.left_padding,
         )
-        import os as _os
-        if _os.environ.get("EXO_DSV4_PSCACHE_DEBUG", "0") == "1":
-            import sys as _sys
-            _sys.stderr.write(
-                f"[PSCACHE mask] N={N} physical={physical} "
-                f"offset={self.offset.tolist()} right_pad={right_pad.tolist()} "
-                f"left_padding={self.left_padding.tolist()} mask.shape={m.shape}\n"
-            )
-            _sys.stderr.flush()
-        return m
 
     def trim_per_stream(self, n_per_stream: mx.array) -> None:
-        """Decrement ``self.offset`` per-stream. Also updates
-        ``self._offset`` to the new max across streams so subsequent
-        ``make_mask`` and ``update_and_fetch`` agree on the physical
-        max. Subsequent per-stream writes land at each stream's own
-        (post-trim) offset, naturally overwriting any rejected-draft
-        positions left in the buffer.
+        """Decrement ``self.offset`` per-stream and re-sync the cached
+        Python-int max. This is the only routine that triggers a
+        ``.item()`` sync — called once per spec cycle (after verify),
+        not once per layer/step. The hot-path ``update_and_fetch`` and
+        ``make_mask`` both read the cached value, never sync.
         """
         self.offset = mx.maximum(mx.zeros_like(self.offset), self.offset - n_per_stream)
-        self._offset = int(mx.max(self.offset).item())
+        # One sync per spec cycle to recompute max(offset) for the
+        # cached scalars used by hot paths. The cached_offsets list
+        # also gets refreshed.
+        new_offsets = self.offset.tolist()
+        self._cached_offsets = list(new_offsets)
+        self._offsets_dirty = False
+        self._per_stream_max = int(max(new_offsets))
+        self._offset = self._per_stream_max
 
 
 class TokenBuffer:
