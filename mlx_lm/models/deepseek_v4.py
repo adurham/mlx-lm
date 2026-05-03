@@ -96,6 +96,15 @@ def make_quantization_config(model):
     attn = {
         k: mxfp8 for k, _ in flat_modules if ".attn.w" in k or ".attn.indexer.wq" in k
     }
+    # MTP block has two extra Linear projections (e_proj / h_proj) that
+    # fuse the embedding and prev-hidden inputs. Upstream stores them
+    # in the same FP8 format as attention weights, so apply the same
+    # mxfp8 quantization override.
+    mtp_proj = {
+        k: mxfp8
+        for k, _ in flat_modules
+        if k.startswith("model.mtp.") and (k.endswith(".e_proj") or k.endswith(".h_proj"))
+    }
 
     return {
         "group_size": 64,
@@ -104,6 +113,7 @@ def make_quantization_config(model):
         **experts,
         **shared_experts,
         **attn,
+        **mtp_proj,
     }
 
 
