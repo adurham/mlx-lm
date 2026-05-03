@@ -2323,13 +2323,16 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
             self._idx = 0
             self._offset = 0
             self._per_stream_max = 0  # cached max(self.offset) as Python int
+            self._offsets_py = [0] * B  # parallel Python-int per-stream offsets
 
-        # Lazy bootstrap of _per_stream_max from base class state if
-        # we just got class-swapped (no __init__ ran on the subclass).
+        # Lazy bootstrap of _per_stream_max + _offsets_py from base
+        # class state if we just got class-swapped (no __init__ ran on
+        # the subclass). Streams haven't diverged yet at swap time —
+        # _offset equals max(offset) and all streams share that value.
         if not hasattr(self, "_per_stream_max"):
-            # Streams haven't diverged yet at swap time — _offset
-            # equals max(offset). Use it without syncing offset.
             self._per_stream_max = int(self._offset)
+        if not hasattr(self, "_offsets_py"):
+            self._offsets_py = [self._per_stream_max] * B
 
         # In steady state (uniform writes per layer per step), every
         # update advances all streams by S. Cached max also advances
@@ -2374,11 +2377,14 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         self.keys = mx.put_along_axis(self.keys, k_indices, keys, axis=2)
         self.values = mx.put_along_axis(self.values, v_indices, values, axis=2)
 
-        # All streams advance uniformly by S on a write.
+        # All streams advance uniformly by S on a write. Maintain the
+        # Python parallel state in lockstep so trim_per_stream can do
+        # its arithmetic in Python without syncing.
         self.offset = self.offset + S
         self._per_stream_max = max_after
         self._offset = max_after
         self._idx = max_after
+        self._offsets_py = [o + S for o in self._offsets_py]
 
         self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
 
@@ -2411,14 +2417,16 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
             left_padding=self.left_padding,
         )
 
-    def trim_per_stream(self, n_per_stream: mx.array) -> None:
-        """Decrement ``self.offset`` per-stream, re-sync the cached
-        Python-int ``_per_stream_max``, and compact the buffer if it
-        has grown past ``2 × max_size``.
+    def trim_per_stream(self, n_per_stream) -> None:
+        """Decrement per-stream offsets and compact the buffer if it
+        has grown past ``2 × max_size``. Called once per spec cycle
+        (after verify), not once per layer/step.
 
-        This is the only routine that triggers a sync — called once
-        per spec cycle (after verify), not once per layer/step.
-        ``make_mask`` reads ``_per_stream_max`` and never syncs.
+        Accepts either a Python int sequence (preferred — zero sync)
+        or an ``mx.array`` (falls back to ``.tolist()`` once per call,
+        which costs N_caches syncs/cycle when called from a 43-layer
+        model). Caller should hand in the Python list since the
+        rollback amounts are computed from per-stream Python ints.
 
         Compaction drops physical positions ``[0, min(offset) - max_size)``,
         which sit before every stream's sliding-window mask and are
@@ -2426,20 +2434,34 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         with generation length and SDPA scans the full history per
         step, defeating the sliding-window mask's window_size hint.
         """
-        self.offset = mx.maximum(mx.zeros_like(self.offset), self.offset - n_per_stream)
-        # One sync per spec cycle: get all offsets as Python ints in
-        # one round-trip rather than separate .item() calls.
-        offsets = self.offset.tolist()
-        self._per_stream_max = max(offsets)
+        if isinstance(n_per_stream, mx.array):
+            rollback = n_per_stream.tolist()
+            n_per_stream_arr = n_per_stream
+        else:
+            rollback = list(n_per_stream)
+            n_per_stream_arr = mx.array(rollback, dtype=mx.int32)
+
+        # Update the GPU-side offset lazily — no sync.
+        self.offset = mx.maximum(
+            mx.zeros_like(self.offset), self.offset - n_per_stream_arr
+        )
+        # Update the Python-int parallel state in lockstep — pure
+        # Python arithmetic, no sync. Subsequent ``update_and_fetch``
+        # / ``make_mask`` calls read ``_per_stream_max`` and don't
+        # need to look at ``self.offset``.
+        new_offsets = [max(0, o - r) for o, r in zip(self._offsets_py, rollback)]
+        self._offsets_py = new_offsets
+        self._per_stream_max = max(new_offsets)
         self._offset = self._per_stream_max
 
         if self.keys is not None and self.keys.shape[2] > 2 * self.max_size:
-            min_off = min(offsets)
+            min_off = min(new_offsets)
             delta = min_off - self.max_size
             if delta > 0:
                 self.keys = self.keys[:, :, delta:, :]
                 self.values = self.values[:, :, delta:, :]
                 self.offset = self.offset - delta
+                self._offsets_py = [o - delta for o in self._offsets_py]
                 self._per_stream_max -= delta
                 self._offset = self._per_stream_max
                 self._idx = self._per_stream_max
