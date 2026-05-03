@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import math
+import os
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1130,10 +1131,23 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.layers = [
             DeepseekV4Block(config, idx) for idx in range(config.num_hidden_layers)
         ]
-        # MTP heads — populated only when checkpoint contains mtp.* weights
-        # (controlled by config.num_nextn_predict_layers). Stored as a list
-        # of modules at `model.mtp` to match upstream weight key paths.
-        if config.num_nextn_predict_layers > 0:
+        # MTP heads — created only when the checkpoint actually contains
+        # mtp.* weights AND the user has opted in via EXO_DSV4_MTP=1.
+        #
+        # Two reasons for the env-var gate:
+        #   1) The mlx-community 8bit/6bit/4bit conversions ship with
+        #      `num_nextn_predict_layers: 1` in config.json but have ZERO
+        #      mtp.* keys in the safetensors (sanitize stripped them).
+        #      Loading those checkpoints without the gate would create
+        #      zero-weight MTP modules — broken if EXO_SPECULATIVE=1.
+        #   2) An MTP-included MLX conversion (with `mtp.*` weights)
+        #      requires a custom run of mlx_lm.convert that we control;
+        #      the gate ensures MTP only activates when the user has
+        #      switched to that variant.
+        if (
+            config.num_nextn_predict_layers > 0
+            and os.environ.get("EXO_DSV4_MTP", "0") == "1"
+        ):
             self.mtp = [
                 DeepseekV4MTPModule(config, i)
                 for i in range(config.num_nextn_predict_layers)
@@ -1251,7 +1265,16 @@ class Model(nn.Module):
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         n_layers = self.args.num_hidden_layers
-        n_mtp = self.args.num_nextn_predict_layers
+        # Only KEEP mtp.* weights when we'll actually have modules to
+        # absorb them — see the matching gate in DeepseekV4Model.__init__
+        # for the rationale (mlx-community variants advertise
+        # num_nextn_predict_layers=1 but ship zero mtp.* keys; the
+        # MTP-included variant is opt-in via EXO_DSV4_MTP=1).
+        mtp_enabled = (
+            self.args.num_nextn_predict_layers > 0
+            and os.environ.get("EXO_DSV4_MTP", "0") == "1"
+        )
+        n_mtp = self.args.num_nextn_predict_layers if mtp_enabled else 0
 
         new_weights = {}
         for k, v in weights.items():
@@ -1263,12 +1286,11 @@ class Model(nn.Module):
                 except ValueError:
                     pass
             elif len(parts) >= 2 and parts[0] == "mtp":
-                # Drop MTP weights only if MTP heads are disabled
-                # (num_nextn_predict_layers = 0) or the index is
-                # out-of-range. Otherwise keep them — they're consumed
-                # by the optional Model.mtp ModuleList loaded later.
+                # Drop mtp.* if MTP isn't enabled (mlx-community
+                # variants without mtp weights, or user hasn't opted
+                # in via EXO_DSV4_MTP=1) or the index is out-of-range.
                 try:
-                    if n_mtp == 0 or int(parts[1]) >= n_mtp:
+                    if not mtp_enabled or int(parts[1]) >= n_mtp:
                         continue
                 except ValueError:
                     pass
