@@ -2253,6 +2253,134 @@ class BatchRotatingKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
+    """:class:`BatchRotatingKVCache` with per-stream physical writes
+    and per-stream attention masking.
+
+    Built for speculative-decode at BS>1 where streams accept differing
+    numbers of draft tokens per cycle. The base class's L=1 vs L>1
+    dispatch creates inconsistency: ``_update_in_place`` returns up to
+    ``self._offset`` while ``_update_concat`` rotates and returns up
+    to ``max_size + S - 1``. Overriding only one leaves the other
+    path uniform-write and shape-mismatched against per-stream masks.
+
+    Solution: override ``update_and_fetch`` directly to route both
+    paths through one unified per-stream physical-write logic. Each
+    batch entry b writes its new KV at physical position
+    ``self.offset[b]`` (its own per-stream offset). Different streams
+    write to different physical positions in the same (B, n_heads,
+    max, head_dim) tensor on the same call. Each stream's content
+    stays contiguous in axis-2 from 0 to ``self.offset[b]`` because
+    subsequent per-stream writes naturally overwrite cycle-N's
+    rejected-draft positions at cycle-N+1.
+
+    ``make_mask`` returns shape ``(B, 1, N, self._offset + N)``
+    matching ``update_and_fetch``'s returned key tensor. The
+    ``window_size`` parameter still gates attention via mask boolean
+    values (no shape change). Per-stream right-padding from
+    ``self._offset - self.offset[b]`` masks each stream's tail.
+
+    ``trim_per_stream(n_per_stream)`` rolls back ``self.offset`` per
+    stream without touching the physical buffer max.
+
+    Limitations:
+
+    * Buffer grows linearly (no rotation). For typical generation
+      lengths (≤thousands of tokens), buffer stays under hundreds of
+      MB. Real rotation support is a multi-day refactor and not
+      strictly needed at user-typical lengths.
+    * ``finalize()`` / ``_lengths`` flow used during prompt processing
+      isn't re-implemented; convert to this class only AFTER prefill.
+    """
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        """Unified per-stream physical write. Same code handles L=1
+        decode and L>1 verify — replaces base class's
+        ``_update_in_place`` / ``_update_concat`` dispatch.
+        """
+        if self._lengths is not None:
+            raise RuntimeError(
+                "finalize() should be called before decoding with "
+                "PerStreamBatchRotatingKVCache"
+            )
+
+        B, n_kv_heads, S, k_head_dim = keys.shape
+        v_head_dim = values.shape[3]
+
+        # Lazy re-init when batch size changes (e.g. when an MTP
+        # predictor cache constructed for B=1 sees its first B=2
+        # write at c=2 entry).
+        if self.left_padding is None or self.left_padding.shape[0] != B:
+            self.left_padding = mx.zeros((B,), dtype=mx.int32)
+            self.offset = mx.zeros((B,), dtype=mx.int32)
+            self.keys = None
+            self.values = None
+            self._idx = 0
+            self._offset = 0
+
+        max_after = int(mx.max(self.offset).item()) + S
+
+        cur_buf = 0 if self.keys is None else self.keys.shape[2]
+        if max_after > cur_buf:
+            target = ((max_after + self.step - 1) // self.step) * self.step
+            grow_by = target - cur_buf
+            if grow_by > 0:
+                new_k = mx.zeros((B, n_kv_heads, grow_by, k_head_dim), keys.dtype)
+                new_v = mx.zeros((B, n_kv_heads, grow_by, v_head_dim), values.dtype)
+                if self.keys is not None:
+                    self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                    self.values = mx.concatenate([self.values, new_v], axis=2)
+                else:
+                    self.keys, self.values = new_k, new_v
+
+        # Per-stream physical writes. Loop over B in Python; B is
+        # small (2-4 for MTP spec at c=2-4) so the host-side loop is
+        # cheap relative to Metal kernel time.
+        offsets = self.offset.tolist()
+        for b in range(B):
+            pos = int(offsets[b])
+            self.keys[b, :, pos : pos + S, :] = keys[b, :, :, :]
+            self.values[b, :, pos : pos + S, :] = values[b, :, :, :]
+
+        self.offset = self.offset + S
+        self._offset = max_after
+        self._idx = max_after
+
+        self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
+
+        return (
+            self.keys[..., : self._offset, :],
+            self.values[..., : self._offset, :],
+        )
+
+    def make_mask(
+        self,
+        N: int,
+        window_size: Optional[int] = None,
+        return_array: bool = False,
+    ):
+        physical = self._offset
+        # Per-stream right-padding: stream b's allowed positions are
+        # [left_padding[b], offset[b] + N).
+        right_pad = physical - self.offset
+
+        return create_causal_mask(
+            N,
+            offset=physical,
+            window_size=window_size or self.max_size,
+            right_padding=right_pad,
+            left_padding=self.left_padding,
+        )
+
+    def trim_per_stream(self, n_per_stream: mx.array) -> None:
+        """Decrement ``self.offset`` per-stream without touching the
+        physical buffer max. Subsequent writes for each stream land at
+        its own offset slot, naturally overwriting any garbage from
+        rejected-draft positions.
+        """
+        self.offset = mx.maximum(mx.zeros_like(self.offset), self.offset - n_per_stream)
+
+
 class TokenBuffer:
     """A simple token buffer that can be efficiently appended to in a similar
     fashion to the KVCache.
