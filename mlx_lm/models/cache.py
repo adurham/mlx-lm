@@ -2412,17 +2412,37 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         )
 
     def trim_per_stream(self, n_per_stream: mx.array) -> None:
-        """Decrement ``self.offset`` per-stream and re-sync the cached
-        Python-int ``_per_stream_max``. This is the only routine that
-        triggers a ``.item()`` sync — called once per spec cycle
-        (after verify), not once per layer/step. ``make_mask`` reads
-        ``_per_stream_max`` and never syncs.
+        """Decrement ``self.offset`` per-stream, re-sync the cached
+        Python-int ``_per_stream_max``, and compact the buffer if it
+        has grown past ``2 × max_size``.
+
+        This is the only routine that triggers a sync — called once
+        per spec cycle (after verify), not once per layer/step.
+        ``make_mask`` reads ``_per_stream_max`` and never syncs.
+
+        Compaction drops physical positions ``[0, min(offset) - max_size)``,
+        which sit before every stream's sliding-window mask and are
+        therefore safe to discard. Without it the buffer grows linearly
+        with generation length and SDPA scans the full history per
+        step, defeating the sliding-window mask's window_size hint.
         """
         self.offset = mx.maximum(mx.zeros_like(self.offset), self.offset - n_per_stream)
-        # One sync per spec cycle to recompute max(offset) for the
-        # cached Python int used by ``make_mask``.
-        self._per_stream_max = int(mx.max(self.offset).item())
+        # One sync per spec cycle: get all offsets as Python ints in
+        # one round-trip rather than separate .item() calls.
+        offsets = self.offset.tolist()
+        self._per_stream_max = max(offsets)
         self._offset = self._per_stream_max
+
+        if self.keys is not None and self.keys.shape[2] > 2 * self.max_size:
+            min_off = min(offsets)
+            delta = min_off - self.max_size
+            if delta > 0:
+                self.keys = self.keys[:, :, delta:, :]
+                self.values = self.values[:, :, delta:, :]
+                self.offset = self.offset - delta
+                self._per_stream_max -= delta
+                self._offset = self._per_stream_max
+                self._idx = self._per_stream_max
 
 
 class TokenBuffer:
