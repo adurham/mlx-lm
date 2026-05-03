@@ -10,6 +10,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten
 
+from ..profiler import finalize, span
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, PoolingCache, RotatingKVCache
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
@@ -448,17 +449,30 @@ class DeepseekV4MoE(nn.Module):
         self.sharding_group = None
 
     def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
-        if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
+        with span("ffn"):
+            if self.sharding_group is not None:
+                x = sum_gradients(self.sharding_group)(x)
 
-        inds, scores = self.gate(x, input_ids)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None].astype(y.dtype)).sum(-2)
-        y = y + self.shared_experts(x)
+            with span("moe.gate"):
+                inds, scores = self.gate(x, input_ids)
+                finalize(inds)
+                finalize(scores)
 
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-        return y
+            with span("moe.switch_mlp"):
+                y = finalize(self.switch_mlp(x, inds))
+
+            with span("moe.weighted_reduce"):
+                y = finalize((y * scores[..., None].astype(y.dtype)).sum(-2))
+
+            with span("moe.shared_experts"):
+                y = finalize(y + self.shared_experts(x))
+
+            if self.sharding_group is not None:
+                with span("moe.all_sum"):
+                    y = finalize(
+                        mx.distributed.all_sum(y, group=self.sharding_group)
+                    )
+            return y
 
 
 class Compressor(nn.Module):
@@ -655,42 +669,49 @@ class LocalAttention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        B, L, _ = x.shape
-        offset = cache.offset if cache is not None else 0
-        offset = mx.array(offset) if isinstance(offset, mx.array) else offset
+        with span("attn"):
+            B, L, _ = x.shape
+            offset = cache.offset if cache is not None else 0
+            offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
+            q = self.wq_b(self.q_norm(self.wq_a(x)))
+            q = q.reshape(B, L, self.n_heads, self.head_dim)
+            q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
+            q = q.transpose(0, 2, 1, 3)
+            q = self.rope(q, offset)
 
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
-        if cache is not None:
-            kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+            kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+            kv = self.rope(kv, offset)
+            if cache is not None:
+                kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        out = scaled_dot_product_attention(
-            q,
-            kv,
-            kv,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
-        )
-        out = self.rope(out, offset, inverse=True)
+            with span("attn.sdpa"):
+                out = finalize(
+                    scaled_dot_product_attention(
+                        q,
+                        kv,
+                        kv,
+                        cache=cache,
+                        scale=self.scale,
+                        mask=mask,
+                        sinks=self.attn_sink.astype(q.dtype),
+                    )
+                )
+            out = self.rope(out, offset, inverse=True)
 
-        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
-        out = self.wo_a(out)
-        out = out.transpose(0, 2, 1, 3).flatten(-2)
-        out = self.wo_b(out)
+            out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
+            out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+            out = self.wo_a(out)
+            out = out.transpose(0, 2, 1, 3).flatten(-2)
+            out = self.wo_b(out)
 
-        if self.sharding_group is not None:
-            out = mx.distributed.all_sum(out, group=self.sharding_group)
+            if self.sharding_group is not None:
+                with span("attn.all_sum"):
+                    out = finalize(
+                        mx.distributed.all_sum(out, group=self.sharding_group)
+                    )
 
-        return out
+            return finalize(out)
 
 
 class CompressedAttention(nn.Module):
@@ -744,55 +765,63 @@ class CompressedAttention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        B, L, _ = x.shape
-        local_cache = cache[0] if cache is not None else None
-        pool_cache = cache[1] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
-        offset = mx.array(offset) if isinstance(offset, mx.array) else offset
+        with span("attn"):
+            B, L, _ = x.shape
+            local_cache = cache[0] if cache is not None else None
+            pool_cache = cache[1] if cache is not None else None
+            offset = local_cache.offset if local_cache is not None else 0
+            offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
+            q = self.wq_b(self.q_norm(self.wq_a(x)))
+            q = q.reshape(B, L, self.n_heads, self.head_dim)
+            q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
+            q = q.transpose(0, 2, 1, 3)
+            q = self.rope(q, offset)
 
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
-        if local_cache is not None:
-            kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+            kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+            kv = self.rope(kv, offset)
+            if local_cache is not None:
+                kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        # Pool tokens into compressed KV and concatenate with local KV
-        pooled = self.compressor(x, pool_cache, offset)
-        pooled_mask = None
-        if pooled.shape[1] > 0:
-            pooled_mask = (
-                pool_cache.make_mask(L, offset) if pool_cache is not None else None
-            )
-            kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+            # Pool tokens into compressed KV and concatenate with local KV
+            with span("attn.compressor"):
+                pooled = finalize(self.compressor(x, pool_cache, offset))
+            pooled_mask = None
+            if pooled.shape[1] > 0:
+                pooled_mask = (
+                    pool_cache.make_mask(L, offset) if pool_cache is not None else None
+                )
+                kv = mx.concatenate([kv, pooled[:, None]], axis=2)
 
-        mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+            mask = _extend_mask(mask, pooled_mask, kv.shape[2])
 
-        out = scaled_dot_product_attention(
-            q,
-            kv,
-            kv,
-            cache=local_cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
-        )
-        out = self.rope(out, offset, inverse=True)
+            with span("attn.sdpa"):
+                out = finalize(
+                    scaled_dot_product_attention(
+                        q,
+                        kv,
+                        kv,
+                        cache=local_cache,
+                        scale=self.scale,
+                        mask=mask,
+                        sinks=self.attn_sink.astype(q.dtype),
+                    )
+                )
+            out = self.rope(out, offset, inverse=True)
 
-        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
-        out = self.wo_a(out)
-        out = out.transpose(0, 2, 1, 3).flatten(-2)
-        out = self.wo_b(out)
+            out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
+            out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+            out = self.wo_a(out)
+            out = out.transpose(0, 2, 1, 3).flatten(-2)
+            out = self.wo_b(out)
 
-        if self.sharding_group is not None:
-            out = mx.distributed.all_sum(out, group=self.sharding_group)
+            if self.sharding_group is not None:
+                with span("attn.all_sum"):
+                    out = finalize(
+                        mx.distributed.all_sum(out, group=self.sharding_group)
+                    )
 
-        return out
+            return finalize(out)
 
 
 class SparseCompressedAttention(nn.Module):
@@ -846,87 +875,97 @@ class SparseCompressedAttention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        B, L, _ = x.shape
-        local_cache = cache[0] if cache is not None else None
-        comp_cache = cache[1] if cache is not None else None
-        idx_cache = cache[2] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
-        offset = mx.array(offset) if isinstance(offset, mx.array) else offset
+        with span("attn"):
+            B, L, _ = x.shape
+            local_cache = cache[0] if cache is not None else None
+            comp_cache = cache[1] if cache is not None else None
+            idx_cache = cache[2] if cache is not None else None
+            offset = local_cache.offset if local_cache is not None else 0
+            offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_residual = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
+            q_residual = self.q_norm(self.wq_a(x))
+            q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
+            q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
+            q = q.transpose(0, 2, 1, 3)
+            q = self.rope(q, offset)
 
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
-        if local_cache is not None:
-            kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+            kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+            kv = self.rope(kv, offset)
+            if local_cache is not None:
+                kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        pooled = self.compressor(x, comp_cache, offset)
-        pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
-        topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
-        sinks = self.attn_sink.astype(q.dtype)
+            with span("attn.compressor"):
+                pooled = finalize(self.compressor(x, comp_cache, offset))
+            pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
+            with span("attn.indexer"):
+                topk = finalize(
+                    self.indexer(x, q_residual, self.rope, idx_cache, offset)
+                )
+            sinks = self.attn_sink.astype(q.dtype)
 
-        # Local attention
-        if pooled.shape[1] == 0:
-            out = scaled_dot_product_attention(
-                q,
-                kv,
-                kv,
-                cache=local_cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=sinks,
-            )
+            with span("attn.sdpa"):
+                # Local attention
+                if pooled.shape[1] == 0:
+                    out = scaled_dot_product_attention(
+                        q,
+                        kv,
+                        kv,
+                        cache=local_cache,
+                        scale=self.scale,
+                        mask=mask,
+                        sinks=sinks,
+                    )
 
-        # Compressed attention
-        elif pooled.shape[1] <= self.indexer.index_topk:
-            full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-            mask = _extend_mask(mask, pmask, full_kv.shape[2])
-            out = scaled_dot_product_attention(
-                q,
-                full_kv,
-                full_kv,
-                cache=local_cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=sinks,
-            )
+                # Compressed attention
+                elif pooled.shape[1] <= self.indexer.index_topk:
+                    full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+                    mask = _extend_mask(mask, pmask, full_kv.shape[2])
+                    out = scaled_dot_product_attention(
+                        q,
+                        full_kv,
+                        full_kv,
+                        cache=local_cache,
+                        scale=self.scale,
+                        mask=mask,
+                        sinks=sinks,
+                    )
 
-        # Sparse compressed attention
-        else:
-            sparse_mask = None
-            if pmask is not None:
-                sparse_mask = mx.take_along_axis(
-                    pmask[None] if pmask.ndim == 2 else pmask,
-                    topk,
-                    axis=2,
-                )[:, None]
-            out = _sparse_pooled_attention(
-                q,
-                kv,
-                pooled,
-                topk,
-                mask,
-                sparse_mask,
-                self.scale,
-                sinks,
-            )
+                # Sparse compressed attention
+                else:
+                    sparse_mask = None
+                    if pmask is not None:
+                        sparse_mask = mx.take_along_axis(
+                            pmask[None] if pmask.ndim == 2 else pmask,
+                            topk,
+                            axis=2,
+                        )[:, None]
+                    out = _sparse_pooled_attention(
+                        q,
+                        kv,
+                        pooled,
+                        topk,
+                        mask,
+                        sparse_mask,
+                        self.scale,
+                        sinks,
+                    )
+                out = finalize(out)
 
-        out = self.rope(out, offset, inverse=True)
+            out = self.rope(out, offset, inverse=True)
 
-        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
-        out = self.wo_a(out)
-        out = out.transpose(0, 2, 1, 3).flatten(-2)
-        out = self.wo_b(out)
+            out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
+            out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+            out = self.wo_a(out)
+            out = out.transpose(0, 2, 1, 3).flatten(-2)
+            out = self.wo_b(out)
 
-        if self.sharding_group is not None:
-            out = mx.distributed.all_sum(out, group=self.sharding_group)
+            if self.sharding_group is not None:
+                with span("attn.all_sum"):
+                    out = finalize(
+                        mx.distributed.all_sum(out, group=self.sharding_group)
+                    )
 
-        return out
+            return finalize(out)
 
 
 def v4_attention_factory(config: ModelArgs, layer_idx: int) -> nn.Module:
@@ -957,14 +996,24 @@ class DeepseekV4Block(nn.Module):
         input_ids: mx.array,
     ) -> mx.array:
         residual = h
-        x, post, comb = self.attn_hc(h)
-        x = self.attn(self.attn_norm(x), mask=mask, cache=cache)
-        h = hc_expand(x, residual, post, comb)
+        with span("layer.attn_hc"):
+            x, post, comb = self.attn_hc(h)
+            finalize(x)
+        with span("layer.attn_norm"):
+            normed = finalize(self.attn_norm(x))
+        x = self.attn(normed, mask=mask, cache=cache)
+        with span("layer.attn_residual"):
+            h = finalize(hc_expand(x, residual, post, comb))
 
         residual = h
-        x, post, comb = self.ffn_hc(h)
-        x = self.ffn(self.ffn_norm(x), input_ids)
-        return hc_expand(x, residual, post, comb)
+        with span("layer.ffn_hc"):
+            x, post, comb = self.ffn_hc(h)
+            finalize(x)
+        with span("layer.ffn_norm"):
+            normed = finalize(self.ffn_norm(x))
+        x = self.ffn(normed, input_ids)
+        with span("layer.ffn_residual"):
+            return finalize(hc_expand(x, residual, post, comb))
 
 
 class DeepseekV4Model(PipelineMixin, nn.Module):
@@ -980,12 +1029,13 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.hc_head = HyperHead(config)
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
-        h = self.embed_tokens(inputs)
-        h = mx.broadcast_to(
-            h[:, :, None, :],
-            (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[2]),
-        )
-        h = mx.contiguous(h)
+        with span("model.embed"):
+            h = self.embed_tokens(inputs)
+            h = mx.broadcast_to(
+                h[:, :, None, :],
+                (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[2]),
+            )
+            h = finalize(mx.contiguous(h))
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
@@ -997,31 +1047,38 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         mask_cache = (
             first_cache[0] if isinstance(first_cache, CacheList) else first_cache
         )
-        mask = create_attention_mask(
-            h[:, :, 0, :],
-            mask_cache,
-            window_size=self.args.sliding_window,
-            return_array=True,
-        )
+        with span("model.attn_mask"):
+            mask = create_attention_mask(
+                h[:, :, 0, :],
+                mask_cache,
+                window_size=self.args.sliding_window,
+                return_array=True,
+            )
+            if mask is not None:
+                finalize(mask)
 
         if pipeline_rank < pipeline_size - 1:
-            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+            with span("model.recv"):
+                h = finalize(mx.distributed.recv_like(h, (pipeline_rank + 1)))
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
 
         if pipeline_rank != 0:
-            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
-            cache_item = cache[-1]
-            if isinstance(cache_item, CacheList):
-                cache_item = cache_item[0]
-            if cache_item is not None:
-                cache_item.keys = mx.depends(cache_item.keys, h)
+            with span("model.send"):
+                h = finalize(mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size))
+                cache_item = cache[-1]
+                if isinstance(cache_item, CacheList):
+                    cache_item = cache_item[0]
+                if cache_item is not None:
+                    cache_item.keys = mx.depends(cache_item.keys, h)
 
         if pipeline_size > 1:
-            h = mx.distributed.all_gather(h)[: h.shape[0]]
+            with span("model.all_gather"):
+                h = finalize(mx.distributed.all_gather(h)[: h.shape[0]])
 
-        return self.norm(self.hc_head(h))
+        with span("model.final_norm"):
+            return finalize(self.norm(self.hc_head(h)))
 
 
 class Model(nn.Module):
@@ -1033,7 +1090,9 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
-        return self.lm_head(self.model(inputs, cache))
+        h = self.model(inputs, cache)
+        with span("model.lm_head"):
+            return finalize(self.lm_head(h))
 
     @property
     def layers(self):
