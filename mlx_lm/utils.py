@@ -393,6 +393,28 @@ def load_model(
         weights = model.sanitize(weights)
 
     def _quantize(quantization):
+        # Pre-populate per-key overrides for DSv4. The auto-detect
+        # heuristic below assumes mxfp4 packing and miscomputes
+        # group_size for upstream mxfp8-stored layers (e.g. MTP's
+        # e_proj/h_proj). DSv4 has well-defined per-pattern
+        # quantization conventions; reusing the model's own config
+        # builder is more reliable than the heuristic. Auto-detect
+        # then skips entries already in config["quantization"] (see
+        # `if base in config["quantization"]: continue` below).
+        if config.get("model_type") == "deepseek_v4":
+            try:
+                from .models.deepseek_v4 import make_quantization_config
+                dsv4_cfg = make_quantization_config(model)
+                # Merge per-key overrides only (skip top-level
+                # group_size/bits/mode — those stay from the loaded
+                # config so we don't regress non-DSv4 logic).
+                for k, v in dsv4_cfg.items():
+                    if isinstance(v, dict):
+                        config["quantization"].setdefault(k, v)
+            except Exception:
+                # Best-effort — never block loading on this.
+                pass
+
         # Detect mxfp4-stored layers that the top-level config doesn't
         # acknowledge. DSv4-Flash 8-bit ships switch_mlp.{gate,up,down}_proj
         # as 4-bit mxfp4 (group_size=32, no biases) while top-level config
