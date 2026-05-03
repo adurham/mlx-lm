@@ -2349,27 +2349,37 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
                 else:
                     self.keys, self.values = new_k, new_v
 
-        # Per-stream physical writes. We need each stream's current
-        # offset as Python ints for slice indexing — `.tolist()` here
-        # is one sync per layer call. To keep the hot path fast, cache
-        # the offsets list and only re-evaluate when self.offset
-        # actually changed (which happens on trim_per_stream).
-        if not hasattr(self, "_cached_offsets") or self._offsets_dirty:
-            offsets = self.offset.tolist()
-            self._cached_offsets = list(offsets)
-            self._offsets_dirty = False
-        else:
-            offsets = self._cached_offsets
+        # Per-stream physical writes via vectorized scatter
+        # (``put_along_axis``). Replaces a Python ``for b in range(B)``
+        # slice-assign loop that issued B mx ops per call (43 layers ×
+        # B writes per cycle = 86+ extra ops at B=2). The vectorized
+        # path issues one scatter per ``keys`` tensor and one per
+        # ``values``.
+        #
+        # ``offsets_arr`` is the per-stream write base. The S-axis
+        # positions are ``offsets_arr[b] + 0 .. offsets_arr[b] + S - 1``;
+        # broadcast to source-tensor shape and feed to put_along_axis
+        # along axis=2.
+        offsets_arr = self.offset  # (B,) mx.int32, current write base per stream
+        pos_offset = mx.arange(S, dtype=offsets_arr.dtype)[None, None, :, None]
+        # k_indices broadcasts to (B, n_kv_heads, S, k_head_dim).
+        k_target_shape = (B, n_kv_heads, S, k_head_dim)
+        v_target_shape = (B, n_kv_heads, S, v_head_dim)
+        k_indices = mx.broadcast_to(
+            offsets_arr[:, None, None, None] + pos_offset, k_target_shape
+        )
+        v_indices = mx.broadcast_to(
+            offsets_arr[:, None, None, None] + pos_offset, v_target_shape
+        )
+        self.keys = mx.put_along_axis(self.keys, k_indices, keys, axis=2)
+        self.values = mx.put_along_axis(self.values, v_indices, values, axis=2)
 
-        for b in range(B):
-            pos = int(offsets[b])
-            self.keys[b, :, pos : pos + S, :] = keys[b, :, :, :]
-            self.values[b, :, pos : pos + S, :] = values[b, :, :, :]
-
-        # All streams advance uniformly by S on a write — bump cached
-        # offsets without re-evaluating from self.offset.
+        # All streams advance uniformly by S on a write.
         self.offset = self.offset + S
-        self._cached_offsets = [o + S for o in self._cached_offsets]
+        # Keep cached_offsets coherent for any future read that needs
+        # Python ints (e.g. external code) — cheap list-comp.
+        if hasattr(self, "_cached_offsets") and not self._offsets_dirty:
+            self._cached_offsets = [o + S for o in self._cached_offsets]
         self._per_stream_max = max_after
         self._offset = max_after
         self._idx = max_after
