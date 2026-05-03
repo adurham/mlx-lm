@@ -2376,10 +2376,6 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
 
         # All streams advance uniformly by S on a write.
         self.offset = self.offset + S
-        # Keep cached_offsets coherent for any future read that needs
-        # Python ints (e.g. external code) — cheap list-comp.
-        if hasattr(self, "_cached_offsets") and not self._offsets_dirty:
-            self._cached_offsets = [o + S for o in self._cached_offsets]
         self._per_stream_max = max_after
         self._offset = max_after
         self._idx = max_after
@@ -2417,19 +2413,15 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
 
     def trim_per_stream(self, n_per_stream: mx.array) -> None:
         """Decrement ``self.offset`` per-stream and re-sync the cached
-        Python-int max. This is the only routine that triggers a
-        ``.item()`` sync — called once per spec cycle (after verify),
-        not once per layer/step. The hot-path ``update_and_fetch`` and
-        ``make_mask`` both read the cached value, never sync.
+        Python-int ``_per_stream_max``. This is the only routine that
+        triggers a ``.item()`` sync — called once per spec cycle
+        (after verify), not once per layer/step. ``make_mask`` reads
+        ``_per_stream_max`` and never syncs.
         """
         self.offset = mx.maximum(mx.zeros_like(self.offset), self.offset - n_per_stream)
         # One sync per spec cycle to recompute max(offset) for the
-        # cached scalars used by hot paths. The cached_offsets list
-        # also gets refreshed.
-        new_offsets = self.offset.tolist()
-        self._cached_offsets = list(new_offsets)
-        self._offsets_dirty = False
-        self._per_stream_max = int(max(new_offsets))
+        # cached Python int used by ``make_mask``.
+        self._per_stream_max = int(mx.max(self.offset).item())
         self._offset = self._per_stream_max
 
 
