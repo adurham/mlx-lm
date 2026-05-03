@@ -417,16 +417,31 @@ def load_model(
                 continue
             scales_groups = scales.shape[-1]
             # weight stored as packed U32: input_dim = last_dim * 32 / bits.
-            # Solve: group_size = input_dim / scales_groups. Probe bits=4
-            # which is the only mxfp4 option in MLX today.
-            mxfp4_input_dim = weight.shape[-1] * 32 // 4
-            inferred_group = mxfp4_input_dim // scales_groups
-            if inferred_group <= 0:
+            # Solve: group_size = input_dim / scales_groups.
+            #
+            # Probe both bits=4 (mxfp4: 8 weights/uint32) and bits=8
+            # (mxfp8: 4 weights/uint32). DSv4-Flash's switch_mlp ships
+            # mxfp4; its attn / shared_experts / mtp.e_proj / mtp.h_proj
+            # ship mxfp8. Pick the bit-width whose inferred group_size
+            # is a valid MLX quant group (32 or 64; powers of 2 ≥ 32).
+            # If both probes give valid groups, prefer the smaller bit-
+            # width (mxfp4) since that's the higher-compression case
+            # and matches the historical default.
+            valid_groups = (32, 64, 128)
+            choice: Optional[tuple[int, int, str]] = None
+            for bits, mode in ((4, "mxfp4"), (8, "mxfp8")):
+                input_dim = weight.shape[-1] * 32 // bits
+                gs = input_dim // scales_groups
+                if gs in valid_groups:
+                    choice = (gs, bits, mode)
+                    break
+            if choice is None:
                 continue
+            inferred_group, inferred_bits, inferred_mode = choice
             config["quantization"][base] = {
                 "group_size": inferred_group,
-                "bits": 4,
-                "mode": "mxfp4",
+                "bits": inferred_bits,
+                "mode": inferred_mode,
             }
 
         def class_predicate(p, m):
