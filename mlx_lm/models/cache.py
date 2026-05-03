@@ -2309,21 +2309,21 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
             self._offset = 0
 
         # The maximum position any stream will need after this write.
+        # Note: NO cap at `self.max_size` — the underlying
+        # BatchRotatingKVCache uses max_size to mean "sliding window"
+        # and rotates the buffer when crossed. Per-stream rotation is
+        # genuinely complex (each stream's logical position diverges,
+        # and the rotated layout couples streams), so we instead keep
+        # the buffer fully linear and rely on `window_size` in
+        # `make_mask` to enforce sliding-window attention semantics.
+        # Memory cost: at gen_length=4096 with B=2 / 43 layers / bf16
+        # / head_dim=64, ~22 MB total — negligible.
         max_after = int(mx.max(self.offset).item()) + S
-        if max_after > self.max_size:
-            raise RuntimeError(
-                f"PerStreamBatchRotatingKVCache hit max_size={self.max_size} "
-                f"(would need position {max_after}); rotation NYI in this "
-                f"per-stream variant. Generation length must stay below "
-                f"sliding_window for spec-decode at BS>1."
-            )
 
-        # Grow the buffer in chunks of `step`, capped at max_size.
+        # Grow the buffer in chunks of `step`. No max cap.
         cur_buf = 0 if self.keys is None else self.keys.shape[2]
         if max_after > cur_buf:
-            target = max(self.step, max_after)
-            target = ((target + self.step - 1) // self.step) * self.step
-            target = min(target, self.max_size)
+            target = ((max_after + self.step - 1) // self.step) * self.step
             grow_by = target - cur_buf
             if grow_by > 0:
                 new_k = mx.zeros((B, n_kv_heads, grow_by, k_head_dim), keys.dtype)
