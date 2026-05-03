@@ -2253,6 +2253,144 @@ class BatchRotatingKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
+    """:class:`BatchRotatingKVCache` with per-stream physical writes
+    and per-stream attention masking.
+
+    Built for speculative-decode at BS>1 where streams accept differing
+    numbers of draft tokens per cycle.
+
+    Key differences from the base class:
+
+    * On every write, each batch entry b stores its new KV at physical
+      position ``self.offset[b]`` (its own per-stream offset), NOT at
+      a shared scalar ``_idx``. Different streams write to different
+      positions in the same (B, n_heads, max, head_dim) tensor on the
+      same call. Each stream's content stays contiguous in axis-2
+      from 0 to ``self.offset[b]``.
+
+    * ``make_mask`` adds per-stream right-padding so each stream's
+      attention only sees its own valid prefix.
+
+    * ``trim_per_stream(n_per_stream)`` rolls back ``self.offset`` by
+      a per-stream amount (mx.array shape ``(B,)``) without touching
+      the physical buffer max. Used after spec verify when streams
+      accepted differing numbers of drafts.
+
+    Limitations / non-goals:
+
+    * Rotation (when total writes exceed ``max_size``) is not
+      supported by this subclass — generation length must stay below
+      ``sliding_window``. Raises a clear error if rotation triggers.
+    * ``finalize()`` / ``_lengths`` flow used during prompt
+      processing isn't re-implemented; convert to this class only
+      AFTER prompt prefill is done.
+    """
+
+    def _update_in_place(self, keys: mx.array, values: mx.array):
+        if self._lengths is not None:
+            raise RuntimeError(
+                "finalize() should be called before decoding with "
+                "PerStreamBatchRotatingKVCache"
+            )
+
+        B, n_kv_heads, S, k_head_dim = keys.shape
+        v_head_dim = values.shape[3]
+
+        # Lazy re-init when we see a new batch size for the first
+        # time. (Happens when an MTP cache constructed for B=1 sees
+        # its first B=2 write at c=2 entry.)
+        if self.left_padding is None or self.left_padding.shape[0] != B:
+            self.left_padding = mx.zeros((B,), dtype=mx.int32)
+            self.offset = mx.zeros((B,), dtype=mx.int32)
+            self.keys = None
+            self.values = None
+            self._idx = 0
+            self._offset = 0
+
+        # The maximum position any stream will need after this write.
+        max_after = int(mx.max(self.offset).item()) + S
+        if max_after > self.max_size:
+            raise RuntimeError(
+                f"PerStreamBatchRotatingKVCache hit max_size={self.max_size} "
+                f"(would need position {max_after}); rotation NYI in this "
+                f"per-stream variant. Generation length must stay below "
+                f"sliding_window for spec-decode at BS>1."
+            )
+
+        # Grow the buffer in chunks of `step`, capped at max_size.
+        cur_buf = 0 if self.keys is None else self.keys.shape[2]
+        if max_after > cur_buf:
+            target = max(self.step, max_after)
+            target = ((target + self.step - 1) // self.step) * self.step
+            target = min(target, self.max_size)
+            grow_by = target - cur_buf
+            if grow_by > 0:
+                new_k = mx.zeros((B, n_kv_heads, grow_by, k_head_dim), keys.dtype)
+                new_v = mx.zeros((B, n_kv_heads, grow_by, v_head_dim), values.dtype)
+                if self.keys is not None:
+                    self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                    self.values = mx.concatenate([self.values, new_v], axis=2)
+                else:
+                    self.keys, self.values = new_k, new_v
+
+        # Per-stream writes — each batch entry writes at its own offset.
+        # Loop over B in Python; B is small (typically 2-4 for MTP
+        # spec at c=2-4) so the host-side loop is cheap relative to
+        # Metal kernel time.
+        offsets = self.offset.tolist()
+        for b in range(B):
+            pos = int(offsets[b])
+            self.keys[b, :, pos : pos + S, :] = keys[b, :, :, :]
+            self.values[b, :, pos : pos + S, :] = values[b, :, :, :]
+
+        # Advance bookkeeping. Per-stream offset + S (each stream got
+        # its own S new tokens). Physical max tracks the highest
+        # position any stream has reached.
+        self.offset = self.offset + S
+        self._offset = max_after
+        self._idx = max_after
+
+        self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
+
+        return (
+            self.keys[..., : self._offset, :],
+            self.values[..., : self._offset, :],
+        )
+
+    def make_mask(
+        self,
+        N: int,
+        window_size: Optional[int] = None,
+        return_array: bool = False,
+    ):
+        physical = self._offset
+        # Per-stream right-padding: stream b's allowed positions are
+        # [left_padding[b], offset[b] + N).
+        right_pad = physical - self.offset
+
+        return create_causal_mask(
+            N,
+            offset=physical,
+            window_size=window_size or self.max_size,
+            right_padding=right_pad,
+            left_padding=self.left_padding,
+        )
+
+    def trim_per_stream(self, n_per_stream: mx.array) -> None:
+        """Decrement ``self.offset`` per-stream.
+
+        Args:
+            n_per_stream: ``mx.array`` shape ``(B,)`` int — how much to
+                roll back each stream. Clamped at 0 from below. Does
+                not touch ``self._offset`` (physical max stays put);
+                positions in ``[offset[b], _offset)`` become "free"
+                slots that the next per-stream write for stream b will
+                overwrite.
+        """
+        self.offset = mx.maximum(mx.zeros_like(self.offset), self.offset - n_per_stream)
+
+
 class TokenBuffer:
     """A simple token buffer that can be efficiently appended to in a similar
     fashion to the KVCache.
