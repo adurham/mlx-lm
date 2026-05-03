@@ -1016,6 +1016,111 @@ class DeepseekV4Block(nn.Module):
             return finalize(hc_expand(x, residual, post, comb))
 
 
+class DeepseekV4MTPModule(nn.Module):
+    """Single Multi-Token-Prediction head for DSv4 self-speculative decode.
+
+    Structure (matches upstream `mtp.{idx}.*` weights):
+
+      enorm/hnorm  → RMSNorms applied to (embedding, prev_hidden) inputs
+      e_proj/h_proj → Linear projections of the normed inputs
+      norm         → RMSNorm of (e_proj_out + h_proj_out)
+      <body>       → standard DSv4 decoder block:
+                       attn_hc, attn_norm, LocalAttention,
+                       ffn_hc, ffn_norm, DeepseekV4MoE
+      hc_head      → HyperHead reducing hc_mult → 1
+
+    The embedding lookup, final RMSNorm, and lm_head are SHARED with the
+    target model and passed in at __call__ time (not owned by this module).
+
+    Forward contract:
+      Input:  prev_hidden (B, L, hidden_size) — the target model's
+                          post-hc_head, pre-final-norm output at the
+                          previous decode step (captured via the
+                          MTPBatchGenerator's `_setup_hidden_capture`).
+              next_token  (B, L) — the token id sampled at that step.
+      Output: logits      (B, L, vocab_size) — predictions for position+1.
+    """
+
+    def __init__(self, config: ModelArgs, mtp_idx: int):
+        super().__init__()
+        self.config = config
+        self.mtp_idx = mtp_idx
+
+        self.enorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.e_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.h_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Body — a standard DSv4 decoder block. Use a layer_idx past
+        # num_hash_layers so MoEGate is in non-hash mode (matches the
+        # upstream `mtp.0.ffn.gate.bias` weight layout).
+        body_layer_idx = config.num_hidden_layers + mtp_idx
+        self.attn = LocalAttention(config, body_layer_idx)
+        self.ffn = DeepseekV4MoE(config, body_layer_idx)
+        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_hc = HyperConnection(config)
+        self.ffn_hc = HyperConnection(config)
+
+        # Output HyperHead — reduces (B, L, hc_mult, hidden_size) → (B, L, hidden_size).
+        self.hc_head = HyperHead(config)
+
+    def make_cache(self):
+        """MTP attention is a LocalAttention (compress_ratio=0)."""
+        return RotatingKVCache(max_size=self.config.sliding_window)
+
+    def __call__(
+        self,
+        prev_hidden: mx.array,
+        next_token: mx.array,
+        embed_tokens: nn.Embedding,
+        final_norm: nn.RMSNorm,
+        lm_head: nn.Linear,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+        return_hidden: bool = False,
+    ) -> Any:
+        # 1. Embed the "current" token and combine with prev_hidden.
+        emb = embed_tokens(next_token)  # (B, L, hidden_size)
+        e_normed = self.enorm(emb)
+        h_normed = self.hnorm(prev_hidden)
+        x = self.norm(self.e_proj(e_normed) + self.h_proj(h_normed))
+
+        # 2. Broadcast into hc_mult parallel streams (matching main model).
+        x = mx.broadcast_to(
+            x[:, :, None, :],
+            (x.shape[0], x.shape[1], self.config.hc_mult, x.shape[2]),
+        )
+        x = mx.contiguous(x)
+
+        # 3. Standard DSv4-block body: attn + ffn with hyperconnection.
+        residual = x
+        x_in, post, comb = self.attn_hc(x)
+        x_attn = self.attn(self.attn_norm(x_in), mask=mask, cache=cache)
+        x = hc_expand(x_attn, residual, post, comb)
+
+        residual = x
+        x_in, post, comb = self.ffn_hc(x)
+        x_ffn = self.ffn(self.ffn_norm(x_in), next_token)
+        x = hc_expand(x_ffn, residual, post, comb)
+
+        # 4. Reduce hc_mult → 1 via this MTP block's own HyperHead.
+        x = self.hc_head(x)  # (B, L, hidden_size)
+        # `x` here is the post-hc_head, pre-final-norm hidden — the
+        # exact shape and semantics that the target model captures and
+        # feeds back as `prev_hidden` for the next chained draft step.
+        pre_norm_out = x
+
+        # 5. Apply target's final norm + lm_head.
+        x = final_norm(x)
+        logits = lm_head(x)
+
+        if return_hidden:
+            return logits, pre_norm_out
+        return logits
+
+
 class DeepseekV4Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -1025,6 +1130,14 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.layers = [
             DeepseekV4Block(config, idx) for idx in range(config.num_hidden_layers)
         ]
+        # MTP heads — populated only when checkpoint contains mtp.* weights
+        # (controlled by config.num_nextn_predict_layers). Stored as a list
+        # of modules at `model.mtp` to match upstream weight key paths.
+        if config.num_nextn_predict_layers > 0:
+            self.mtp = [
+                DeepseekV4MTPModule(config, i)
+                for i in range(config.num_nextn_predict_layers)
+            ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = HyperHead(config)
 
@@ -1138,15 +1251,24 @@ class Model(nn.Module):
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         n_layers = self.args.num_hidden_layers
+        n_mtp = self.args.num_nextn_predict_layers
 
         new_weights = {}
         for k, v in weights.items():
-            if k.startswith("mtp."):
-                continue
             parts = k.split(".")
             if len(parts) >= 2 and parts[0] == "layers":
                 try:
                     if int(parts[1]) >= n_layers:
+                        continue
+                except ValueError:
+                    pass
+            elif len(parts) >= 2 and parts[0] == "mtp":
+                # Drop MTP weights only if MTP heads are disabled
+                # (num_nextn_predict_layers = 0) or the index is
+                # out-of-range. Otherwise keep them — they're consumed
+                # by the optional Model.mtp ModuleList loaded later.
+                try:
+                    if n_mtp == 0 or int(parts[1]) >= n_mtp:
                         continue
                 except ValueError:
                     pass
@@ -1195,10 +1317,25 @@ class Model(nn.Module):
             if old in weights:
                 weights[new] = weights.pop(old)
 
+        # MTP-specific top-level renames (parallel to the main-model
+        # hc_head_* renames in `top_remap` above).
+        for mtp_idx in range(n_mtp):
+            mtp_remap = {
+                f"mtp.{mtp_idx}.hc_head_fn": f"model.mtp.{mtp_idx}.hc_head.fn",
+                f"mtp.{mtp_idx}.hc_head_base": f"model.mtp.{mtp_idx}.hc_head.base",
+                f"mtp.{mtp_idx}.hc_head_scale": f"model.mtp.{mtp_idx}.hc_head.scale",
+            }
+            for old, new in mtp_remap.items():
+                if old in weights:
+                    weights[new] = weights.pop(old)
+
         remapped = {}
         w_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
         for k, v in weights.items():
-            nk = "model." + k if k.startswith("layers.") else k
+            if k.startswith("layers.") or k.startswith("mtp."):
+                nk = "model." + k
+            else:
+                nk = k
             nk = nk.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
@@ -1208,32 +1345,43 @@ class Model(nn.Module):
             remapped[nk] = v
         weights = remapped
 
-        for layer_idx in range(n_layers):
-            prefix = f"model.layers.{layer_idx}.ffn.experts"
-            for src, dst in (
-                ("w1", "gate_proj"),
-                ("w2", "down_proj"),
-                ("w3", "up_proj"),
-            ):
-                for suffix in ("weight", "scales"):
-                    key0 = f"{prefix}.0.{src}.{suffix}"
-                    if key0 in weights:
-                        stacked = [
-                            weights.pop(f"{prefix}.{e}.{src}.{suffix}")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[
-                            f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
-                        ] = mx.stack(stacked)
+        # Stack expert weights for both main layers and MTP blocks.
+        for prefix_root, count in (
+            ("model.layers", n_layers),
+            ("model.mtp", n_mtp),
+        ):
+            for idx in range(count):
+                prefix = f"{prefix_root}.{idx}.ffn.experts"
+                for src, dst in (
+                    ("w1", "gate_proj"),
+                    ("w2", "down_proj"),
+                    ("w3", "up_proj"),
+                ):
+                    for suffix in ("weight", "scales"):
+                        key0 = f"{prefix}.0.{src}.{suffix}"
+                        if key0 in weights:
+                            stacked = [
+                                weights.pop(f"{prefix}.{e}.{src}.{suffix}")
+                                for e in range(self.args.n_routed_experts)
+                            ]
+                            weights[
+                                f"{prefix_root}.{idx}.ffn.switch_mlp.{dst}.{suffix}"
+                            ] = mx.stack(stacked)
 
-        # Reshape wo_a from nn.Linear (2D) to MultiLinear (3D) for all layers
-        for layer_idx in range(n_layers):
-            prefix = f"model.layers.{layer_idx}.attn.wo_a"
-            for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
-                if key in weights and weights[key].ndim == 2:
-                    weights[key] = weights[key].reshape(
-                        self.args.o_groups, self.args.o_lora_rank, -1
-                    )
+        # Reshape wo_a from nn.Linear (2D) to MultiLinear (3D) for all
+        # layers — including the MTP block(s), whose attention is a
+        # LocalAttention with the same wo_a structure.
+        for prefix_root, count in (
+            ("model.layers", n_layers),
+            ("model.mtp", n_mtp),
+        ):
+            for idx in range(count):
+                prefix = f"{prefix_root}.{idx}.attn.wo_a"
+                for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
+                    if key in weights and weights[key].ndim == 2:
+                        weights[key] = weights[key].reshape(
+                            self.args.o_groups, self.args.o_lora_rank, -1
+                        )
 
         return weights
 
