@@ -128,15 +128,22 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
 
 
 @mx.compile
-def _expert_select(
-    logits: mx.array,
+def _gate_route(
+    x: mx.array,
+    weight: mx.array,
     e_score_correction_bias: mx.array,
     top_k: int,
     routed_scaling_factor: float,
     norm_topk_prob: bool,
     scoring_func: str,
 ) -> Tuple[mx.array, mx.array]:
-    logits = logits.astype(mx.float32)
+    """Phase H: fold the gate matmul into the compiled expert-select chain.
+
+    Was 2 dispatches (matmul + compiled chain). The matmul output is small
+    (B, L, n_experts) so MLX can keep it in registers across the cast +
+    score-func + argpartition + take_along_axis chain. Bit-equivalent.
+    """
+    logits = (x @ weight.T).astype(mx.float32)
     scores = _score_func(logits, scoring_func)
     biased = scores + e_score_correction_bias
     inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k]
@@ -148,15 +155,17 @@ def _expert_select(
 
 
 @mx.compile
-def _hash_expert_select(
+def _hash_gate_route(
     input_ids: mx.array,
-    logits: mx.array,
+    x: mx.array,
+    weight: mx.array,
     tid2eid: mx.array,
     routed_scaling_factor: float,
     norm_topk_prob: bool,
     scoring_func: str,
 ) -> Tuple[mx.array, mx.array]:
-    logits = logits.astype(mx.float32)
+    """Phase H: hash-routing variant of `_gate_route` with matmul folded in."""
+    logits = (x @ weight.T).astype(mx.float32)
     scores = _score_func(logits, scoring_func)
     inds = tid2eid[input_ids]
     weights = mx.take_along_axis(scores, inds, axis=-1)
@@ -209,6 +218,85 @@ def _o_pre_a(
 def _o_pre_b(out: mx.array) -> mx.array:
     """Phase H: fuse pre-wo_b transpose + flatten."""
     return out.transpose(0, 2, 1, 3).flatten(-2)
+
+
+def _try_fuse_two_quantized_linears(
+    holder: nn.Module,
+    name_a: str,
+    name_b: str,
+    fused_prefix: str,
+) -> bool:
+    """Concatenate two same-input QuantizedLinears along the output axis.
+
+    Stores fused weights as ``f"_{fused_prefix}_w" / "_s" / "_b"`` on
+    ``holder`` along with ``f"_{fused_prefix}_n"`` (the size of the first
+    half) and ``_fused_group_size / _fused_bits / _fused_mode``. Frees
+    the original sub-linears by replacing them with empty modules.
+
+    Returns True on success, False if the projections aren't both
+    quantized or share incompatible modes/group_sizes/bits. Idempotent.
+    """
+    a: Any = getattr(holder, name_a)
+    b: Any = getattr(holder, name_b)
+    for proj_name, proj in ((name_a, a), (name_b, b)):
+        for attr in ("weight", "scales", "group_size", "bits", "mode"):
+            if not hasattr(proj, attr):
+                return False
+    if a.group_size != b.group_size or a.bits != b.bits or a.mode != b.mode:
+        return False
+
+    a_w = a["weight"]
+    b_w = b["weight"]
+    a_s = a["scales"]
+    b_s = b["scales"]
+    a_bias = a.get("biases") if hasattr(a, "get") else None
+    b_bias = b.get("biases") if hasattr(b, "get") else None
+
+    setattr(holder, f"_{fused_prefix}_w", mx.concatenate([a_w, b_w], axis=0))
+    setattr(holder, f"_{fused_prefix}_s", mx.concatenate([a_s, b_s], axis=0))
+    fused_b = (
+        mx.concatenate([a_bias, b_bias], axis=0)
+        if a_bias is not None and b_bias is not None
+        else None
+    )
+    setattr(holder, f"_{fused_prefix}_b", fused_b)
+    setattr(holder, f"_{fused_prefix}_n", int(a_w.shape[0]))
+    holder._fused_group_size = int(a.group_size)  # type: ignore[attr-defined]
+    holder._fused_bits = int(a.bits)  # type: ignore[attr-defined]
+    holder._fused_mode = a.mode  # type: ignore[attr-defined]
+
+    fused_w = getattr(holder, f"_{fused_prefix}_w")
+    fused_s = getattr(holder, f"_{fused_prefix}_s")
+    mx.eval(fused_w, fused_s)
+    if fused_b is not None:
+        mx.eval(fused_b)
+
+    setattr(holder, name_a, nn.Module())
+    setattr(holder, name_b, nn.Module())
+    return True
+
+
+def _fused_quantized_matmul(holder: nn.Module, fused_prefix: str, x: mx.array):
+    """Issue a single quantized_matmul against fused weights and split.
+
+    Returns ``(first_half, second_half)`` where ``first_half`` has
+    ``..._{fused_prefix}_n`` columns and ``second_half`` has the rest.
+    """
+    fused_w = getattr(holder, f"_{fused_prefix}_w")
+    fused_s = getattr(holder, f"_{fused_prefix}_s")
+    fused_b = getattr(holder, f"_{fused_prefix}_b")
+    n = getattr(holder, f"_{fused_prefix}_n")
+    out = mx.quantized_matmul(
+        x,
+        fused_w,
+        scales=fused_s,
+        biases=fused_b,
+        transpose=True,
+        group_size=holder._fused_group_size,  # type: ignore[attr-defined]
+        bits=holder._fused_bits,  # type: ignore[attr-defined]
+        mode=holder._fused_mode,  # type: ignore[attr-defined]
+    )
+    return out[..., :n], out[..., n:]
 
 
 @mx.compile
@@ -447,22 +535,22 @@ class MoEGate(nn.Module):
             )
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
-        logits = x @ self.weight.T
-
         if self.hash:
             if input_ids is None:
                 raise ValueError("DeepSeek-V4 hash routing requires input_ids.")
-            inds, weights = _hash_expert_select(
+            inds, weights = _hash_gate_route(
                 input_ids,
-                logits,
+                x,
+                self.weight,
                 self.tid2eid,
                 self.routed_scaling_factor,
                 self.norm_topk_prob,
                 self.scoring_func,
             )
         else:
-            inds, weights = _expert_select(
-                logits,
+            inds, weights = _gate_route(
+                x,
+                self.weight,
                 self.e_score_correction_bias,
                 self.top_k,
                 self.routed_scaling_factor,
@@ -488,7 +576,73 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.swiglu_limit = swiglu_limit
 
+    def fuse_gate_up_weights(self) -> None:
+        """Concatenate gate_proj + up_proj weights along the output axis.
+
+        Phase H: lets ``__call__`` issue a single quantized matmul instead
+        of two for the gate/up projections. Saves one Metal dispatch per
+        DSv4 layer per decode token (60 dispatches/cycle on DSv4-Flash).
+        Bit-equivalent: ``concat(x@G.T, x@U.T) == x @ concat(G, U).T``.
+
+        Idempotent. Requires both projections quantized with the same
+        group_size / bits / mode (true for DSv4: both mxfp8). Frees
+        gate_proj/up_proj weights after fusion to keep memory flat.
+        """
+        gp: Any = self.gate_proj
+        up: Any = self.up_proj
+        for proj_name, proj in (("gate_proj", gp), ("up_proj", up)):
+            for attr in ("weight", "scales", "group_size", "bits", "mode"):
+                if not hasattr(proj, attr):
+                    return  # not quantized — skip silently
+        if (
+            gp.group_size != up.group_size
+            or gp.bits != up.bits
+            or gp.mode != up.mode
+        ):
+            return
+
+        gp_w = gp["weight"]
+        up_w = up["weight"]
+        gp_s = gp["scales"]
+        up_s = up["scales"]
+        gp_b = gp.get("biases") if hasattr(gp, "get") else None
+        up_b = up.get("biases") if hasattr(up, "get") else None
+
+        self._fused_gu_w = mx.concatenate([gp_w, up_w], axis=0)
+        self._fused_gu_s = mx.concatenate([gp_s, up_s], axis=0)
+        self._fused_gu_b = (
+            mx.concatenate([gp_b, up_b], axis=0)
+            if gp_b is not None and up_b is not None
+            else None
+        )
+        self._fused_gu_n = int(gp_w.shape[0])
+        self._fused_group_size = int(gp.group_size)
+        self._fused_bits = int(gp.bits)
+        self._fused_mode = gp.mode
+        mx.eval(self._fused_gu_w, self._fused_gu_s)
+        if self._fused_gu_b is not None:
+            mx.eval(self._fused_gu_b)
+
+        # Free originals — gate_proj/up_proj are now dead weight.
+        self.gate_proj = nn.Module()
+        self.up_proj = nn.Module()
+
     def __call__(self, x: mx.array) -> mx.array:
+        if hasattr(self, "_fused_gu_w"):
+            gu = mx.quantized_matmul(
+                x,
+                self._fused_gu_w,
+                scales=self._fused_gu_s,
+                biases=self._fused_gu_b,
+                transpose=True,
+                group_size=self._fused_group_size,
+                bits=self._fused_bits,
+                mode=self._fused_mode,
+            )
+            n = self._fused_gu_n
+            x_gate = gu[..., :n]
+            x_up = gu[..., n:]
+            return self.down_proj(_limited_swiglu(x_gate, x_up, self.swiglu_limit))
         return self.down_proj(
             _limited_swiglu(self.gate_proj(x), self.up_proj(x), self.swiglu_limit)
         )
@@ -562,6 +716,68 @@ class Compressor(nn.Module):
             freq_scale=compress_ratio,
         )
 
+    def fuse_kv_gate_weights(self) -> None:
+        """Concatenate wkv + wgate weights along the output axis.
+
+        Phase H: lets ``__call__`` issue a single quantized matmul instead
+        of two for the kv/gate projections. Saves one Metal dispatch per
+        compressor per decode token. Compressors are NOT sharded, so this
+        runs as one local quantized_matmul per rank. Bit-equivalent.
+        """
+        wkv: Any = self.wkv
+        wgate: Any = self.wgate
+        for proj_name, proj in (("wkv", wkv), ("wgate", wgate)):
+            for attr in ("weight", "scales", "group_size", "bits", "mode"):
+                if not hasattr(proj, attr):
+                    return  # not quantized — skip
+        if (
+            wkv.group_size != wgate.group_size
+            or wkv.bits != wgate.bits
+            or wkv.mode != wgate.mode
+        ):
+            return
+
+        kv_w = wkv["weight"]
+        g_w = wgate["weight"]
+        kv_s = wkv["scales"]
+        g_s = wgate["scales"]
+        kv_b = wkv.get("biases") if hasattr(wkv, "get") else None
+        g_b = wgate.get("biases") if hasattr(wgate, "get") else None
+
+        self._fused_kg_w = mx.concatenate([kv_w, g_w], axis=0)
+        self._fused_kg_s = mx.concatenate([kv_s, g_s], axis=0)
+        self._fused_kg_b = (
+            mx.concatenate([kv_b, g_b], axis=0)
+            if kv_b is not None and g_b is not None
+            else None
+        )
+        self._fused_kg_n = int(kv_w.shape[0])
+        self._fused_group_size = int(wkv.group_size)
+        self._fused_bits = int(wkv.bits)
+        self._fused_mode = wkv.mode
+        mx.eval(self._fused_kg_w, self._fused_kg_s)
+        if self._fused_kg_b is not None:
+            mx.eval(self._fused_kg_b)
+
+        self.wkv = nn.Module()
+        self.wgate = nn.Module()
+
+    def _project_kv_gate(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+        if hasattr(self, "_fused_kg_w"):
+            gu = mx.quantized_matmul(
+                x,
+                self._fused_kg_w,
+                scales=self._fused_kg_s,
+                biases=self._fused_kg_b,
+                transpose=True,
+                group_size=self._fused_group_size,
+                bits=self._fused_bits,
+                mode=self._fused_mode,
+            )
+            n = self._fused_kg_n
+            return gu[..., :n], gu[..., n:]
+        return self.wkv(x), self.wgate(x)
+
     def __call__(
         self,
         x: mx.array,
@@ -569,8 +785,7 @@ class Compressor(nn.Module):
         offset: Union[int, mx.array],
     ) -> mx.array:
         B, _, _ = x.shape
-        kv = self.wkv(x)
-        gate = self.wgate(x)
+        kv, gate = self._project_kv_gate(x)
         if pool_cache is None:
             usable = (kv.shape[1] // self.compress_ratio) * self.compress_ratio
             ready_kv, ready_gate = kv[:, :usable], gate[:, :usable]
@@ -729,6 +944,23 @@ class LocalAttention(nn.Module):
 
         self.sharding_group = None
 
+    def fuse_qa_kv_weights(self) -> bool:
+        """Phase H: fuse wq_a + wkv weights into a single quantized matmul.
+
+        Both consume the same input ``x`` and are NOT sharded
+        (q_lora_rank/head_dim are per-rank duplicated). Concatenating
+        along the output axis collapses two ``mx.quantized_matmul``
+        dispatches into one per attention block per decode token. The
+        downstream q_norm/wq_b path consumes the q_lora half; kv_norm
+        the kv half — both unchanged. Bit-equivalent.
+        """
+        return _try_fuse_two_quantized_linears(self, "wq_a", "wkv", "fused_qkv")
+
+    def _project_qa_kv(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+        if hasattr(self, "_fused_qkv_w"):
+            return _fused_quantized_matmul(self, "fused_qkv", x)
+        return self.wq_a(x), self.wkv(x)
+
     def __call__(
         self,
         x: mx.array,
@@ -740,14 +972,15 @@ class LocalAttention(nn.Module):
             offset = cache.offset if cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
+            q_lora, kv_pre = self._project_qa_kv(x)
             q = _q_finalize(
-                self.wq_b(self.q_norm(self.wq_a(x))),
+                self.wq_b(self.q_norm(q_lora)),
                 B, L, self.n_heads, self.head_dim,
                 self.config.rms_norm_eps,
             )
             q = self.rope(q, offset)
 
-            kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
             kv = self.rope(kv, offset)
             if cache is not None:
                 kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
@@ -825,6 +1058,17 @@ class CompressedAttention(nn.Module):
 
         self.sharding_group = None
 
+    def fuse_qa_kv_weights(self) -> bool:
+        """Phase H: fuse wq_a + wkv into a single quantized matmul.
+        See LocalAttention.fuse_qa_kv_weights for details. Bit-equivalent.
+        """
+        return _try_fuse_two_quantized_linears(self, "wq_a", "wkv", "fused_qkv")
+
+    def _project_qa_kv(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+        if hasattr(self, "_fused_qkv_w"):
+            return _fused_quantized_matmul(self, "fused_qkv", x)
+        return self.wq_a(x), self.wkv(x)
+
     def __call__(
         self,
         x: mx.array,
@@ -838,14 +1082,15 @@ class CompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
+            q_lora, kv_pre = self._project_qa_kv(x)
             q = _q_finalize(
-                self.wq_b(self.q_norm(self.wq_a(x))),
+                self.wq_b(self.q_norm(q_lora)),
                 B, L, self.n_heads, self.head_dim,
                 self.config.rms_norm_eps,
             )
             q = self.rope(q, offset)
 
-            kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
             kv = self.rope(kv, offset)
             if local_cache is not None:
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
@@ -935,6 +1180,17 @@ class SparseCompressedAttention(nn.Module):
 
         self.sharding_group = None
 
+    def fuse_qa_kv_weights(self) -> bool:
+        """Phase H: fuse wq_a + wkv into a single quantized matmul.
+        See LocalAttention.fuse_qa_kv_weights for details. Bit-equivalent.
+        """
+        return _try_fuse_two_quantized_linears(self, "wq_a", "wkv", "fused_qkv")
+
+    def _project_qa_kv(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+        if hasattr(self, "_fused_qkv_w"):
+            return _fused_quantized_matmul(self, "fused_qkv", x)
+        return self.wq_a(x), self.wkv(x)
+
     def __call__(
         self,
         x: mx.array,
@@ -949,7 +1205,8 @@ class SparseCompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q_residual = self.q_norm(self.wq_a(x))
+            q_lora, kv_pre = self._project_qa_kv(x)
+            q_residual = self.q_norm(q_lora)
             q = _q_finalize(
                 self.wq_b(q_residual),
                 B, L, self.n_heads, self.head_dim,
@@ -957,7 +1214,7 @@ class SparseCompressedAttention(nn.Module):
             )
             q = self.rope(q, offset)
 
-            kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
             kv = self.rope(kv, offset)
             if local_cache is not None:
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
