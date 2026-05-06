@@ -174,6 +174,21 @@ def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
     return nn.silu(gate) * up
 
 
+@mx.compile
+def _moe_post_combine(
+    y: mx.array, scores: mx.array, shared_out: mx.array
+) -> mx.array:
+    """Phase H: fuse moe.weighted_reduce + moe.shared_experts add.
+
+    Was two separate spans (~5.9% + 7.7% = ~13.6% of decode profile each
+    with their own dispatches and intermediate eval). Combining into one
+    compiled function lets MLX fuse the elementwise multiply, sum-reduce,
+    and addition into a single graph node with downstream dispatch.
+    Bit-equivalent: same ops, same order.
+    """
+    return (y * scores[..., None].astype(y.dtype)).sum(-2) + shared_out
+
+
 class LimitedSwiGLU(nn.Module):
     def __init__(self, limit: float):
         super().__init__()
@@ -472,11 +487,14 @@ class DeepseekV4MoE(nn.Module):
             with span("moe.switch_mlp"):
                 y = finalize(self.switch_mlp(x, inds))
 
-            with span("moe.weighted_reduce"):
-                y = finalize((y * scores[..., None].astype(y.dtype)).sum(-2))
-
-            with span("moe.shared_experts"):
-                y = finalize(y + self.shared_experts(x))
+            with span("moe.post_combine"):
+                # Phase H: fused weighted_reduce + shared_experts add via
+                # @mx.compile (_moe_post_combine). Was two separate spans
+                # before. shared_experts forward (the matmul itself) stays
+                # separate; we fuse only the y-side combine, which is
+                # the elementwise + sum + add path.
+                shared_out = self.shared_experts(x)
+                y = finalize(_moe_post_combine(y, scores, shared_out))
 
             if self.sharding_group is not None:
                 with span("moe.all_sum"):
