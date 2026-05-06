@@ -175,6 +175,43 @@ def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
 
 
 @mx.compile
+def _q_finalize(
+    q_proj_out: mx.array,
+    batch_size: int,
+    seq_len: int,
+    n_heads: int,
+    head_dim: int,
+    eps: float,
+) -> mx.array:
+    """Phase H: fuse q's reshape + rms_norm + transpose into one compiled op.
+
+    Was 3 separate dispatches per layer. Bit-equivalent.
+    """
+    q = q_proj_out.reshape(batch_size, seq_len, n_heads, head_dim)
+    q = mx.fast.rms_norm(q, None, eps)
+    return q.transpose(0, 2, 1, 3)
+
+
+@mx.compile
+def _o_pre_a(
+    out: mx.array,
+    batch_size: int,
+    o_groups: int,
+    seq_len: int,
+    head_dim: int,
+) -> mx.array:
+    """Phase H: fuse pre-wo_a reshape + transpose + flatten."""
+    out = out.reshape(batch_size, o_groups, -1, seq_len, head_dim)
+    return out.transpose(0, 1, 3, 2, 4).flatten(-2)
+
+
+@mx.compile
+def _o_pre_b(out: mx.array) -> mx.array:
+    """Phase H: fuse pre-wo_b transpose + flatten."""
+    return out.transpose(0, 2, 1, 3).flatten(-2)
+
+
+@mx.compile
 def _moe_post_combine(
     y: mx.array, scores: mx.array, shared_out: mx.array
 ) -> mx.array:
@@ -703,10 +740,11 @@ class LocalAttention(nn.Module):
             offset = cache.offset if cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-            q = q.reshape(B, L, self.n_heads, self.head_dim)
-            q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-            q = q.transpose(0, 2, 1, 3)
+            q = _q_finalize(
+                self.wq_b(self.q_norm(self.wq_a(x))),
+                B, L, self.n_heads, self.head_dim,
+                self.config.rms_norm_eps,
+            )
             q = self.rope(q, offset)
 
             kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
@@ -728,10 +766,9 @@ class LocalAttention(nn.Module):
                 )
             out = self.rope(out, offset, inverse=True)
 
-            out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-            out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
             out = self.wo_a(out)
-            out = out.transpose(0, 2, 1, 3).flatten(-2)
+            out = _o_pre_b(out)
             out = self.wo_b(out)
 
             if self.sharding_group is not None:
@@ -801,10 +838,11 @@ class CompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-            q = q.reshape(B, L, self.n_heads, self.head_dim)
-            q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-            q = q.transpose(0, 2, 1, 3)
+            q = _q_finalize(
+                self.wq_b(self.q_norm(self.wq_a(x))),
+                B, L, self.n_heads, self.head_dim,
+                self.config.rms_norm_eps,
+            )
             q = self.rope(q, offset)
 
             kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
@@ -838,10 +876,9 @@ class CompressedAttention(nn.Module):
                 )
             out = self.rope(out, offset, inverse=True)
 
-            out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-            out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
             out = self.wo_a(out)
-            out = out.transpose(0, 2, 1, 3).flatten(-2)
+            out = _o_pre_b(out)
             out = self.wo_b(out)
 
             if self.sharding_group is not None:
@@ -913,9 +950,11 @@ class SparseCompressedAttention(nn.Module):
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
             q_residual = self.q_norm(self.wq_a(x))
-            q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
-            q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-            q = q.transpose(0, 2, 1, 3)
+            q = _q_finalize(
+                self.wq_b(q_residual),
+                B, L, self.n_heads, self.head_dim,
+                self.config.rms_norm_eps,
+            )
             q = self.rope(q, offset)
 
             kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
@@ -982,10 +1021,9 @@ class SparseCompressedAttention(nn.Module):
 
             out = self.rope(out, offset, inverse=True)
 
-            out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-            out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
             out = self.wo_a(out)
-            out = out.transpose(0, 2, 1, 3).flatten(-2)
+            out = _o_pre_b(out)
             out = self.wo_b(out)
 
             if self.sharding_group is not None:
