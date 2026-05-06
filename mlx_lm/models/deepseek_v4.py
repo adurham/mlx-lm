@@ -480,9 +480,19 @@ class DeepseekV4MoE(nn.Module):
 
             if self.sharding_group is not None:
                 with span("moe.all_sum"):
-                    y = finalize(
-                        mx.distributed.all_sum(y, group=self.sharding_group)
-                    )
+                    y = mx.distributed.all_sum(y, group=self.sharding_group)
+                    # Phase H Lever 1 (2026-05-06): force evaluation of the
+                    # collective output before any subsequent layer reads
+                    # `y`. The all_sum itself is bit-deterministic across
+                    # ranks, but a lazy graph can let two ranks dispatch
+                    # the next MoE layer with subtly-different inputs if
+                    # GPU stragglers cause the all_sum to be evaluated at
+                    # different graph positions per rank. mx.eval flushes
+                    # that ordering window. Required for the re-sharded
+                    # MTP MoE path (auto_parallel.py:935 Phase H Lever 1)
+                    # to remain bit-equivalent across ranks at c=2 temp=0.
+                    mx.eval(y)
+                    y = finalize(y)
             return y
 
 
