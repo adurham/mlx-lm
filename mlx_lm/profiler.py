@@ -56,6 +56,26 @@ class ProfilerHook(Protocol):
 _registered_hook: Optional[ProfilerHook] = None
 
 
+# Singleton reusable no-op context manager so ``span()`` doesn't allocate
+# a new generator-based CM per call when no hook is active. Hot decode
+# paths can call span() 360+ times per token; the @contextmanager
+# decorator's per-call overhead (build a generator, advance to yield,
+# advance again on exit) was ~3-5 µs/call. With 60 layers × 6 spans/layer
+# the overhead added up to ~1.8 ms/step on DSv4 — large enough to show
+# up in the GPU% probe as raw fwd_build time.
+class _NullSpan:
+    __slots__ = ()
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+_NULL_SPAN: _NullSpan = _NullSpan()
+
+
 def register(hook: ProfilerHook) -> None:
     """Install a profiler hook. Replaces any previously registered hook."""
     global _registered_hook
@@ -82,16 +102,15 @@ def span(name: str) -> "contextlib.AbstractContextManager[None]":
     """Enter a named profiling region; no-op when no hook is registered."""
     hook = _registered_hook
     if hook is None:
-        return _null_span()
+        return _NULL_SPAN
     return hook.span(name)
 
 
 def finalize(x: mx.array) -> mx.array:
     """Force ``mx.eval(x)`` if a hook is registered; otherwise no-op."""
-    hook = _registered_hook
-    if hook is None:
+    if _registered_hook is None:
         return x
-    return hook.finalize(x)
+    return _registered_hook.finalize(x)
 
 
 def on_layer_start(layer_idx: int, kind: str) -> None:
