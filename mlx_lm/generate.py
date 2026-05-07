@@ -1368,8 +1368,12 @@ class GenerationBatch:
         inputs = self._current_tokens
 
         # Forward pass
+        if _gpu_probe:
+            _t_pre_forward = time.perf_counter()
         logits = self.model(inputs[:, None], cache=self.prompt_cache)
         logits = logits[:, -1, :]
+        if _gpu_probe:
+            _t_post_forward = time.perf_counter()
 
         # Logits processors
         token_context = []
@@ -1405,12 +1409,18 @@ class GenerationBatch:
         # asynchronously
         self._next_tokens = sampled
         self._next_logprobs = list(logprobs)
+        if _gpu_probe:
+            _t_pre_async_eval = time.perf_counter()
         mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+        if _gpu_probe:
+            _t_post_async_eval = time.perf_counter()
 
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained
         # in the KV Cache.
         mx.eval(inputs, self._current_logprobs)
+        if _gpu_probe:
+            _t_post_eval = time.perf_counter()
         # Eager-detach the prompt cache state. By this point the previous
         # step's graph is materialized, and mx.eval's internal detach should
         # have fired — but in practice the cache chain (each step's
@@ -1431,26 +1441,53 @@ class GenerationBatch:
         # eval — small at steady state). Roll the deltas into a per-cycle
         # average and log every _gpu_log_every steps.
         if _gpu_probe:
-            _wall_ns = int((time.perf_counter() - _wall_start) * 1e9)
+            _t_step_end = time.perf_counter()
+            _wall_ns = int((_t_step_end - _wall_start) * 1e9)
             _gpu_ns_delta = mx.metal.gpu_time_ns() - _gpu_ns_start
+            # Per-section CPU-wall breakdown. The pre_forward is everything
+            # before the lazy-graph build (~free). forward_build is the
+            # Python-side traversal that constructs the graph for one
+            # decoder pass; lazy, so wall here is pure CPU. sample_build is
+            # the logprobs/sampler chain (also lazy). eval_block is the
+            # synchronous mx.eval wait for the current step's outputs to
+            # materialize on the GPU. post_eval is the host-side cache
+            # detach + tolist + token append loop. async_eval gives
+            # MLX the chance to pipeline next-step sampling onto the GPU.
+            _ns = lambda a, b: int((b - a) * 1e9)
+            _pre_fwd_ns = _ns(_wall_start, _t_pre_forward)
+            _fwd_build_ns = _ns(_t_pre_forward, _t_post_forward)
+            _sample_build_ns = _ns(_t_post_forward, _t_pre_async_eval)
+            _async_ns = _ns(_t_pre_async_eval, _t_post_async_eval)
+            _eval_block_ns = _ns(_t_post_async_eval, _t_post_eval)
+            _post_eval_ns = _ns(_t_post_eval, _t_step_end)
+
             cnt = getattr(self, "_gpu_probe_cnt", 0) + 1
-            sw = getattr(self, "_gpu_probe_sum_wall", 0) + _wall_ns
-            sg = getattr(self, "_gpu_probe_sum_gpu", 0) + _gpu_ns_delta
             self._gpu_probe_cnt = cnt
-            self._gpu_probe_sum_wall = sw
-            self._gpu_probe_sum_gpu = sg
+            self._gpu_probe_sum_wall = getattr(self, "_gpu_probe_sum_wall", 0) + _wall_ns
+            self._gpu_probe_sum_gpu = getattr(self, "_gpu_probe_sum_gpu", 0) + _gpu_ns_delta
+            self._gpu_probe_sum_pre_fwd = getattr(self, "_gpu_probe_sum_pre_fwd", 0) + _pre_fwd_ns
+            self._gpu_probe_sum_fwd_build = getattr(self, "_gpu_probe_sum_fwd_build", 0) + _fwd_build_ns
+            self._gpu_probe_sum_sample = getattr(self, "_gpu_probe_sum_sample", 0) + _sample_build_ns
+            self._gpu_probe_sum_async = getattr(self, "_gpu_probe_sum_async", 0) + _async_ns
+            self._gpu_probe_sum_eval = getattr(self, "_gpu_probe_sum_eval", 0) + _eval_block_ns
+            self._gpu_probe_sum_post = getattr(self, "_gpu_probe_sum_post", 0) + _post_eval_ns
             if cnt % _gpu_log_every == 0:
-                avg_wall_ms = sw / cnt / 1e6
-                avg_gpu_ms = sg / cnt / 1e6
-                pct = (sg / sw * 100.0) if sw > 0 else 0.0
+                avg = lambda x: x / cnt / 1e6
                 B = inputs.shape[0] if hasattr(inputs, "shape") else len(inputs)
+                pct = (self._gpu_probe_sum_gpu / self._gpu_probe_sum_wall * 100.0) if self._gpu_probe_sum_wall > 0 else 0.0
                 _log_pid = os.getpid()
                 sys.stderr.write(
                     f"[GPU_TIME pid={_log_pid}] "
                     f"steps={cnt} B={B} "
-                    f"avg_wall_ms={avg_wall_ms:.2f} "
-                    f"avg_gpu_ms={avg_gpu_ms:.2f} "
-                    f"gpu_pct={pct:.1f}\n"
+                    f"wall={avg(self._gpu_probe_sum_wall):.2f} "
+                    f"gpu={avg(self._gpu_probe_sum_gpu):.2f} "
+                    f"pct={pct:.1f} "
+                    f"pre_fwd={avg(self._gpu_probe_sum_pre_fwd):.3f} "
+                    f"fwd_build={avg(self._gpu_probe_sum_fwd_build):.2f} "
+                    f"sample={avg(self._gpu_probe_sum_sample):.3f} "
+                    f"async={avg(self._gpu_probe_sum_async):.3f} "
+                    f"eval={avg(self._gpu_probe_sum_eval):.2f} "
+                    f"post={avg(self._gpu_probe_sum_post):.2f}\n"
                 )
                 sys.stderr.flush()
 
