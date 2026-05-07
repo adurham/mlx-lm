@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import os
 import sys
 import time
 from collections import deque
@@ -1349,6 +1350,19 @@ class GenerationBatch:
         Returns:
             Tuple of token list and logprobs list.
         """
+        # GPU-utilization probe (optional). When MLX_GPU_TIME=1 is set on the
+        # worker, the metal backend accumulates GPUEndTime - GPUStartTime
+        # across every completed command buffer into a global atomic. We
+        # snapshot it before/after each decode step's mx.eval barrier and log
+        # rolling per-cycle GPU% busy every _GPU_TIME_LOG_EVERY steps. The
+        # whole probe is a no-op when the env var is unset (gpu_time_ns()
+        # returns 0 fast) so production keeps its hot path clean.
+        _gpu_probe = bool(os.environ.get("MLX_GPU_TIME"))
+        if _gpu_probe:
+            _gpu_log_every = int(os.environ.get("MLX_GPU_TIME_LOG_EVERY", "32"))
+            _wall_start = time.perf_counter()
+            _gpu_ns_start = mx.metal.gpu_time_ns()
+
         self._current_tokens = self._next_tokens
         self._current_logprobs = self._next_logprobs
         inputs = self._current_tokens
@@ -1410,6 +1424,36 @@ class GenerationBatch:
         inputs = inputs.tolist()
         for sti, ti in zip(self.tokens, inputs):
             sti.append(ti)
+
+        # GPU-utilization probe (continued). After mx.eval above has flushed
+        # the in-flight command buffers, gpu_time_ns() reflects the busy time
+        # for this step (plus any sliver overlapping the next step's async
+        # eval — small at steady state). Roll the deltas into a per-cycle
+        # average and log every _gpu_log_every steps.
+        if _gpu_probe:
+            _wall_ns = int((time.perf_counter() - _wall_start) * 1e9)
+            _gpu_ns_delta = mx.metal.gpu_time_ns() - _gpu_ns_start
+            cnt = getattr(self, "_gpu_probe_cnt", 0) + 1
+            sw = getattr(self, "_gpu_probe_sum_wall", 0) + _wall_ns
+            sg = getattr(self, "_gpu_probe_sum_gpu", 0) + _gpu_ns_delta
+            self._gpu_probe_cnt = cnt
+            self._gpu_probe_sum_wall = sw
+            self._gpu_probe_sum_gpu = sg
+            if cnt % _gpu_log_every == 0:
+                avg_wall_ms = sw / cnt / 1e6
+                avg_gpu_ms = sg / cnt / 1e6
+                pct = (sg / sw * 100.0) if sw > 0 else 0.0
+                B = inputs.shape[0] if hasattr(inputs, "shape") else len(inputs)
+                _log_pid = os.getpid()
+                sys.stderr.write(
+                    f"[GPU_TIME pid={_log_pid}] "
+                    f"steps={cnt} B={B} "
+                    f"avg_wall_ms={avg_wall_ms:.2f} "
+                    f"avg_gpu_ms={avg_gpu_ms:.2f} "
+                    f"gpu_pct={pct:.1f}\n"
+                )
+                sys.stderr.flush()
+
         return inputs, self._current_logprobs
 
     def extract_cache(self, idx: int) -> List[Any]:
