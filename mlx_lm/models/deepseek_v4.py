@@ -664,8 +664,43 @@ class DeepseekV4MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
         )
         self.sharding_group = None
+        self._compiled_forward: Optional[Any] = None
+
+    def install_compiled_forward(self) -> None:
+        """Phase H mx.compile: trace the FFN body once and reuse on every
+        subsequent decode step.
+
+        The FFN's only impure ops are the cross-rank ``mx.distributed.all_sum``
+        and the ``sum_gradients`` no-op-on-forward. Both are supported inside
+        ``mx.compile`` (verified). The gate / switch_mlp / shared_experts /
+        post_combine chain is otherwise pure compute, which means the trace
+        is reusable across all decode steps where shapes match.
+
+        Idempotent. Should be called after weights are loaded and
+        ``sharding_group`` is set so the compile boundary closes over the
+        final weight identities.
+        """
+        if self._compiled_forward is not None:
+            return
+        self._compiled_forward = mx.compile(self._raw_forward)
+
+    def _raw_forward(self, x: mx.array, input_ids: mx.array) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+        inds, scores = self.gate(x, input_ids)
+        y = self.switch_mlp(x, inds)
+        shared_out = self.shared_experts(x)
+        y = _moe_post_combine(y, scores, shared_out)
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+        return y
 
     def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
+        # Fast path: pre-compiled trace skips the per-decode-step Python
+        # graph build (~1-2 ms / cycle on DSv4 60-layer models).
+        if self._compiled_forward is not None:
+            return self._compiled_forward(x, input_ids)
+
         with span("ffn"):
             if self.sharding_group is not None:
                 x = sum_gradients(self.sharding_group)(x)
