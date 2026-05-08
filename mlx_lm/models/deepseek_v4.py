@@ -1356,6 +1356,72 @@ class DeepseekV4Block(nn.Module):
         self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn_hc = HyperConnection(config)
         self.ffn_hc = HyperConnection(config)
+        self._compiled_attn_pre: Optional[Any] = None
+        self._compiled_ffn_pre: Optional[Any] = None
+        self._compiled_post_attn: Optional[Any] = None
+        self._compiled_post_ffn: Optional[Any] = None
+
+    def install_compiled_forward(self) -> None:
+        """Phase H+ mx.compile of the four pure layer-plumbing chunks.
+
+        Each chunk is a 3-5 op sequence on the per-decode-step Python
+        critical path (HC body + RMSNorm pre-block; hc_expand
+        post-block). Tracing once and reusing the compile-cached graph
+        eliminates ~1-2 µs/op of Python lazy-graph overhead per op
+        per layer per step. At 60 layers × 2 sides × ~5 ops = 600 ops
+        per cycle, this collapses 0.6-1.2 ms / step.
+
+        Cache mutation in attention prevents whole-block compile, so
+        we split: pre-attn (HC + norm) | attention proper (uncompiled)
+        | post-attn (hc_expand). Same split for FFN, but the FFN body
+        itself is already compiled via DeepseekV4MoE.install_compiled_forward.
+
+        Idempotent — safe to call multiple times.
+        """
+        if self._compiled_attn_pre is not None:
+            return
+        self._compiled_attn_pre = mx.compile(self._raw_attn_pre)
+        self._compiled_ffn_pre = mx.compile(self._raw_ffn_pre)
+        self._compiled_post_attn = mx.compile(self._raw_post_attn)
+        self._compiled_post_ffn = mx.compile(self._raw_post_ffn)
+
+    def _raw_attn_pre(
+        self, h: mx.array
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
+        """HC + RMSNorm fused into one compiled trace.
+
+        Returns ``(normed, residual, post, comb)`` where ``residual``
+        is the original ``h`` (kept inside the trace so the post-attn
+        hc_expand can read it without a separate Python ref).
+        """
+        x, post, comb = self.attn_hc(h)
+        normed = self.attn_norm(x)
+        return normed, h, post, comb
+
+    def _raw_ffn_pre(
+        self, h: mx.array
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
+        x, post, comb = self.ffn_hc(h)
+        normed = self.ffn_norm(x)
+        return normed, h, post, comb
+
+    def _raw_post_attn(
+        self,
+        attn_out: mx.array,
+        residual: mx.array,
+        post: mx.array,
+        comb: mx.array,
+    ) -> mx.array:
+        return hc_expand(attn_out, residual, post, comb)
+
+    def _raw_post_ffn(
+        self,
+        ffn_out: mx.array,
+        residual: mx.array,
+        post: mx.array,
+        comb: mx.array,
+    ) -> mx.array:
+        return hc_expand(ffn_out, residual, post, comb)
 
     def __call__(
         self,
@@ -1364,6 +1430,16 @@ class DeepseekV4Block(nn.Module):
         cache: Optional[Any],
         input_ids: mx.array,
     ) -> mx.array:
+        # Fast path — pre-traced compile graphs skip the per-step
+        # Python lazy-graph build for all four plumbing chunks.
+        if self._compiled_attn_pre is not None:
+            normed, residual, post, comb = self._compiled_attn_pre(h)
+            x = self.attn(normed, mask=mask, cache=cache)
+            h = self._compiled_post_attn(x, residual, post, comb)
+            normed, residual, post, comb = self._compiled_ffn_pre(h)
+            x = self.ffn(normed, input_ids)
+            return self._compiled_post_ffn(x, residual, post, comb)
+
         residual = h
         with span("layer.attn_hc"):
             x, post, comb = self.attn_hc(h)
