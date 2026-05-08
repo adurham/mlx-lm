@@ -670,36 +670,60 @@ class DeepseekV4MoE(nn.Module):
         """Phase H mx.compile: trace the FFN body once and reuse on every
         subsequent decode step.
 
-        The FFN's only impure ops are the cross-rank ``mx.distributed.all_sum``
-        and the ``sum_gradients`` no-op-on-forward. Both are supported inside
-        ``mx.compile`` (verified). The gate / switch_mlp / shared_experts /
-        post_combine chain is otherwise pure compute, which means the trace
-        is reusable across all decode steps where shapes match.
-
-        Idempotent. Should be called after weights are loaded and
+        The compile boundary covers the **pure local compute** —
+        gate / switch_mlp / shared_experts / post_combine. The cross-rank
+        ``mx.distributed.all_sum`` is held outside compile so the
+        post-allreduce ``mx.eval`` fence (the same one in the span path)
+        can fire and force cross-rank lockstep. At c=2 long context
+        without the fence, JACCL ack barriers wait on the slowest rank
+        and per-stream throughput collapses (~7-8 tok/s vs ~17 with
+        fence). Idempotent. Call after weights are loaded and
         ``sharding_group`` is set so the compile boundary closes over the
         final weight identities.
         """
         if self._compiled_forward is not None:
             return
-        self._compiled_forward = mx.compile(self._raw_forward)
+        self._compiled_forward = mx.compile(self._raw_local)
 
-    def _raw_forward(self, x: mx.array, input_ids: mx.array) -> mx.array:
+    def _raw_local(self, x: mx.array, input_ids: mx.array) -> mx.array:
+        """Pure local compute portion of the MoE forward — no collective.
+
+        This is the part inside the ``mx.compile`` boundary. The
+        cross-rank ``all_sum`` happens outside (in ``__call__`` and in
+        ``DeepseekV4Block`` callers) so the post-allreduce eval fence can
+        fire without poisoning the compile cache.
+        """
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
         inds, scores = self.gate(x, input_ids)
         y = self.switch_mlp(x, inds)
         shared_out = self.shared_experts(x)
-        y = _moe_post_combine(y, scores, shared_out)
+        return _moe_post_combine(y, scores, shared_out)
+
+    def _raw_forward(self, x: mx.array, input_ids: mx.array) -> mx.array:
+        """Pure compute + cross-rank allreduce, eval-free.
+
+        Kept for callers (e.g. ``DeepseekV4Block._raw_ffn_section``) that
+        wrap the entire FFN in their own outer compile and provide the
+        cross-rank fence themselves.
+        """
+        y = self._raw_local(x, input_ids)
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
 
     def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
-        # Fast path: pre-compiled trace skips the per-decode-step Python
-        # graph build (~1-2 ms / cycle on DSv4 60-layer models).
+        # Fast path: pre-compiled local trace + Python-level allreduce
+        # with the fence eval. Mirrors the span-path semantics.
         if self._compiled_forward is not None:
-            return self._compiled_forward(x, input_ids)
+            y = self._compiled_forward(x, input_ids)
+            if self.sharding_group is not None:
+                y = mx.distributed.all_sum(y, group=self.sharding_group)
+                # Cross-rank lockstep fence — see install_compiled_forward
+                # docstring. Without this, JACCL ack barriers serialize
+                # on the slowest rank at long c=2 context.
+                mx.eval(y)
+            return y
 
         with span("ffn"):
             if self.sharding_group is not None:
@@ -1358,26 +1382,30 @@ class DeepseekV4Block(nn.Module):
         self.ffn_hc = HyperConnection(config)
         self._compiled_attn_pre: Optional[Any] = None
         self._compiled_post_attn: Optional[Any] = None
-        self._compiled_ffn_section: Optional[Any] = None
+        self._compiled_ffn_pre: Optional[Any] = None
+        self._compiled_post_ffn: Optional[Any] = None
 
     def install_compiled_forward(self) -> None:
         """Phase H+ mx.compile of the layer's pure subsections.
 
-        Splits the layer body around the cache-mutating attention call:
+        Splits the layer body around the cache-mutating attention call
+        AND around the FFN's cross-rank allreduce so the post-allreduce
+        eval fence (in DeepseekV4MoE.__call__) can fire:
 
           * ``_raw_attn_pre``   — attn_hc + attn_norm
           * ``[uncompiled]``    — attention proper (cache.update_and_fetch)
           * ``_raw_post_attn``  — hc_expand back into the residual
-          * ``_raw_ffn_section`` — ffn_hc + ffn_norm + MoE body + hc_expand
+          * ``_raw_ffn_pre``    — ffn_hc + ffn_norm
+          * ``[ffn.__call__]``  — MoE body via its own compile + eval fence
+          * ``_raw_post_ffn``   — hc_expand back into the residual
 
-        Each compiled call replaces 5-15 Python lazy-graph ops with one
-        compile-cache lookup. At 60 layers × 3 compiled chunks per layer,
-        the per-decode-step Python overhead drops from ~1500 ops to ~180.
-
-        ``_raw_ffn_section`` calls ``self.ffn._raw_forward`` directly so
-        the MoE body is traced inside the section's compile boundary
-        instead of going through ``DeepseekV4MoE.__call__``'s separate
-        compile cache.
+        Earlier (76016ec) we tried a single ``_raw_ffn_section`` compile
+        that called ``self.ffn._raw_forward`` directly, but that put the
+        all_sum inside the V4Block compile boundary and lost the
+        cross-rank eval fence — c=2 100K collapsed to ~7.7 tok/s vs
+        ~17 with the fence intact. Splitting the FFN restores the
+        fence at the cost of one extra compile-cache lookup per layer
+        (acceptable: each call is microseconds).
 
         Idempotent — safe to call multiple times.
         """
@@ -1385,7 +1413,8 @@ class DeepseekV4Block(nn.Module):
             return
         self._compiled_attn_pre = mx.compile(self._raw_attn_pre)
         self._compiled_post_attn = mx.compile(self._raw_post_attn)
-        self._compiled_ffn_section = mx.compile(self._raw_ffn_section)
+        self._compiled_ffn_pre = mx.compile(self._raw_ffn_pre)
+        self._compiled_post_ffn = mx.compile(self._raw_post_ffn)
 
     def _raw_attn_pre(
         self, h: mx.array
@@ -1409,18 +1438,22 @@ class DeepseekV4Block(nn.Module):
     ) -> mx.array:
         return hc_expand(attn_out, residual, post, comb)
 
-    def _raw_ffn_section(self, h: mx.array, input_ids: mx.array) -> mx.array:
-        """Full FFN section (HC + norm + MoE body + hc_expand) in one trace.
-
-        Calls ``self.ffn._raw_forward`` (the MoE body) directly to keep
-        everything inside this compile boundary. The MoE's own
-        ``_compiled_forward`` cache is NOT used here — would be a nested
-        compile-in-compile lookup that adds overhead.
-        """
+    def _raw_ffn_pre(
+        self, h: mx.array
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
+        """HC + RMSNorm fused into one compiled trace, FFN side."""
         x, post, comb = self.ffn_hc(h)
         normed = self.ffn_norm(x)
-        y = self.ffn._raw_forward(normed, input_ids)
-        return hc_expand(y, h, post, comb)
+        return normed, h, post, comb
+
+    def _raw_post_ffn(
+        self,
+        ffn_out: mx.array,
+        residual: mx.array,
+        post: mx.array,
+        comb: mx.array,
+    ) -> mx.array:
+        return hc_expand(ffn_out, residual, post, comb)
 
     def __call__(
         self,
@@ -1430,12 +1463,17 @@ class DeepseekV4Block(nn.Module):
         input_ids: mx.array,
     ) -> mx.array:
         # Fast path — pre-traced compile graphs skip the per-step
-        # Python lazy-graph build for the layer's pure chunks.
+        # Python lazy-graph build for the layer's pure chunks. The
+        # FFN goes through ``self.ffn`` (MoE.__call__) so its post-allreduce
+        # mx.eval fence fires — required for cross-rank lockstep at
+        # c=2 long context.
         if self._compiled_attn_pre is not None:
             normed, residual, post, comb = self._compiled_attn_pre(h)
             x = self.attn(normed, mask=mask, cache=cache)
             h = self._compiled_post_attn(x, residual, post, comb)
-            return self._compiled_ffn_section(h, input_ids)
+            normed, residual, post, comb = self._compiled_ffn_pre(h)
+            x = self.ffn(normed, input_ids)
+            return self._compiled_post_ffn(x, residual, post, comb)
 
         residual = h
         with span("layer.attn_hc"):
