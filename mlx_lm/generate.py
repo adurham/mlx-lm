@@ -424,6 +424,19 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
+    # GPU-utilization probe (optional). Gated on MLX_GPU_TIME=1 so production
+    # is a no-op. Logs rolling per-cycle GPU% busy + per-section CPU wall
+    # breakdown every MLX_GPU_TIME_LOG_EVERY tokens during the decode loop.
+    # Placed in stream_generate's decode loop because exo's mlx_generate
+    # calls THIS path (legacy single-stream gen), not BatchGenerator._step.
+    _gpu_probe = bool(os.environ.get("MLX_GPU_TIME"))
+    _gpu_log_every = int(os.environ.get("MLX_GPU_TIME_LOG_EVERY", "32")) if _gpu_probe else 0
+    _probe_sum_wall = 0
+    _probe_sum_gpu = 0
+    _probe_sum_step = 0
+    _probe_sum_yield = 0
+    _probe_cnt = 0
+
     with mx.stream(generation_stream):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
@@ -458,19 +471,53 @@ def generate_step(
     mx.async_eval(y, logprobs)
     n = 0
     while True:
+        if _gpu_probe:
+            _t_cycle_start = time.perf_counter()
+            _gpu_ns_start = mx.metal.gpu_time_ns()
         if n != max_tokens:
+            if _gpu_probe:
+                _t_step_start = time.perf_counter()
             next_y, next_logprobs = _step(y)
             mx.async_eval(next_y, next_logprobs)
+            if _gpu_probe:
+                _step_ns = int((time.perf_counter() - _t_step_start) * 1e9)
+        else:
+            _step_ns = 0
         if n == 0:
             mx.eval(y)
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
         if n == max_tokens:
             break
+        if _gpu_probe:
+            _t_yield_start = time.perf_counter()
         yield y.item(), logprobs
+        if _gpu_probe:
+            _yield_ns = int((time.perf_counter() - _t_yield_start) * 1e9)
         if n % 256 == 0:
             mx.clear_cache()
         y, logprobs = next_y, next_logprobs
         n += 1
+        if _gpu_probe:
+            _wall_ns = int((time.perf_counter() - _t_cycle_start) * 1e9)
+            _gpu_ns_delta = mx.metal.gpu_time_ns() - _gpu_ns_start
+            _probe_sum_wall += _wall_ns
+            _probe_sum_gpu += _gpu_ns_delta
+            _probe_sum_step += _step_ns
+            _probe_sum_yield += _yield_ns
+            _probe_cnt += 1
+            if _probe_cnt % _gpu_log_every == 0:
+                avg = lambda x: x / _probe_cnt / 1e6
+                pct = (_probe_sum_gpu / _probe_sum_wall * 100.0) if _probe_sum_wall > 0 else 0.0
+                sys.stderr.write(
+                    f"[STREAM_GEN_PROBE pid={os.getpid()}] "
+                    f"tokens={_probe_cnt} "
+                    f"wall_ms={avg(_probe_sum_wall):.2f} "
+                    f"gpu_ms={avg(_probe_sum_gpu):.2f} "
+                    f"gpu_pct={pct:.1f} "
+                    f"step_ms={avg(_probe_sum_step):.2f} "
+                    f"yield_ms={avg(_probe_sum_yield):.3f}\n"
+                )
+                sys.stderr.flush()
 
 
 def speculative_generate_step(
