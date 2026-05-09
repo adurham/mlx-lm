@@ -1012,6 +1012,7 @@ class LocalAttention(nn.Module):
         )
 
         self.sharding_group = None
+        self._compiled_qkv_rope: Optional[Any] = None
 
     def fuse_qa_kv_weights(self) -> bool:
         """Phase H: fuse wq_a + wkv weights into a single quantized matmul.
@@ -1030,6 +1031,31 @@ class LocalAttention(nn.Module):
             return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
 
+    def install_compiled_forward(self) -> None:
+        """Phase I: pre-trace the pre-cache QKV+RoPE chain.
+
+        See ``SparseCompressedAttention.install_compiled_forward`` for
+        rationale. Idempotent. Bit-equivalent to the eager path.
+        """
+        if self._compiled_qkv_rope is not None:
+            return
+        self._compiled_qkv_rope = mx.compile(self._raw_qkv_rope)
+
+    def _raw_qkv_rope(
+        self, x: mx.array, offset: mx.array
+    ) -> Tuple[mx.array, mx.array]:
+        B, L, _ = x.shape
+        q_lora, kv_pre = self._project_qa_kv(x)
+        q = _q_finalize(
+            self.wq_b(self.q_norm(q_lora)),
+            B, L, self.n_heads, self.head_dim,
+            self.config.rms_norm_eps,
+        )
+        q = self.rope(q, offset)
+        kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+        kv = self.rope(kv, offset)
+        return q, kv
+
     def __call__(
         self,
         x: mx.array,
@@ -1041,16 +1067,19 @@ class LocalAttention(nn.Module):
             offset = cache.offset if cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q_lora, kv_pre = self._project_qa_kv(x)
-            q = _q_finalize(
-                self.wq_b(self.q_norm(q_lora)),
-                B, L, self.n_heads, self.head_dim,
-                self.config.rms_norm_eps,
-            )
-            q = self.rope(q, offset)
+            if self._compiled_qkv_rope is not None:
+                q, kv = self._compiled_qkv_rope(x, offset)
+            else:
+                q_lora, kv_pre = self._project_qa_kv(x)
+                q = _q_finalize(
+                    self.wq_b(self.q_norm(q_lora)),
+                    B, L, self.n_heads, self.head_dim,
+                    self.config.rms_norm_eps,
+                )
+                q = self.rope(q, offset)
 
-            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = self.rope(kv, offset)
+                kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+                kv = self.rope(kv, offset)
             if cache is not None:
                 kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
@@ -1126,6 +1155,7 @@ class CompressedAttention(nn.Module):
         self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
 
         self.sharding_group = None
+        self._compiled_qkv_rope: Optional[Any] = None
 
     def fuse_qa_kv_weights(self) -> bool:
         """Phase H: fuse wq_a + wkv into a single quantized matmul.
@@ -1137,6 +1167,31 @@ class CompressedAttention(nn.Module):
         if hasattr(self, "_fused_qkv_w"):
             return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
+
+    def install_compiled_forward(self) -> None:
+        """Phase I: pre-trace the pre-cache QKV+RoPE chain.
+
+        See ``SparseCompressedAttention.install_compiled_forward`` for
+        rationale. Idempotent. Bit-equivalent to the eager path.
+        """
+        if self._compiled_qkv_rope is not None:
+            return
+        self._compiled_qkv_rope = mx.compile(self._raw_qkv_rope)
+
+    def _raw_qkv_rope(
+        self, x: mx.array, offset: mx.array
+    ) -> Tuple[mx.array, mx.array]:
+        B, L, _ = x.shape
+        q_lora, kv_pre = self._project_qa_kv(x)
+        q = _q_finalize(
+            self.wq_b(self.q_norm(q_lora)),
+            B, L, self.n_heads, self.head_dim,
+            self.config.rms_norm_eps,
+        )
+        q = self.rope(q, offset)
+        kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+        kv = self.rope(kv, offset)
+        return q, kv
 
     def __call__(
         self,
@@ -1151,16 +1206,19 @@ class CompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q_lora, kv_pre = self._project_qa_kv(x)
-            q = _q_finalize(
-                self.wq_b(self.q_norm(q_lora)),
-                B, L, self.n_heads, self.head_dim,
-                self.config.rms_norm_eps,
-            )
-            q = self.rope(q, offset)
+            if self._compiled_qkv_rope is not None:
+                q, kv = self._compiled_qkv_rope(x, offset)
+            else:
+                q_lora, kv_pre = self._project_qa_kv(x)
+                q = _q_finalize(
+                    self.wq_b(self.q_norm(q_lora)),
+                    B, L, self.n_heads, self.head_dim,
+                    self.config.rms_norm_eps,
+                )
+                q = self.rope(q, offset)
 
-            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = self.rope(kv, offset)
+                kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+                kv = self.rope(kv, offset)
             if local_cache is not None:
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
@@ -1248,6 +1306,7 @@ class SparseCompressedAttention(nn.Module):
         self.indexer = Indexer(config, self.compress_ratio)
 
         self.sharding_group = None
+        self._compiled_qkv_rope: Optional[Any] = None
 
     def fuse_qa_kv_weights(self) -> bool:
         """Phase H: fuse wq_a + wkv into a single quantized matmul.
@@ -1259,6 +1318,54 @@ class SparseCompressedAttention(nn.Module):
         if hasattr(self, "_fused_qkv_w"):
             return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
+
+    def install_compiled_forward(self) -> None:
+        """Phase I (2026-05-09): pre-trace the pre-cache QKV+RoPE chain.
+
+        Covers the previously-uncompiled chunk of attn between
+        ``_raw_attn_pre`` (HC+norm) and the cache mutation: QKV projection,
+        ``q_norm``, ``_q_finalize`` (reshape+norm+transpose), Q-side RoPE,
+        ``kv_norm``, KV reshape, and KV-side RoPE — ~7 small kernels per
+        layer per cycle that were dispatched individually. Fusing into one
+        compile-cache lookup folds the per-step Python lazy-graph build for
+        these ops. The post-cache work (compressor + indexer + SDPA + wo)
+        cannot share this compile because of nested cache mutations and
+        the SDPA branch on ``pooled.shape[1]``.
+
+        Per-shape compile (no ``shapeless=True``) — ``_q_finalize`` baked
+        the ``batch_size``/``seq_len`` ints into its own compile, and
+        nesting a shape-baked inner compile inside a shapeless outer is
+        unsupported. Decode hits 1-2 unique ``(B, L)`` shapes and prefill
+        a small bounded set of chunk sizes, so the per-shape cache stays
+        small. (Contrast with ``_indexer_score`` which has a strictly
+        growing pool dim — that one *requires* shapeless.)
+
+        Idempotent. Bit-equivalent to the eager path.
+        """
+        if self._compiled_qkv_rope is not None:
+            return
+        self._compiled_qkv_rope = mx.compile(self._raw_qkv_rope)
+
+    def _raw_qkv_rope(
+        self, x: mx.array, offset: mx.array
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """Pure pre-cache compute: QKV projection + RMSNorm + RoPE.
+
+        Returns ``(q, kv, q_residual)`` where ``q_residual`` is the
+        pre-``wq_b`` post-``q_norm`` activation needed by the indexer.
+        """
+        B, L, _ = x.shape
+        q_lora, kv_pre = self._project_qa_kv(x)
+        q_residual = self.q_norm(q_lora)
+        q = _q_finalize(
+            self.wq_b(q_residual),
+            B, L, self.n_heads, self.head_dim,
+            self.config.rms_norm_eps,
+        )
+        q = self.rope(q, offset)
+        kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+        kv = self.rope(kv, offset)
+        return q, kv, q_residual
 
     def __call__(
         self,
@@ -1274,17 +1381,20 @@ class SparseCompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q_lora, kv_pre = self._project_qa_kv(x)
-            q_residual = self.q_norm(q_lora)
-            q = _q_finalize(
-                self.wq_b(q_residual),
-                B, L, self.n_heads, self.head_dim,
-                self.config.rms_norm_eps,
-            )
-            q = self.rope(q, offset)
+            if self._compiled_qkv_rope is not None:
+                q, kv, q_residual = self._compiled_qkv_rope(x, offset)
+            else:
+                q_lora, kv_pre = self._project_qa_kv(x)
+                q_residual = self.q_norm(q_lora)
+                q = _q_finalize(
+                    self.wq_b(q_residual),
+                    B, L, self.n_heads, self.head_dim,
+                    self.config.rms_norm_eps,
+                )
+                q = self.rope(q, offset)
 
-            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = self.rope(kv, offset)
+                kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+                kv = self.rope(kv, offset)
             if local_cache is not None:
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
@@ -1415,6 +1525,12 @@ class DeepseekV4Block(nn.Module):
         self._compiled_post_attn = mx.compile(self._raw_post_attn)
         self._compiled_ffn_pre = mx.compile(self._raw_ffn_pre)
         self._compiled_post_ffn = mx.compile(self._raw_post_ffn)
+        # Phase I (2026-05-09): also pre-trace the attn module's
+        # pre-cache QKV+RoPE chain — the previously-uncompiled chunk
+        # between ``_raw_attn_pre`` (HC+norm) and the cache mutation.
+        attn_install = getattr(self.attn, "install_compiled_forward", None)
+        if attn_install is not None:
+            attn_install()
 
     def _raw_attn_pre(
         self, h: mx.array
