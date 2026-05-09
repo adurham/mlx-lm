@@ -1350,6 +1350,15 @@ class GenerationBatch:
         Returns:
             Tuple of token list and logprobs list.
         """
+        # DIAG 2026-05-09: confirm probe path is reached + env value seen
+        if not getattr(self.__class__, "_step_diag_logged", False):
+            sys.stderr.write(
+                f"[STEP_DIAG pid={os.getpid()}] BatchGenerator._step ENTERED for first time. "
+                f"MLX_GPU_TIME={os.environ.get('MLX_GPU_TIME', '<unset>')!r} "
+                f"PID env keys with MLX={[k for k in os.environ if k.startswith('MLX')]}\n"
+            )
+            sys.stderr.flush()
+            self.__class__._step_diag_logged = True
         # GPU-utilization probe (optional). When MLX_GPU_TIME=1 is set on the
         # worker, the metal backend accumulates GPUEndTime - GPUStartTime
         # across every completed command buffer into a global atomic. We
