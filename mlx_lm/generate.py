@@ -1404,6 +1404,15 @@ class GenerationBatch:
         # rolling per-cycle GPU% busy every _GPU_TIME_LOG_EVERY steps. The
         # whole probe is a no-op when the env var is unset (gpu_time_ns()
         # returns 0 fast) so production keeps its hot path clean.
+        # DIAG: confirm path is reached (one-shot per class lifetime)
+        if not getattr(self.__class__, "_gb_step_diag_logged", False):
+            sys.stderr.write(
+                f"[GB_STEP_DIAG pid={os.getpid()}] GenerationBatch._step ENTERED. "
+                f"MLX_GPU_TIME={os.environ.get('MLX_GPU_TIME', '<unset>')!r} "
+                f"len={len(self.uids)}\n"
+            )
+            sys.stderr.flush()
+            self.__class__._gb_step_diag_logged = True
         _gpu_probe = bool(os.environ.get("MLX_GPU_TIME"))
         if _gpu_probe:
             _gpu_log_every = int(os.environ.get("MLX_GPU_TIME_LOG_EVERY", "32"))
