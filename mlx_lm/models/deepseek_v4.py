@@ -1013,7 +1013,6 @@ class LocalAttention(nn.Module):
 
         self.sharding_group = None
         self._compiled_qkv_rope: Optional[Any] = None
-        self._compiled_post_sdpa: Optional[Any] = None
 
     def fuse_qa_kv_weights(self) -> bool:
         """Phase H: fuse wq_a + wkv weights into a single quantized matmul.
@@ -1033,8 +1032,7 @@ class LocalAttention(nn.Module):
         return self.wq_a(x), self.wkv(x)
 
     def install_compiled_forward(self) -> None:
-        """Phase I: pre-trace the pre-cache QKV+RoPE chain
-        and the post-SDPA output-projection chain.
+        """Phase I: pre-trace the pre-cache QKV+RoPE chain.
 
         See ``SparseCompressedAttention.install_compiled_forward`` for
         rationale. Idempotent. Bit-equivalent to the eager path.
@@ -1042,7 +1040,6 @@ class LocalAttention(nn.Module):
         if self._compiled_qkv_rope is not None:
             return
         self._compiled_qkv_rope = mx.compile(self._raw_qkv_rope)
-        self._compiled_post_sdpa = mx.compile(self._raw_post_sdpa)
 
     def _raw_qkv_rope(
         self, x: mx.array, offset: mx.array
@@ -1058,18 +1055,6 @@ class LocalAttention(nn.Module):
         kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         return q, kv
-
-    def _raw_post_sdpa(
-        self, out: mx.array, offset: mx.array
-    ) -> mx.array:
-        B = out.shape[0]
-        L = out.shape[2]
-        out = self.rope(out, offset, inverse=True)
-        out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-        out = self.wo_a(out)
-        out = _o_pre_b(out)
-        out = self.wo_b(out)
-        return out
 
     def __call__(
         self,
@@ -1110,14 +1095,12 @@ class LocalAttention(nn.Module):
                         sinks=self.attn_sink.astype(q.dtype),
                     )
                 )
-            if self._compiled_post_sdpa is not None:
-                out = self._compiled_post_sdpa(out, offset)
-            else:
-                out = self.rope(out, offset, inverse=True)
-                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-                out = self.wo_a(out)
-                out = _o_pre_b(out)
-                out = self.wo_b(out)
+            out = self.rope(out, offset, inverse=True)
+
+            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+            out = self.wo_a(out)
+            out = _o_pre_b(out)
+            out = self.wo_b(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
@@ -1173,7 +1156,6 @@ class CompressedAttention(nn.Module):
 
         self.sharding_group = None
         self._compiled_qkv_rope: Optional[Any] = None
-        self._compiled_post_sdpa: Optional[Any] = None
 
     def fuse_qa_kv_weights(self) -> bool:
         """Phase H: fuse wq_a + wkv into a single quantized matmul.
@@ -1187,8 +1169,7 @@ class CompressedAttention(nn.Module):
         return self.wq_a(x), self.wkv(x)
 
     def install_compiled_forward(self) -> None:
-        """Phase I: pre-trace the pre-cache QKV+RoPE chain
-        and the post-SDPA output-projection chain.
+        """Phase I: pre-trace the pre-cache QKV+RoPE chain.
 
         See ``SparseCompressedAttention.install_compiled_forward`` for
         rationale. Idempotent. Bit-equivalent to the eager path.
@@ -1196,7 +1177,6 @@ class CompressedAttention(nn.Module):
         if self._compiled_qkv_rope is not None:
             return
         self._compiled_qkv_rope = mx.compile(self._raw_qkv_rope)
-        self._compiled_post_sdpa = mx.compile(self._raw_post_sdpa)
 
     def _raw_qkv_rope(
         self, x: mx.array, offset: mx.array
@@ -1212,18 +1192,6 @@ class CompressedAttention(nn.Module):
         kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         return q, kv
-
-    def _raw_post_sdpa(
-        self, out: mx.array, offset: mx.array
-    ) -> mx.array:
-        B = out.shape[0]
-        L = out.shape[2]
-        out = self.rope(out, offset, inverse=True)
-        out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-        out = self.wo_a(out)
-        out = _o_pre_b(out)
-        out = self.wo_b(out)
-        return out
 
     def __call__(
         self,
@@ -1278,14 +1246,12 @@ class CompressedAttention(nn.Module):
                         sinks=self.attn_sink.astype(q.dtype),
                     )
                 )
-            if self._compiled_post_sdpa is not None:
-                out = self._compiled_post_sdpa(out, offset)
-            else:
-                out = self.rope(out, offset, inverse=True)
-                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-                out = self.wo_a(out)
-                out = _o_pre_b(out)
-                out = self.wo_b(out)
+            out = self.rope(out, offset, inverse=True)
+
+            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+            out = self.wo_a(out)
+            out = _o_pre_b(out)
+            out = self.wo_b(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
@@ -1341,7 +1307,6 @@ class SparseCompressedAttention(nn.Module):
 
         self.sharding_group = None
         self._compiled_qkv_rope: Optional[Any] = None
-        self._compiled_post_sdpa: Optional[Any] = None
 
     def fuse_qa_kv_weights(self) -> bool:
         """Phase H: fuse wq_a + wkv into a single quantized matmul.
@@ -1355,33 +1320,31 @@ class SparseCompressedAttention(nn.Module):
         return self.wq_a(x), self.wkv(x)
 
     def install_compiled_forward(self) -> None:
-        """Phase I (2026-05-09): pre-trace the pre-cache QKV+RoPE chain
-        and the post-SDPA output-projection chain.
+        """Phase I (2026-05-09): pre-trace the pre-cache QKV+RoPE chain.
 
-        Two compile boundaries inside attn forward, both pure compute:
-          1. ``_raw_qkv_rope`` — QKV projection, ``q_norm``, ``_q_finalize``
-             (reshape+norm+transpose), Q-side RoPE, ``kv_norm``, KV reshape,
-             KV-side RoPE. ~7 kernels per attn that were dispatched
-             individually.
-          2. ``_raw_post_sdpa`` — inverse RoPE, ``_o_pre_a``, ``wo_a``,
-             ``_o_pre_b``, ``wo_b``. 5 kernels per attn similarly fused.
+        Covers the previously-uncompiled chunk of attn between
+        ``_raw_attn_pre`` (HC+norm) and the cache mutation: QKV projection,
+        ``q_norm``, ``_q_finalize`` (reshape+norm+transpose), Q-side RoPE,
+        ``kv_norm``, KV reshape, and KV-side RoPE — ~7 small kernels per
+        layer per cycle that were dispatched individually. Fusing into one
+        compile-cache lookup folds the per-step Python lazy-graph build for
+        these ops. The post-cache work (compressor + indexer + SDPA + wo)
+        cannot share this compile because of nested cache mutations and
+        the SDPA branch on ``pooled.shape[1]``.
 
-        The middle (compressor + indexer + SDPA + cache mutations) stays
-        uncompiled because of nested cache mutations and the SDPA Python
-        branch on ``pooled.shape[1]``. The trailing all_sum stays outside
-        compile so its eval fence (when added) can fire.
-
-        Per-shape compile (no ``shapeless=True``) — ``_q_finalize`` and
-        ``_o_pre_a`` bake ``batch_size``/``seq_len`` ints. Decode hits
-        1-2 unique ``(B, L)`` shapes and prefill a small bounded set, so
-        the per-shape cache stays small.
+        Per-shape compile (no ``shapeless=True``) — ``_q_finalize`` baked
+        the ``batch_size``/``seq_len`` ints into its own compile, and
+        nesting a shape-baked inner compile inside a shapeless outer is
+        unsupported. Decode hits 1-2 unique ``(B, L)`` shapes and prefill
+        a small bounded set of chunk sizes, so the per-shape cache stays
+        small. (Contrast with ``_indexer_score`` which has a strictly
+        growing pool dim — that one *requires* shapeless.)
 
         Idempotent. Bit-equivalent to the eager path.
         """
         if self._compiled_qkv_rope is not None:
             return
         self._compiled_qkv_rope = mx.compile(self._raw_qkv_rope)
-        self._compiled_post_sdpa = mx.compile(self._raw_post_sdpa)
 
     def _raw_qkv_rope(
         self, x: mx.array, offset: mx.array
@@ -1403,24 +1366,6 @@ class SparseCompressedAttention(nn.Module):
         kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         return q, kv, q_residual
-
-    def _raw_post_sdpa(
-        self, out: mx.array, offset: mx.array
-    ) -> mx.array:
-        """Pure post-SDPA compute: inverse RoPE + reshape/transpose + wo.
-
-        Input ``out`` is SDPA's output, shape ``[B, n_heads, L, head_dim]``.
-        Output is the pre-allreduce activation; the cross-rank ``all_sum``
-        stays outside this compile.
-        """
-        B = out.shape[0]
-        L = out.shape[2]
-        out = self.rope(out, offset, inverse=True)
-        out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-        out = self.wo_a(out)
-        out = _o_pre_b(out)
-        out = self.wo_b(out)
-        return out
 
     def __call__(
         self,
@@ -1510,14 +1455,12 @@ class SparseCompressedAttention(nn.Module):
                     )
                 out = finalize(out)
 
-            if self._compiled_post_sdpa is not None:
-                out = self._compiled_post_sdpa(out, offset)
-            else:
-                out = self.rope(out, offset, inverse=True)
-                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-                out = self.wo_a(out)
-                out = _o_pre_b(out)
-                out = self.wo_b(out)
+            out = self.rope(out, offset, inverse=True)
+
+            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+            out = self.wo_a(out)
+            out = _o_pre_b(out)
+            out = self.wo_b(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
