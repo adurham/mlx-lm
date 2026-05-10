@@ -652,6 +652,22 @@ class DeepseekV4MoE(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
+        # Lever 6 (2026-05-09): cross-rank fence batching.
+        # By default (N=1), fence after every layer's all_sum — Phase H Lever 1
+        # behavior, required for cross-rank lockstep at long c=2 context.
+        # With N>=2, fence only every Nth layer (plus the final layer,
+        # whose output flows to lm_head). Trades cross-rank lockstep
+        # frequency for fewer GPU/CPU sync points per cycle. Safe ceiling
+        # is empirical — too aggressive (N too large) lets graph-position
+        # drift accumulate across ranks and JACCL ack barriers wedge.
+        # See `dsv4_v4block_compile_2026_05_08.md` for the all_sum-inside-
+        # compile case (effectively N=∞) collapsing c=2 100K to 7.7 tok/s.
+        import os as _os
+        self._fence_every_n = max(1, int(
+            _os.environ.get("EXO_DSV4_FENCE_EVERY_N_LAYERS", "1")
+        ))
+        self._num_total_layers = int(config.num_hidden_layers)
         self.gate = MoEGate(config, layer_idx)
         self.switch_mlp = SwitchGLU(
             config.hidden_size,
@@ -722,7 +738,15 @@ class DeepseekV4MoE(nn.Module):
                 # Cross-rank lockstep fence — see install_compiled_forward
                 # docstring. Without this, JACCL ack barriers serialize
                 # on the slowest rank at long c=2 context.
-                mx.eval(y)
+                # Lever 6: with EXO_DSV4_FENCE_EVERY_N_LAYERS>=2, only fence
+                # every Nth layer (plus the final layer). Reduces sync
+                # points per cycle.
+                _is_last = self.layer_idx == self._num_total_layers - 1
+                _is_fence_idx = (self.layer_idx % self._fence_every_n) == (
+                    self._fence_every_n - 1
+                )
+                if _is_last or _is_fence_idx:
+                    mx.eval(y)
             return y
 
         with span("ffn"):
