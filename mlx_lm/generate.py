@@ -1409,6 +1409,17 @@ class GenerationBatch:
             _gpu_log_every = int(os.environ.get("MLX_GPU_TIME_LOG_EVERY", "32"))
             _wall_start = time.perf_counter()
             _gpu_ns_start = mx.metal.gpu_time_ns()
+        # DIAG: confirm probe entry. Fires once per _step call when env set.
+        if not getattr(self, "_probe_entry_logged", False):
+            import sys as _sys
+            _sys.stderr.write(
+                f"[PROBE_ENTRY pid={os.getpid()}] _step entered "
+                f"_gpu_probe={_gpu_probe} "
+                f"MLX_GPU_TIME={os.environ.get('MLX_GPU_TIME')!r} "
+                f"uids={len(self.uids)}\n"
+            )
+            _sys.stderr.flush()
+            self._probe_entry_logged = True
 
         self._current_tokens = self._next_tokens
         self._current_logprobs = self._next_logprobs
