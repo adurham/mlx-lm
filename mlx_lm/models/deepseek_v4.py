@@ -471,7 +471,6 @@ def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
     return weights_a, weights_b
 
 
-@partial(mx.compile, shapeless=True)
 def _sparse_pooled_attention(
     q: mx.array,
     local_kv: mx.array,
