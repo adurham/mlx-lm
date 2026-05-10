@@ -13,6 +13,29 @@ from mlx.utils import tree_flatten
 
 from ..profiler import finalize, span
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+
+# CPU build-time probe (env-gated MLX_BUILD_PROBE=1). Accumulates per-section
+# CPU-wall time across all V4Block fast-path invocations. Reported by
+# DeepseekV4Model.__call__ at MLX_BUILD_PROBE_LOG_EVERY decode cycles.
+import sys as _bp_sys
+import time as _bp_time
+_BUILD_PROBE_ENABLED = bool(os.environ.get("MLX_BUILD_PROBE"))
+_BUILD_PROBE_LOG_EVERY = int(os.environ.get("MLX_BUILD_PROBE_LOG_EVERY", "8"))
+_BUILD_PROBE_PERF = _bp_time.perf_counter
+_BUILD_PROBE_ACC: Dict[str, float] = {
+    "attn_pre": 0.0,
+    "attn": 0.0,
+    "post_attn": 0.0,
+    "ffn_pre": 0.0,
+    "ffn": 0.0,
+    "post_ffn": 0.0,
+    "layer_count": 0,
+    "model_forward_total": 0.0,
+    "embed": 0.0,
+    "attn_mask": 0.0,
+    "final_norm": 0.0,
+    "step_count": 0,
+}
 from .cache import CacheList, PoolingCache, RotatingKVCache
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 from .mla import MultiLinear
@@ -1492,12 +1515,38 @@ class DeepseekV4Block(nn.Module):
         # mx.eval fence fires — required for cross-rank lockstep at
         # c=2 long context.
         if self._compiled_attn_pre is not None:
+            # Per-section CPU build-time probe (env-gated MLX_BUILD_PROBE=1).
+            # Times each of the 6 calls and accumulates into a process-global
+            # dict. The probe is no-op when the env var is unset.
+            _bp = _BUILD_PROBE_ENABLED
+            if _bp:
+                _bt0 = _BUILD_PROBE_PERF()
             normed, residual, post, comb = self._compiled_attn_pre(h)
+            if _bp:
+                _bt1 = _BUILD_PROBE_PERF()
             x = self.attn(normed, mask=mask, cache=cache)
+            if _bp:
+                _bt2 = _BUILD_PROBE_PERF()
             h = self._compiled_post_attn(x, residual, post, comb)
+            if _bp:
+                _bt3 = _BUILD_PROBE_PERF()
             normed, residual, post, comb = self._compiled_ffn_pre(h)
+            if _bp:
+                _bt4 = _BUILD_PROBE_PERF()
             x = self.ffn(normed, input_ids)
-            return self._compiled_post_ffn(x, residual, post, comb)
+            if _bp:
+                _bt5 = _BUILD_PROBE_PERF()
+            out = self._compiled_post_ffn(x, residual, post, comb)
+            if _bp:
+                _bt6 = _BUILD_PROBE_PERF()
+                _BUILD_PROBE_ACC["attn_pre"] += (_bt1 - _bt0)
+                _BUILD_PROBE_ACC["attn"] += (_bt2 - _bt1)
+                _BUILD_PROBE_ACC["post_attn"] += (_bt3 - _bt2)
+                _BUILD_PROBE_ACC["ffn_pre"] += (_bt4 - _bt3)
+                _BUILD_PROBE_ACC["ffn"] += (_bt5 - _bt4)
+                _BUILD_PROBE_ACC["post_ffn"] += (_bt6 - _bt5)
+                _BUILD_PROBE_ACC["layer_count"] += 1
+            return out
 
         residual = h
         with span("layer.attn_hc"):
@@ -1668,6 +1717,9 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.hc_head = HyperHead(config)
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
+        _bp = _BUILD_PROBE_ENABLED
+        if _bp:
+            _bp_t_start = _BUILD_PROBE_PERF()
         with span("model.embed"):
             h = self.embed_tokens(inputs)
             h = mx.broadcast_to(
@@ -1675,6 +1727,9 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[2]),
             )
             h = finalize(mx.contiguous(h))
+        if _bp:
+            _bp_t_post_embed = _BUILD_PROBE_PERF()
+            _BUILD_PROBE_ACC["embed"] += (_bp_t_post_embed - _bp_t_start)
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
@@ -1695,6 +1750,9 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             )
             if mask is not None:
                 finalize(mask)
+        if _bp:
+            _bp_t_post_mask = _BUILD_PROBE_PERF()
+            _BUILD_PROBE_ACC["attn_mask"] += (_bp_t_post_mask - _bp_t_post_embed)
 
         if pipeline_rank < pipeline_size - 1:
             with span("model.recv"):
@@ -1717,7 +1775,43 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 h = finalize(mx.distributed.all_gather(h)[: h.shape[0]])
 
         with span("model.final_norm"):
-            return finalize(self.norm(self.hc_head(h)))
+            out = finalize(self.norm(self.hc_head(h)))
+        if _bp:
+            _bp_t_end = _BUILD_PROBE_PERF()
+            _BUILD_PROBE_ACC["final_norm"] += (_bp_t_end - _bp_t_post_mask)
+            _BUILD_PROBE_ACC["model_forward_total"] += (_bp_t_end - _bp_t_start)
+            _BUILD_PROBE_ACC["step_count"] += 1
+            sc = _BUILD_PROBE_ACC["step_count"]
+            if sc % _BUILD_PROBE_LOG_EVERY == 0:
+                lc = max(_BUILD_PROBE_ACC["layer_count"], 1)
+                # Per-step averages (sum across all layers, divided by step_count)
+                pms = lambda k: _BUILD_PROBE_ACC[k] / sc * 1000
+                # Per-layer-call averages (sum / layer_count, in ms)
+                pml = lambda k: _BUILD_PROBE_ACC[k] / lc * 1000
+                _bp_sys.stderr.write(
+                    f"[BUILD_PROBE pid={os.getpid()}] "
+                    f"steps={sc} "
+                    f"total={pms('model_forward_total'):.2f} "
+                    f"embed={pms('embed'):.3f} "
+                    f"mask={pms('attn_mask'):.3f} "
+                    f"final={pms('final_norm'):.3f} "
+                    f"layers/step="
+                    f"attn_pre={pms('attn_pre'):.2f} "
+                    f"attn={pms('attn'):.2f} "
+                    f"post_attn={pms('post_attn'):.2f} "
+                    f"ffn_pre={pms('ffn_pre'):.2f} "
+                    f"ffn={pms('ffn'):.2f} "
+                    f"post_ffn={pms('post_ffn'):.2f} "
+                    f"per_layer="
+                    f"attn_pre={pml('attn_pre'):.3f} "
+                    f"attn={pml('attn'):.3f} "
+                    f"post_attn={pml('post_attn'):.3f} "
+                    f"ffn_pre={pml('ffn_pre'):.3f} "
+                    f"ffn={pml('ffn'):.3f} "
+                    f"post_ffn={pml('post_ffn'):.3f}\n"
+                )
+                _bp_sys.stderr.flush()
+        return out
 
 
 class Model(nn.Module):
