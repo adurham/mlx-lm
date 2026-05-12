@@ -948,31 +948,19 @@ def _indexer_score(
     process-wide compile cache (no eviction), and OOMs at ~94K decoded
     Think-mode tokens with ~24K cached pipelines.
 
-    May 12 2026 perf rewrite (microbench ``bench/indexer_score_microbench.py``):
-    drop the three explicit ``.astype(mx.float32)`` casts and fuse the
-    matmul + head-collapse into two einsums. At 100K decode shape
-    ``(B=1, n_heads=64, L_q=3, head_dim=128) x (B=1, L_pool=25000, head_dim=128)``,
-    this drops the score kernel from ~0.7 ms to ~0.3 ms per call (2.17x).
-    Numerically: max abs diff ~0.015, but top-192 argpartition overlap is
-    98.6% — the differing entries are near the threshold cutoff. MLX's
-    bf16 GEMM accumulates in fp32 internally so the matmul precision is
-    preserved up to the final downcast, and ``mx.argpartition`` top-k
-    selection is robust to small score perturbations at the boundary.
-
-    This was the fix promised by ``f4dd9e7`` ("drop fp32 casts in Indexer
-    score computation", +3.4% decode at 100K per fork-notes) — but
-    ``2e099bd`` ("@mx.compile the Indexer score-and-collapse hot path")
-    silently re-introduced the fp32 casts when it wrapped the function in
-    mx.compile. This restores the bf16 path inside the compile boundary.
-
+    Replaces lines:
+      scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(mx.float32)
+      scores = mx.maximum(scores, 0) * self.scale
+      weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
+      scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
     Runs every decode step on every indexer-equipped layer (~21 layers).
     """
-    # score[b, h, q, p] = q[b,h,q,d] . pooled[b,p,d]
-    scores = mx.einsum("bhqd,bpd->bhqp", q, pooled)
+    qf = q.astype(mx.float32)
+    pf = pooled[:, None].astype(mx.float32)
+    scores = qf @ pf.swapaxes(-1, -2)
     scores = mx.maximum(scores, 0) * scale
-    w = weights_x * n_heads_inv_sqrt
-    # collapse heads: out[b, q, p] = sum_h scores[b,h,q,p] * w[b,q,h]
-    return mx.einsum("bhqp,bqh->bqp", scores, w)
+    w = weights_x.astype(mx.float32) * n_heads_inv_sqrt
+    return (scores * w.swapaxes(-1, -2)[..., None]).sum(axis=1)
 
 
 class Indexer(nn.Module):
