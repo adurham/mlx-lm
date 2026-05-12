@@ -36,6 +36,103 @@ _BUILD_PROBE_ACC: Dict[str, float] = {
     "final_norm": 0.0,
     "step_count": 0,
 }
+
+# Per-mlx-op CPU-dispatch probe (env-gated MLX_OP_PROBE=1).
+# Monkey-patches a curated set of hot mlx primitives at module load so every
+# call accumulates wall-time (Python wrapper + pybind cross + C++-side
+# eager submit, NOT GPU compute — GPU runs async). Reported alongside
+# BUILD_PROBE at MLX_BUILD_PROBE_LOG_EVERY steps. Use this to find which
+# op classes dominate the un-compiled CPU dispatch budget identified by
+# build_probe.
+#
+# Probed ops (chosen as the hot path through V4Attention.__call__ and the
+# FFN body): mx.fast.rope, mx.fast.scaled_dot_product_attention,
+# mx.fast.rms_norm, mx.quantized_matmul, mx.matmul, mx.softmax,
+# mx.logsumexp, mx.logaddexp, mx.take_along_axis, mx.argpartition,
+# mx.einsum, mx.distributed.all_sum.
+#
+# Each tracked op also gets a call-count so we can compute mean-per-call.
+_OP_PROBE_ENABLED = bool(os.environ.get("MLX_OP_PROBE"))
+_OP_PROBE_ACC: Dict[str, float] = {}
+_OP_PROBE_COUNT: Dict[str, int] = {}
+
+
+def _op_probe_install() -> None:
+    """Monkey-patch hot mlx primitives to accumulate per-op CPU-wall time.
+
+    Idempotent — guarded by the _patched flag on each wrapped callable so
+    repeated calls (e.g. from multiple model instances) don't double-wrap.
+
+    Notes:
+      * The wrappers do their own try/finally to be exception-safe.
+      * They write to module-level dicts (not thread-local). Single-process
+        decode is the only target, so no locking needed.
+      * Wall-time captured includes the Python wrapper itself; in practice
+        that is sub-microsecond and dwarfed by the pybind cross + C++ side
+        eager-submit / shape-validation work.
+    """
+
+    def _wrap(mod, name: str, label: str) -> None:
+        fn = getattr(mod, name, None)
+        if fn is None or getattr(fn, "_op_probe_wrapped", False):
+            return
+
+        def _wrapped(*args, _fn=fn, _label=label, **kwargs):
+            _t0 = _BUILD_PROBE_PERF()
+            try:
+                return _fn(*args, **kwargs)
+            finally:
+                _t1 = _BUILD_PROBE_PERF()
+                _OP_PROBE_ACC[_label] = _OP_PROBE_ACC.get(_label, 0.0) + (_t1 - _t0)
+                _OP_PROBE_COUNT[_label] = _OP_PROBE_COUNT.get(_label, 0) + 1
+
+        _wrapped._op_probe_wrapped = True
+        setattr(mod, name, _wrapped)
+
+    # Top-level mx.* ops
+    _wrap(mx, "matmul", "matmul")
+    _wrap(mx, "quantized_matmul", "quantized_matmul")
+    _wrap(mx, "softmax", "softmax")
+    _wrap(mx, "logsumexp", "logsumexp")
+    _wrap(mx, "logaddexp", "logaddexp")
+    _wrap(mx, "take_along_axis", "take_along_axis")
+    _wrap(mx, "argpartition", "argpartition")
+    _wrap(mx, "einsum", "einsum")
+    _wrap(mx, "concatenate", "concatenate")
+    _wrap(mx, "broadcast_to", "broadcast_to")
+    _wrap(mx, "where", "where")
+    _wrap(mx, "exp", "exp")
+    # mx.fast.*
+    _wrap(mx.fast, "rope", "fast.rope")
+    _wrap(mx.fast, "scaled_dot_product_attention", "fast.sdpa")
+    _wrap(mx.fast, "rms_norm", "fast.rms_norm")
+    # mx.distributed.*
+    _wrap(mx.distributed, "all_sum", "dist.all_sum")
+    _wrap(mx.distributed, "all_gather", "dist.all_gather")
+    _wrap(mx.distributed, "send", "dist.send")
+    _wrap(mx.distributed, "recv_like", "dist.recv_like")
+
+
+if _OP_PROBE_ENABLED:
+    _op_probe_install()
+
+
+def _op_probe_report() -> str:
+    """Build a one-line report of per-op CPU-wall accumulation.
+
+    Sorted by total wall (descending) so the dominant ops appear first.
+    """
+    if not _OP_PROBE_ENABLED or not _OP_PROBE_ACC:
+        return ""
+    items = sorted(_OP_PROBE_ACC.items(), key=lambda kv: -kv[1])
+    parts = []
+    for label, total_s in items:
+        count = _OP_PROBE_COUNT.get(label, 0)
+        mean_us = (total_s / count * 1e6) if count else 0.0
+        parts.append(f"{label}={total_s * 1000:.1f}ms/n={count}/mean={mean_us:.1f}us")
+    return " ".join(parts)
+
+
 from .cache import CacheList, PoolingCache, RotatingKVCache
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 from .mla import MultiLinear
@@ -1863,6 +1960,12 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                     f"ffn={pml('ffn'):.3f} "
                     f"post_ffn={pml('post_ffn'):.3f}\n"
                 )
+                if _OP_PROBE_ENABLED:
+                    _op_line = _op_probe_report()
+                    if _op_line:
+                        _bp_sys.stderr.write(
+                            f"[OP_PROBE pid={os.getpid()}] steps={sc} {_op_line}\n"
+                        )
                 _bp_sys.stderr.flush()
         return out
 
