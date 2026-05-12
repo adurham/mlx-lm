@@ -955,11 +955,26 @@ def _indexer_score(
       scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
     Runs every decode step on every indexer-equipped layer (~21 layers).
     """
-    qf = q.astype(mx.float32)
-    pf = pooled[:, None].astype(mx.float32)
-    scores = qf @ pf.swapaxes(-1, -2)
+    # Drops three explicit .astype(mx.float32) casts. MLX's bf16 GEMM
+    # accumulates in fp32 internally so matmul precision is preserved up
+    # to the final downcast. mx.argpartition top-k is robust to small
+    # score perturbations at the cutoff (microbench: 98.6% top-192 overlap
+    # vs fp32 reference, max abs diff ~0.015 at bf16 epsilon scale).
+    #
+    # This restores the fix originally landed in f4dd9e7 (+3.4% decode at
+    # 100K per fork-notes) — 2e099bd silently undid it when wrapping in
+    # mx.compile. See bench/indexer_score_microbench.py for microbench.
+    #
+    # CAUTION: under MTP self-spec (EXO_DSV4_MTP=1), this perturbation
+    # reduces draft/verify agreement by ~9% (1.04 → 0.95 mean acceptance
+    # on c=1 100K) — the cycle is 1.6% faster but generates 4.6% fewer
+    # accepted tokens, net -1.4% decode tps. Under MTP-off (the canonical
+    # tuning configuration), it is a pure win: same kernel speedup, no
+    # acceptance to lose.
+    pf = pooled[:, None]
+    scores = q @ pf.swapaxes(-1, -2)
     scores = mx.maximum(scores, 0) * scale
-    w = weights_x.astype(mx.float32) * n_heads_inv_sqrt
+    w = weights_x * n_heads_inv_sqrt
     return (scores * w.swapaxes(-1, -2)[..., None]).sum(axis=1)
 
 
