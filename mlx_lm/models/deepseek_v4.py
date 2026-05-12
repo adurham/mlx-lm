@@ -1345,8 +1345,6 @@ class SparseCompressedAttention(nn.Module):
         self.indexer = Indexer(config, self.compress_ratio)
 
         self.sharding_group = None
-        self._compiled_attn_proj: Optional[Any] = None
-        self._compiled_attn_post: Optional[Any] = None
 
     def fuse_qa_kv_weights(self) -> bool:
         """Phase H: fuse wq_a + wkv into a single quantized matmul.
@@ -1358,71 +1356,6 @@ class SparseCompressedAttention(nn.Module):
         if hasattr(self, "_fused_qkv_w"):
             return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
-
-    def install_compiled_attn(self) -> None:
-        """Phase I (2026-05-12): mx.compile the pure pre-SDPA and
-        post-SDPA chains of SparseCompressedAttention.__call__.
-
-        SparseCompressedAttention is on ~half of the 43 V4 layers
-        (the compress_ratio=4 slots). The pre-SDPA chain (projections,
-        q/kv norm, RoPE) and post-SDPA chain (RoPE inverse, output
-        projection chain) are both pure (no cache mutation), so they
-        compile cleanly. Each compiled boundary collapses ~5-10
-        separate Python-side op dispatches into one compile-cache
-        lookup.
-
-        The cache-mutating bits (local_cache.update_and_fetch,
-        compressor's pool_cache.accumulate_windows, indexer's
-        pool_cache.update_and_fetch) and the conditional SDPA dispatch
-        stay outside compile boundaries.
-
-        Idempotent — safe to call multiple times.
-
-        Wired via EXO_DSV4_COMPILE_LAYER (sibling of the V4Block
-        compile setup); call site is auto_parallel.py during model
-        load.
-        """
-        if self._compiled_attn_proj is not None:
-            return
-        self._compiled_attn_proj = mx.compile(self._raw_attn_proj)
-        self._compiled_attn_post = mx.compile(self._raw_attn_post)
-
-    def _raw_attn_proj(
-        self, x: mx.array, offset: Any
-    ) -> Tuple[mx.array, mx.array, mx.array]:
-        """Pre-SDPA projection chain: q/kv lora + norms + RoPE.
-
-        Returns ``(q, q_residual, kv)``. ``q_residual`` is needed by
-        the Indexer in the un-compiled middle. ``kv`` here is
-        pre-cache-update; the caller still has to push it through
-        ``local_cache.update_and_fetch`` outside the compile boundary.
-
-        Pure function. No side-effects, no cache mutation.
-        """
-        B, L, _ = x.shape
-        q_lora, kv_pre = self._project_qa_kv(x)
-        q_residual = self.q_norm(q_lora)
-        q = _q_finalize(
-            self.wq_b(q_residual),
-            B, L, self.n_heads, self.head_dim,
-            self.config.rms_norm_eps,
-        )
-        q = self.rope(q, offset)
-        kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
-        return q, q_residual, kv
-
-    def _raw_attn_post(self, attn_out: mx.array, offset: Any) -> mx.array:
-        """Post-SDPA projection chain: RoPE inverse + o_pre_a + wo_a +
-        o_pre_b + wo_b. Pure function.
-        """
-        B, L = attn_out.shape[0], attn_out.shape[2]
-        out = self.rope(attn_out, offset, inverse=True)
-        out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-        out = self.wo_a(out)
-        out = _o_pre_b(out)
-        out = self.wo_b(out)
-        return out
 
     def __call__(
         self,
@@ -1438,12 +1371,17 @@ class SparseCompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            # Pre-SDPA chain (compiled when install_compiled_attn() ran).
-            if self._compiled_attn_proj is not None:
-                q, q_residual, kv = self._compiled_attn_proj(x, offset)
-            else:
-                q, q_residual, kv = self._raw_attn_proj(x, offset)
+            q_lora, kv_pre = self._project_qa_kv(x)
+            q_residual = self.q_norm(q_lora)
+            q = _q_finalize(
+                self.wq_b(q_residual),
+                B, L, self.n_heads, self.head_dim,
+                self.config.rms_norm_eps,
+            )
+            q = self.rope(q, offset)
 
+            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+            kv = self.rope(kv, offset)
             if local_cache is not None:
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
@@ -1504,11 +1442,12 @@ class SparseCompressedAttention(nn.Module):
                     )
                 out = finalize(out)
 
-            # Post-SDPA chain (compiled when install_compiled_attn() ran).
-            if self._compiled_attn_post is not None:
-                out = self._compiled_attn_post(out, offset)
-            else:
-                out = self._raw_attn_post(out, offset)
+            out = self.rope(out, offset, inverse=True)
+
+            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+            out = self.wo_a(out)
+            out = _o_pre_b(out)
+            out = self.wo_b(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
