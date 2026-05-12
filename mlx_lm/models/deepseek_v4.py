@@ -967,14 +967,12 @@ def _indexer_score(
 
     Runs every decode step on every indexer-equipped layer (~21 layers).
     """
-    # Preserves original matmul/reduction shape; only difference vs the
-    # f4dd9e7-pre version is no .astype(mx.float32). bf16 matmul still
-    # accumulates in fp32 internally.
-    pf = pooled[:, None]
-    scores = q @ pf.swapaxes(-1, -2)
+    # score[b, h, q, p] = q[b,h,q,d] . pooled[b,p,d]
+    scores = mx.einsum("bhqd,bpd->bhqp", q, pooled)
     scores = mx.maximum(scores, 0) * scale
     w = weights_x * n_heads_inv_sqrt
-    return (scores * w.swapaxes(-1, -2)[..., None]).sum(axis=1)
+    # collapse heads: out[b, q, p] = sum_h scores[b,h,q,p] * w[b,q,h]
+    return mx.einsum("bhqp,bqh->bqp", scores, w)
 
 
 class Indexer(nn.Module):
