@@ -956,10 +956,13 @@ class Compressor(nn.Module):
             gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
             new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
             new_pooled = self.norm(new_pooled)
-            new_pooled = self.rope(
-                new_pooled[:, None],
-                offset=pool_base,
-            ).squeeze(1)
+            # Phase I.b (2026-05-12): rope expects (..., L, D); the leading
+            # axes can be any rank. The original code did
+            # ``self.rope(new_pooled[:, None], offset=...).squeeze(1)``
+            # which inserts then removes a unit axis. mx.fast.rope works
+            # on (B, L, D) directly, so we can drop the unsqueeze/squeeze
+            # pair and save two array ops per call.
+            new_pooled = self.rope(new_pooled, offset=pool_base)
 
         if pool_cache is not None:
             new_pooled = pool_cache.update_and_fetch(new_pooled)
