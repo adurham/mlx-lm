@@ -494,6 +494,51 @@ def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
     return weights_a, weights_b
 
 
+@partial(mx.compile, shapeless=True)
+def _sparse_pooled_attention_inner(
+    q_scaled: mx.array,
+    local_kv: mx.array,
+    pooled_gathered: mx.array,
+    local_mask: Optional[mx.array],
+    pooled_mask: Optional[mx.array],
+    sinks_expanded: Optional[mx.array],
+) -> mx.array:
+    """Inner kernel of _sparse_pooled_attention with all-static shapes.
+
+    All shape variation (pooled.shape[1] grows with decode position) is
+    handled by the outer wrapper's take_along_axis. Inside this function:
+      - q_scaled: (B, H, L_q, D) — H, L_q, D fixed per workload
+      - local_kv: (B, 1, sliding_window, D) — sliding_window fixed
+      - pooled_gathered: (B, 1, L_q, k, D) — k=index_topk fixed
+      - masks: shapes derived from above, all fixed
+
+    Microbench (sparse_pooled_attn_microbench.py) shows ~13% speedup over
+    the un-compiled chain by collapsing ~15 separate op constructions
+    into one compile-cache lookup per cycle.
+    """
+    local_scores = q_scaled @ local_kv.swapaxes(-1, -2)
+    local_scores = _apply_score_mask(local_scores, local_mask)
+    normalizer = mx.logsumexp(local_scores, -1, keepdims=True)
+
+    pooled_sq = pooled_gathered.squeeze(1)
+    q_bl = q_scaled.transpose(0, 2, 1, 3)
+    pooled_scores = q_bl @ pooled_sq.swapaxes(-1, -2)
+    pooled_scores = pooled_scores.transpose(0, 2, 1, 3)
+    pooled_scores = _apply_score_mask(pooled_scores, pooled_mask)
+    normalizer = mx.logaddexp(
+        normalizer, mx.logsumexp(pooled_scores, -1, keepdims=True)
+    )
+
+    local_weights, pooled_weights = _split_softmax(
+        normalizer, local_scores, pooled_scores, sinks_expanded,
+    )
+
+    out = local_weights @ local_kv
+    pw_bl = pooled_weights.transpose(0, 2, 1, 3)
+    out = out + (pw_bl @ pooled_sq).transpose(0, 2, 1, 3)
+    return out.astype(q_scaled.dtype)
+
+
 def _sparse_pooled_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -504,39 +549,29 @@ def _sparse_pooled_attention(
     scale: float,
     sinks: Optional[mx.array],
 ) -> mx.array:
+    """Sparse-pooled attention dispatch.
+
+    Pulls take_along_axis (the only op with dynamic shape via pooled.shape[1])
+    OUT of the @mx.compile boundary, then calls the static-shape inner
+    kernel. This avoids the shapeless broadcast bug that bit the May 9
+    attempt at compiling the whole function (97f87c0 → 6c4112a/25a47a1b).
+    """
     B, H, L, D = q.shape
     idx = topk[:, None, :, :, None]
-    pooled = mx.take_along_axis(
+    pooled_gathered = mx.take_along_axis(
         mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
         mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
         axis=3,
     )
-
-    q_scaled = q * scale
-    local_scores = q_scaled @ local_kv.swapaxes(-1, -2)
-    local_scores = _apply_score_mask(local_scores, local_mask)
-    normalizer = mx.logsumexp(local_scores, -1, keepdims=True)
-
-    pooled_sq = pooled.squeeze(1)
-    q_bl = q_scaled.transpose(0, 2, 1, 3)
-    pooled_scores = q_bl @ pooled_sq.swapaxes(-1, -2)
-    pooled_scores = pooled_scores.transpose(0, 2, 1, 3)
-    pooled_scores = _apply_score_mask(pooled_scores, pooled_mask)
-    normalizer = mx.logaddexp(
-        normalizer, mx.logsumexp(pooled_scores, -1, keepdims=True)
+    sinks_expanded = sinks[None, :, None, None] if sinks is not None else None
+    return _sparse_pooled_attention_inner(
+        q * scale,
+        local_kv,
+        pooled_gathered,
+        local_mask,
+        pooled_mask,
+        sinks_expanded,
     )
-
-    local_weights, pooled_weights = _split_softmax(
-        normalizer,
-        local_scores,
-        pooled_scores,
-        sinks[None, :, None, None] if sinks is not None else None,
-    )
-
-    out = local_weights @ local_kv
-    pw_bl = pooled_weights.transpose(0, 2, 1, 3)
-    out = out + (pw_bl @ pooled_sq).transpose(0, 2, 1, 3)
-    return out.astype(q.dtype)
 
 
 class MoEGate(nn.Module):
