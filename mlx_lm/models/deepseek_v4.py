@@ -684,19 +684,40 @@ def _sparse_pooled_attention(
         # Concat along seq axis: local_kv (B, 1, sw, D) + pooled_kv (B, 1, k, D)
         combined_kv = mx.concatenate([local_kv, pooled_kv], axis=2)
 
-        # Merge masks if either is present. local_mask is for the sw region,
-        # pooled_mask for the k region. Both shapes broadcast to
-        # (B, H, L=1, *) at this layer; concat along last axis.
+        # Merge masks if either is present. local_mask comes from the
+        # global attention mask (B, 1, L, sw)-ish — broadcast across H.
+        # pooled_mask is per-head (B, H, L, k). Both need to be expanded
+        # to (B, H, L, *) before concat. Also handle additive (fp) vs
+        # boolean masks — fast.sdpa accepts either as long as types match.
         combined_mask: Optional[mx.array] = None
         if local_mask is not None or pooled_mask is not None:
             sw = local_kv.shape[2]
             k = pooled_kv.shape[2]
-            lm = local_mask if local_mask is not None else mx.zeros(
-                (B, H, L, sw), dtype=q.dtype
+            target_dtype = (
+                local_mask.dtype if local_mask is not None else pooled_mask.dtype
             )
-            pm = pooled_mask if pooled_mask is not None else mx.zeros(
-                (B, H, L, k), dtype=q.dtype
-            )
+            target_is_bool = target_dtype == mx.bool_
+
+            def _full(shape):
+                if target_is_bool:
+                    return mx.ones(shape, dtype=mx.bool_)
+                return mx.zeros(shape, dtype=target_dtype)
+
+            lm = local_mask if local_mask is not None else _full((B, H, L, sw))
+            pm = pooled_mask if pooled_mask is not None else _full((B, H, L, k))
+            # Broadcast head axis if needed
+            if lm.shape[1] == 1 and H > 1:
+                lm = mx.broadcast_to(lm, (B, H, L, sw))
+            if pm.shape[1] == 1 and H > 1:
+                pm = mx.broadcast_to(pm, (B, H, L, k))
+            # Coerce dtypes to match for concat
+            if lm.dtype != pm.dtype:
+                if target_is_bool:
+                    lm = lm.astype(mx.bool_)
+                    pm = pm.astype(mx.bool_)
+                else:
+                    lm = lm.astype(target_dtype)
+                    pm = pm.astype(target_dtype)
             combined_mask = mx.concatenate([lm, pm], axis=-1)
 
         return mx.fast.scaled_dot_product_attention(
