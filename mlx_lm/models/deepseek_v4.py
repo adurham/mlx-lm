@@ -53,6 +53,46 @@ _BUILD_PROBE_ACC: Dict[str, float] = {
 #
 # Each tracked op also gets a call-count so we can compute mean-per-call.
 _OP_PROBE_ENABLED = bool(os.environ.get("MLX_OP_PROBE"))
+
+# 2026-05-13 NOP-probe diagnostic. File-based switch (changed between bench
+# runs without restarting the cluster). Reads /tmp/dsv4_nop_targets; cached
+# for 1 sec to avoid file IO per layer call. Targets are comma-separated:
+#   "indexer"         -> Indexer.__call__ returns zeros (shape (B, L, k))
+#   "sparse_attn"     -> SparseCompressedAttention attention output = zeros
+#   "compressed_attn" -> CompressedAttention attention output = zeros
+#   "moe"             -> DeepseekV4MoE.__call__ returns zeros (shape (B, L, hidden))
+#   "all_sum"         -> mx.distributed.all_sum becomes identity (skip reduce)
+# Output is GARBAGE — bench tok/s only. Quality intentionally broken.
+import time as _nop_time
+_NOP_FILE = "/tmp/dsv4_nop_targets"
+_nop_cache = [0.0, set()]
+
+
+def _get_nop_targets():
+    now = _nop_time.time()
+    if now - _nop_cache[0] < 1.0:
+        return _nop_cache[1]
+    targets = set()
+    try:
+        with open(_NOP_FILE) as f:
+            targets = {s.strip() for s in f.read().split(",") if s.strip()}
+    except Exception:
+        pass
+    _nop_cache[0] = now
+    _nop_cache[1] = targets
+    return targets
+
+
+# Monkey-patch mx.distributed.all_sum to honor the NOP flag.
+# Idempotent: guarded by _all_sum_nop_wrapped attribute.
+_orig_all_sum = mx.distributed.all_sum
+if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
+    def _all_sum_nop_aware(x, *args, **kwargs):
+        if "all_sum" in _get_nop_targets():
+            return x  # NOP: pass through, skip cross-rank reduce
+        return _orig_all_sum(x, *args, **kwargs)
+    _all_sum_nop_aware._all_sum_nop_wrapped = True
+    mx.distributed.all_sum = _all_sum_nop_aware
 _OP_PROBE_ACC: Dict[str, float] = {}
 _OP_PROBE_COUNT: Dict[str, int] = {}
 
@@ -960,6 +1000,8 @@ class DeepseekV4MoE(nn.Module):
         return y
 
     def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
+        if "moe" in _get_nop_targets():
+            return mx.zeros(x.shape, dtype=x.dtype)
         # Fast path: pre-compiled local trace + Python-level allreduce
         # with the fence eval. Mirrors the span-path semantics.
         if self._compiled_forward is not None:
@@ -1472,17 +1514,20 @@ class CompressedAttention(nn.Module):
             mask = _extend_mask(mask, pooled_mask, kv.shape[2])
 
             with span("attn.sdpa"):
-                out = finalize(
-                    scaled_dot_product_attention(
-                        q,
-                        kv,
-                        kv,
-                        cache=local_cache,
-                        scale=self.scale,
-                        mask=mask,
-                        sinks=self.attn_sink.astype(q.dtype),
+                if "compressed_attn" in _get_nop_targets():
+                    out = mx.zeros(q.shape, dtype=q.dtype)
+                else:
+                    out = finalize(
+                        scaled_dot_product_attention(
+                            q,
+                            kv,
+                            kv,
+                            cache=local_cache,
+                            scale=self.scale,
+                            mask=mask,
+                            sinks=self.attn_sink.astype(q.dtype),
+                        )
                     )
-                )
             out = self.rope(out, offset, inverse=True)
 
             out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
