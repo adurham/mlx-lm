@@ -652,8 +652,63 @@ def _sparse_pooled_attention(
     OUT of the @mx.compile boundary, then calls the static-shape inner
     kernel. This avoids the shapeless broadcast bug that bit the May 9
     attempt at compiling the whole function (97f87c0 → 6c4112a/25a47a1b).
+
+    L_q=1 fast path (May 13 2026): when there's exactly one query position
+    (canonical MTP-off decode), concatenate local + per-query-pooled K/V
+    into one tensor and dispatch through ``mx.fast.scaled_dot_product_attention``
+    instead of the hand-rolled split-softmax in the inner kernel. Apple's
+    optimized SDPA Metal kernel fuses score-matmul + softmax + value-matmul,
+    and using fp32 internally for the accumulation makes the bf16 output
+    numerically CLOSER to fp32 reference than the manual code (microbench
+    bench/sparse_pooled_refactor_microbench.py: max abs diff vs fp32 ref
+    drops from 0.012 (current) to 0.004 (proposed), and wall drops 1.24x).
+
+    The fast path is gated on L_q==1 because at L_q>1 each query position
+    has its OWN gathered pooled K/V (different topk per row), which the
+    single-SDPA approach can't express without expensive broadcasting.
+    MTP-on (L_q=γ+1>=2) falls through to the inner kernel as before.
     """
     B, H, L, D = q.shape
+
+    # L_q=1 fast path: concat-and-fused-sdpa
+    if L == 1:
+        # pooled_gathered shape: (B, 1, 1, k, D) — squeeze the L axis at axis=2
+        idx = topk[:, None, :, :, None]  # (B, 1, L=1, k, 1)
+        pooled_gathered = mx.take_along_axis(
+            mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
+            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
+            axis=3,
+        )
+        # (B, 1, 1, k, D) -> (B, 1, k, D)
+        pooled_kv = pooled_gathered.squeeze(2)
+        # Concat along seq axis: local_kv (B, 1, sw, D) + pooled_kv (B, 1, k, D)
+        combined_kv = mx.concatenate([local_kv, pooled_kv], axis=2)
+
+        # Merge masks if either is present. local_mask is for the sw region,
+        # pooled_mask for the k region. Both shapes broadcast to
+        # (B, H, L=1, *) at this layer; concat along last axis.
+        combined_mask: Optional[mx.array] = None
+        if local_mask is not None or pooled_mask is not None:
+            sw = local_kv.shape[2]
+            k = pooled_kv.shape[2]
+            lm = local_mask if local_mask is not None else mx.zeros(
+                (B, H, L, sw), dtype=q.dtype
+            )
+            pm = pooled_mask if pooled_mask is not None else mx.zeros(
+                (B, H, L, k), dtype=q.dtype
+            )
+            combined_mask = mx.concatenate([lm, pm], axis=-1)
+
+        return mx.fast.scaled_dot_product_attention(
+            q,
+            combined_kv,
+            combined_kv,
+            scale=scale,
+            mask=combined_mask,
+            sinks=sinks,
+        )
+
+    # L_q>1 fallback (e.g. MTP-on verify pass): use inner kernel as before
     idx = topk[:, None, :, :, None]
     pooled_gathered = mx.take_along_axis(
         mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
