@@ -93,6 +93,55 @@ if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
         return _orig_all_sum(x, *args, **kwargs)
     _all_sum_nop_aware._all_sum_nop_wrapped = True
     mx.distributed.all_sum = _all_sum_nop_aware
+
+
+# ROUTE_HIST: per-(layer, expert) routing histogram probe.
+_ROUTE_HIST_DIR = "/tmp/dsv4_route_hist"
+_route_hist_counts: dict = {}
+_route_hist_n_calls: dict = {}
+
+def _route_hist_record(layer_idx: int, inds) -> None:
+    import os as _osh, numpy as _np
+    try:
+        _osh.makedirs(_ROUTE_HIST_DIR, exist_ok=True)
+    except Exception:
+        return
+    try:
+        idx_np = _np.asarray(inds, dtype=_np.int64).ravel()
+    except Exception:
+        try:
+            idx_np = _np.asarray(inds.tolist(), dtype=_np.int64).ravel()
+        except Exception:
+            return
+    if layer_idx not in _route_hist_counts:
+        _route_hist_counts[layer_idx] = _np.zeros(256, dtype=_np.int64)
+        _route_hist_n_calls[layer_idx] = 0
+    counts = _route_hist_counts[layer_idx]
+    mask = (idx_np >= 0) * (idx_np < counts.shape[0])
+    idx_np = idx_np[mask.astype(bool)]
+    bc = _np.bincount(idx_np, minlength=counts.shape[0])[: counts.shape[0]]
+    counts += bc
+    _route_hist_n_calls[layer_idx] += 1
+    if (_route_hist_n_calls[layer_idx] % 64) == 0:
+        _route_hist_flush(layer_idx)
+
+def _route_hist_flush(layer_idx: int) -> None:
+    import os as _osh, numpy as _np
+    try:
+        counts = _route_hist_counts[layer_idx]
+        pid = _osh.getpid()
+        out = f"{_ROUTE_HIST_DIR}/L{layer_idx:02d}_pid{pid}.npy"
+        _np.save(out, counts)
+    except Exception:
+        pass
+
+def _route_hist_flush_all() -> None:
+    for li in list(_route_hist_counts.keys()):
+        _route_hist_flush(li)
+
+import atexit as _atexit
+_atexit.register(_route_hist_flush_all)
+
 _OP_PROBE_ACC: Dict[str, float] = {}
 _OP_PROBE_COUNT: Dict[str, int] = {}
 
@@ -1002,6 +1051,14 @@ class DeepseekV4MoE(nn.Module):
     def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
         if "moe" in _get_nop_targets():
             return mx.zeros(x.shape, dtype=x.dtype)
+        # ROUTE_HIST probe: EXO_DSV4_ROUTE_HIST=1 records expert routing.
+        import os as _ros
+        if _ros.environ.get("EXO_DSV4_ROUTE_HIST", "0") == "1":
+            try:
+                _ri, _ = self.gate(x, input_ids)
+                _route_hist_record(self.layer_idx, _ri)
+            except Exception:
+                pass
         # Fast path: pre-compiled local trace + Python-level allreduce
         # with the fence eval. Mirrors the span-path semantics.
         if self._compiled_forward is not None:
