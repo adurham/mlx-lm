@@ -1802,6 +1802,8 @@ class DeepseekV4Block(nn.Module):
         cache: Optional[Any],
         input_ids: mx.array,
     ) -> mx.array:
+        if "v4block" in _get_nop_targets():
+            return h  # NOP: pass residual through unchanged
         # Fast path — pre-traced compile graphs skip the per-step
         # Python lazy-graph build for the layer's pure chunks. The
         # FFN goes through ``self.ffn`` (MoE.__call__) so its post-allreduce
