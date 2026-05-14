@@ -1052,11 +1052,19 @@ class DeepseekV4MoE(nn.Module):
         if "moe" in _get_nop_targets():
             return mx.zeros(x.shape, dtype=x.dtype)
         # ROUTE_HIST probe: EXO_DSV4_ROUTE_HIST=1 records expert routing.
+        # EXO_DSV4_ROUTE_HIST_DECODE_ONLY=1 records only L==1 calls (decode path).
+        # Prefill calls have L > 1; decode calls have L == 1 (or sometimes L == γ+1 for MTP).
         import os as _ros
         if _ros.environ.get("EXO_DSV4_ROUTE_HIST", "0") == "1":
             try:
-                _ri, _ = self.gate(x, input_ids)
-                _route_hist_record(self.layer_idx, _ri)
+                _decode_only = _ros.environ.get("EXO_DSV4_ROUTE_HIST_DECODE_ONLY", "0") == "1"
+                _record = True
+                if _decode_only:
+                    # x shape is (B, L, D). Decode = L == 1.
+                    _record = (x.ndim >= 2 and x.shape[-2] == 1)
+                if _record:
+                    _ri, _ = self.gate(x, input_ids)
+                    _route_hist_record(self.layer_idx, _ri)
             except Exception:
                 pass
         # Fast path: pre-compiled local trace + Python-level allreduce
