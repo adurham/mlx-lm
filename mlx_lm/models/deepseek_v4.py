@@ -1633,17 +1633,16 @@ class SparseCompressedAttention(nn.Module):
             pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
             with span("attn.indexer"):
                 if "indexer" in _get_nop_targets():
-                    # Return a deterministic, valid set of indices so downstream sparse_sdpa
-                    # doesn't OOB. Just take the first index_topk positions.
+                    # Indexer returns argsort(-scores)[..., :k] over scores shaped
+                    # (B, L, P) so output is (B, L, k). Return deterministic
+                    # in-range indices [0, k) so downstream sparse_sdpa doesn't OOB.
                     _topk = self.indexer.index_topk
                     _pool_len = pooled.shape[1] if pooled.shape[1] > 0 else _topk
                     _take = min(_topk, _pool_len)
-                    # Shape: indexer returns (B, n_heads, L, index_topk). Use the same.
                     _B, _, _L, _ = q.shape
-                    _n_heads = self.indexer.n_heads
                     topk = mx.broadcast_to(
-                        mx.arange(_take, dtype=mx.int32)[None, None, None, :],
-                        (_B, _n_heads, _L, _take),
+                        mx.arange(_take, dtype=mx.int32)[None, None, :],
+                        (_B, _L, _take),
                     )
                 else:
                     topk = finalize(
