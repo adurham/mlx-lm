@@ -1744,7 +1744,31 @@ class SparseCompressedAttention(nn.Module):
 
                 # Sparse compressed attention
                 else:
-                    if "sparse_attn" in _get_nop_targets():
+                    # Per-layer NOP: targets file or env can specify which sparse layers to NOP.
+                    # File: any token "sparse_layers:2,4,6" in /tmp/dsv4_nop_targets (1-sec TTL).
+                    # Env:  EXO_DSV4_NOP_SPARSE_LAYERS="2,4,6"
+                    # Falls back to the global "sparse_attn" NOP target.
+                    _targets = _get_nop_targets()
+                    _layer_nop = False
+                    for _t in _targets:
+                        if _t.startswith("sparse_layers:"):
+                            try:
+                                _ids = set(int(x) for x in _t[len("sparse_layers:"):].split(",") if x.strip())
+                                if self.layer_idx in _ids:
+                                    _layer_nop = True
+                                    break
+                            except Exception:
+                                pass
+                    if not _layer_nop:
+                        import os as _ronl
+                        _env = _ronl.environ.get("EXO_DSV4_NOP_SPARSE_LAYERS", "")
+                        if _env:
+                            try:
+                                _ids = set(int(x) for x in _env.split(",") if x.strip())
+                                _layer_nop = self.layer_idx in _ids
+                            except Exception:
+                                pass
+                    if _layer_nop or "sparse_attn" in _targets:
                         # Skip the expensive sparse SDPA — just return zeros of q shape.
                         out = mx.zeros(q.shape, dtype=q.dtype)
                     else:
