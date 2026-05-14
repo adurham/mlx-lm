@@ -1632,9 +1632,23 @@ class SparseCompressedAttention(nn.Module):
                 pooled = finalize(self.compressor(x, comp_cache, offset))
             pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
             with span("attn.indexer"):
-                topk = finalize(
-                    self.indexer(x, q_residual, self.rope, idx_cache, offset)
-                )
+                if "indexer" in _get_nop_targets():
+                    # Return a deterministic, valid set of indices so downstream sparse_sdpa
+                    # doesn't OOB. Just take the first index_topk positions.
+                    _topk = self.indexer.index_topk
+                    _pool_len = pooled.shape[1] if pooled.shape[1] > 0 else _topk
+                    _take = min(_topk, _pool_len)
+                    # Shape: indexer returns (B, n_heads, L, index_topk). Use the same.
+                    _B, _, _L, _ = q.shape
+                    _n_heads = self.indexer.n_heads
+                    topk = mx.broadcast_to(
+                        mx.arange(_take, dtype=mx.int32)[None, None, None, :],
+                        (_B, _n_heads, _L, _take),
+                    )
+                else:
+                    topk = finalize(
+                        self.indexer(x, q_residual, self.rope, idx_cache, offset)
+                    )
             sinks = self.attn_sink.astype(q.dtype)
 
             with span("attn.sdpa"):
@@ -1666,23 +1680,27 @@ class SparseCompressedAttention(nn.Module):
 
                 # Sparse compressed attention
                 else:
-                    sparse_mask = None
-                    if pmask is not None:
-                        sparse_mask = mx.take_along_axis(
-                            pmask[None] if pmask.ndim == 2 else pmask,
+                    if "sparse_attn" in _get_nop_targets():
+                        # Skip the expensive sparse SDPA — just return zeros of q shape.
+                        out = mx.zeros(q.shape, dtype=q.dtype)
+                    else:
+                        sparse_mask = None
+                        if pmask is not None:
+                            sparse_mask = mx.take_along_axis(
+                                pmask[None] if pmask.ndim == 2 else pmask,
+                                topk,
+                                axis=2,
+                            )[:, None]
+                        out = _sparse_pooled_attention(
+                            q,
+                            kv,
+                            pooled,
                             topk,
-                            axis=2,
-                        )[:, None]
-                    out = _sparse_pooled_attention(
-                        q,
-                        kv,
-                        pooled,
-                        topk,
-                        mask,
-                        sparse_mask,
-                        self.scale,
-                        sinks,
-                    )
+                            mask,
+                            sparse_mask,
+                            self.scale,
+                            sinks,
+                        )
                 out = finalize(out)
 
             out = self.rope(out, offset, inverse=True)
