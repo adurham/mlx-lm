@@ -2130,6 +2130,10 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
+        if "model_call" in _get_nop_targets():
+            B = inputs.shape[0]
+            L = inputs.shape[1] if inputs.ndim > 1 else 1
+            return mx.zeros((B, L, self.args.vocab_size), dtype=mx.bfloat16)
         h = self.model(inputs, cache)
         with span("model.lm_head"):
             if "lm_head" in _get_nop_targets():
