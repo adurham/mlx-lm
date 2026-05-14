@@ -2049,14 +2049,20 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             _bp_t_post_mask = _BUILD_PROBE_PERF()
             _BUILD_PROBE_ACC["attn_mask"] += (_bp_t_post_mask - _bp_t_post_embed)
 
-        if pipeline_rank < pipeline_size - 1:
+        # NOP TARGET "pipeline": skip all pipeline collectives (recv/send/all_gather).
+        # Only valid for diagnostics — output text is meaningless because each rank
+        # only sees its own layers' contribution. Used to quantify how much per-token
+        # wall is RDMA pipeline sync vs actual compute.
+        _nop_pipeline = "pipeline" in _get_nop_targets()
+
+        if not _nop_pipeline and pipeline_rank < pipeline_size - 1:
             with span("model.recv"):
                 h = finalize(mx.distributed.recv_like(h, (pipeline_rank + 1)))
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
 
-        if pipeline_rank != 0:
+        if not _nop_pipeline and pipeline_rank != 0:
             with span("model.send"):
                 h = finalize(mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size))
                 cache_item = cache[-1]
@@ -2065,7 +2071,7 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 if cache_item is not None:
                     cache_item.keys = mx.depends(cache_item.keys, h)
 
-        if pipeline_size > 1:
+        if not _nop_pipeline and pipeline_size > 1:
             with span("model.all_gather"):
                 h = finalize(mx.distributed.all_gather(h)[: h.shape[0]])
 
