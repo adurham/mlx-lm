@@ -2132,6 +2132,13 @@ class Model(nn.Module):
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
         h = self.model(inputs, cache)
         with span("model.lm_head"):
+            if "lm_head" in _get_nop_targets():
+                # Return zeros of the expected output shape (B, L, vocab_size).
+                # The shape needs to match what the BatchGenerator expects so
+                # logsumexp / argmax don't blow up. Output text will be garbage.
+                B = h.shape[0]
+                L = h.shape[1]
+                return finalize(mx.zeros((B, L, self.args.vocab_size), dtype=mx.bfloat16))
             return finalize(self.lm_head(h))
 
     @property
