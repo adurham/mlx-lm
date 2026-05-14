@@ -2131,9 +2131,27 @@ class Model(nn.Module):
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
         if "model_call" in _get_nop_targets():
+            import time as _t
+            _t0 = _t.perf_counter()
             B = inputs.shape[0]
             L = inputs.shape[1] if inputs.ndim > 1 else 1
-            return mx.zeros((B, L, self.args.vocab_size), dtype=mx.bfloat16)
+            _t1 = _t.perf_counter()
+            out = mx.zeros((B, L, self.args.vocab_size), dtype=mx.bfloat16)
+            _t2 = _t.perf_counter()
+            # Force the same materialization the BatchGenerator would do
+            # NOTE: do NOT mx.eval here; that would change wall behavior
+            _t3 = _t.perf_counter()
+            self._mc_count = getattr(self, "_mc_count", 0) + 1
+            if self._mc_count % 32 == 0:
+                import sys as _sys, os as _os
+                _sys.stderr.write(
+                    f"[MC_PROBE pid={_os.getpid()}] n={self._mc_count} "
+                    f"shape_us={(_t1-_t0)*1e6:.1f} "
+                    f"zeros_us={(_t2-_t1)*1e6:.1f} "
+                    f"post_us={(_t3-_t2)*1e6:.1f}\n"
+                )
+                _sys.stderr.flush()
+            return out
         h = self.model(inputs, cache)
         with span("model.lm_head"):
             if "lm_head" in _get_nop_targets():
