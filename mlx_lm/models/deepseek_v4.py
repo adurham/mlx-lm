@@ -1506,7 +1506,15 @@ class Indexer(nn.Module):
         # at B=1 L=1 P=25000 K=160: 60us/call -> 11us/call). Falls back
         # to argsort when fused path can't run (large k, or pmask gating
         # for L>1 which the fast-path kernel doesn't handle).
-        if (_topk_os.environ.get("EXO_DSV4_TOPK_FUSED", "0") == "1"
+        # File toggle: putting "topk_fused" in /tmp/dsv4_nop_targets enables
+        # the fused path live (without restart). "topk_off" disables.
+        _topk_targets = _get_nop_targets()
+        _topk_enabled = (
+            "topk_fused" in _topk_targets
+            or (_topk_os.environ.get("EXO_DSV4_TOPK_FUSED", "0") == "1"
+                and "topk_off" not in _topk_targets)
+        )
+        if (_topk_enabled
                 and scores.shape[1] == 1
                 and pmask is None
                 and k <= 1024):
