@@ -818,22 +818,89 @@ def _sparse_pooled_attention(
             sinks=sinks,
         )
 
-    # L_q>1 fallback (e.g. MTP-on verify pass): use inner kernel as before
+    # L_q>1 path (e.g. MTP-on verify pass, L_q=γ+1): fold L into the
+    # batch axis so we can dispatch the same fused mx.fast.scaled_dot_product_attention
+    # kernel as the L_q==1 fast path above. Each query position has its
+    # own gathered pooled K/V (different topk per row), but reshaping to
+    # (B*L, ...) makes each row an independent "single-query" attention
+    # call from SDPA's perspective. local_kv is shared across L so we
+    # broadcast it explicitly.
+    #
+    # 2026-05-18 lever: replaces the hand-rolled split-softmax inner
+    # kernel which manually computes local_scores, pooled_scores,
+    # logaddexp normalizer, _split_softmax, and two separate matmuls
+    # (10+ ops). Apple's fused SDPA does the whole thing as one Metal
+    # kernel with fp32 internal accumulation — same numerics-or-better
+    # vs the split path (the L=1 path's microbench shows max abs diff
+    # vs fp32 ref drops from 0.012 to 0.004), 1.24x wall on L=1, larger
+    # gain at L>1 because the slow path's per-op overhead doesn't
+    # amortize over L. Estimated 3-4 ms saved per verify cycle.
     idx = topk[:, None, :, :, None]
     pooled_gathered = mx.take_along_axis(
         mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
         mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
         axis=3,
-    )
-    sinks_expanded = sinks[None, :, None, None] if sinks is not None else None
-    return _sparse_pooled_attention_inner(
-        q * scale,
-        local_kv,
-        pooled_gathered,
-        local_mask,
-        pooled_mask,
-        sinks_expanded,
-    )
+    )  # (B, 1, L, k, D)
+    k = pooled_gathered.shape[3]
+    sw = local_kv.shape[2]
+
+    # Fold L into batch.
+    # q: (B, H, L, D) -> (B*L, H, 1, D)
+    q_bl = q.transpose(0, 2, 1, 3).reshape(B * L, H, 1, D)
+    # pooled_gathered: (B, 1, L, k, D) -> (B*L, 1, k, D)
+    pool_bl = pooled_gathered.transpose(0, 2, 1, 3, 4).reshape(B * L, 1, k, D)
+    # local_kv: (B, 1, sw, D), shared across L -> broadcast to (B, 1, L, sw, D) -> (B*L, 1, sw, D)
+    local_bl = mx.broadcast_to(
+        local_kv[:, :, None, :, :], (B, 1, L, sw, D)
+    ).reshape(B * L, 1, sw, D)
+    combined_kv = mx.concatenate([local_bl, pool_bl], axis=2)  # (B*L, 1, sw+k, D)
+
+    # Merge + reshape masks.
+    combined_mask: Optional[mx.array] = None
+    if local_mask is not None or pooled_mask is not None:
+        target_dtype = (
+            local_mask.dtype if local_mask is not None else pooled_mask.dtype
+        )
+        target_is_bool = target_dtype == mx.bool_
+
+        def _full(shape):
+            if target_is_bool:
+                return mx.ones(shape, dtype=mx.bool_)
+            return mx.zeros(shape, dtype=target_dtype)
+
+        lm = local_mask if local_mask is not None else _full((B, H, L, sw))
+        pm = pooled_mask if pooled_mask is not None else _full((B, H, L, k))
+        # Broadcast head axis if needed
+        if lm.shape[1] == 1 and H > 1:
+            lm = mx.broadcast_to(lm, (B, H, L, sw))
+        if pm.shape[1] == 1 and H > 1:
+            pm = mx.broadcast_to(pm, (B, H, L, k))
+        # Coerce dtypes to match for concat
+        if lm.dtype != pm.dtype:
+            if target_is_bool:
+                lm = lm.astype(mx.bool_)
+                pm = pm.astype(mx.bool_)
+            else:
+                lm = lm.astype(target_dtype)
+                pm = pm.astype(target_dtype)
+        # Concat over key axis: (B, H, L, sw+k)
+        combined_mask_blq = mx.concatenate([lm, pm], axis=-1)
+        # Fold L into batch: (B, H, L, sw+k) -> (B*L, H, 1, sw+k)
+        combined_mask = combined_mask_blq.transpose(0, 2, 1, 3).reshape(
+            B * L, H, 1, sw + k
+        )
+
+    # Apply scale via the SDPA kernel directly.
+    out_bl = mx.fast.scaled_dot_product_attention(
+        q_bl,
+        combined_kv,
+        combined_kv,
+        scale=scale,
+        mask=combined_mask,
+        sinks=sinks,
+    )  # (B*L, H, 1, D)
+    # Unfold back: (B*L, H, 1, D) -> (B, L, H, D) -> (B, H, L, D)
+    return out_bl.reshape(B, L, H, D).transpose(0, 2, 1, 3)
 
 
 class MoEGate(nn.Module):
