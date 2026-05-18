@@ -1971,6 +1971,23 @@ def v4_attention_factory(config: ModelArgs, layer_idx: int) -> nn.Module:
     return SparseCompressedAttention(config, layer_idx)
 
 
+def _hc_expand_inline(x, residual, post, comb):
+    """Body of hyper_connection._hc_expand_op inlined.
+
+    Avoids the nested-compile pitfall (pitfall #16) when the caller is
+    itself wrapped in mx.compile — the original _hc_expand_op is
+    @mx.compile'd, and wrapping a compiled fn inside another compile
+    boundary is net-negative. Inlining keeps the body fused into the
+    caller's single compile trace.
+
+    Inputs: x (B, L, D), residual (B, L, H, D), post (B, L, H), comb (B, L, H, H).
+    Output: (B, L, H, D) in x.dtype.
+    """
+    y = post[..., None] * x[:, :, None, :].astype(mx.float32)
+    y = y + mx.matmul(comb.swapaxes(-1, -2), residual.astype(mx.float32))
+    return y.astype(x.dtype)
+
+
 class DeepseekV4Block(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
@@ -1981,8 +1998,11 @@ class DeepseekV4Block(nn.Module):
         self.attn_hc = HyperConnection(config)
         self.ffn_hc = HyperConnection(config)
         self._compiled_attn_pre: Optional[Any] = None
-        self._compiled_post_attn: Optional[Any] = None
-        self._compiled_ffn_pre: Optional[Any] = None
+        # Lever 2 (2026-05-18): _compiled_post_attn + _compiled_ffn_pre fused
+        # into _compiled_attn_to_ffn to eliminate one Python<->MLX boundary
+        # and one compile-cache lookup per layer (~150 layers/cycle at 86 attn
+        # + 86 ffn boundaries).
+        self._compiled_attn_to_ffn: Optional[Any] = None
         self._compiled_post_ffn: Optional[Any] = None
 
     def install_compiled_forward(self) -> None:
@@ -2011,10 +2031,9 @@ class DeepseekV4Block(nn.Module):
         """
         if self._compiled_attn_pre is not None:
             return
-        self._compiled_attn_pre = mx.compile(self._raw_attn_pre)
-        self._compiled_post_attn = mx.compile(self._raw_post_attn)
-        self._compiled_ffn_pre = mx.compile(self._raw_ffn_pre)
-        self._compiled_post_ffn = mx.compile(self._raw_post_ffn)
+        self._compiled_attn_pre    = mx.compile(self._raw_attn_pre)
+        self._compiled_attn_to_ffn = mx.compile(self._raw_attn_to_ffn)
+        self._compiled_post_ffn    = mx.compile(self._raw_post_ffn)
 
     def _raw_attn_pre(
         self, h: mx.array
@@ -2029,22 +2048,39 @@ class DeepseekV4Block(nn.Module):
         normed = self.attn_norm(x)
         return normed, h, post, comb
 
-    def _raw_post_attn(
+    def _raw_attn_to_ffn(
         self,
         attn_out: mx.array,
-        residual: mx.array,
-        post: mx.array,
-        comb: mx.array,
-    ) -> mx.array:
-        return hc_expand(attn_out, residual, post, comb)
-
-    def _raw_ffn_pre(
-        self, h: mx.array
+        residual_attn: mx.array,
+        post_attn: mx.array,
+        comb_attn: mx.array,
     ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
-        """HC + RMSNorm fused into one compiled trace, FFN side."""
-        x, post, comb = self.ffn_hc(h)
-        normed = self.ffn_norm(x)
-        return normed, h, post, comb
+        """Lever 2 (2026-05-18) fused post-attn + ffn-pre.
+
+        Replaces the original two compiled functions (_raw_post_attn +
+        _raw_ffn_pre) with a single compiled chain. Eliminates one Python
+        <->MLX boundary and one compile-cache lookup per layer.
+
+        Inlines _hc_expand_op (via _hc_expand_inline) to avoid the
+        nested-compile pitfall (pitfall #16): wrapping the @mx.compile'd
+        hc_expand inside another @mx.compile boundary is net-negative.
+
+        Inputs:
+          attn_out      — output of attention (B, L, D)
+          residual_attn — h before attn (B, L, H, D)
+          post_attn     — HC post coeffs for attn side (B, L, H)
+          comb_attn     — HC comb coeffs for attn side (B, L, H, H)
+
+        Returns:
+          normed_ffn    — RMSNorm(ffn_hc(h_after_attn).x) (B, L, D)
+          h_after_attn  — hc_expand result, residual for the FFN side (B, L, H, D)
+          post_ffn      — HC post coeffs for FFN side (B, L, H)
+          comb_ffn      — HC comb coeffs for FFN side (B, L, H, H)
+        """
+        h_after_attn = _hc_expand_inline(attn_out, residual_attn, post_attn, comb_attn)
+        x, post_ffn, comb_ffn = self.ffn_hc(h_after_attn)
+        normed_ffn = self.ffn_norm(x)
+        return normed_ffn, h_after_attn, post_ffn, comb_ffn
 
     def _raw_post_ffn(
         self,
@@ -2082,24 +2118,25 @@ class DeepseekV4Block(nn.Module):
             x = self.attn(normed, mask=mask, cache=cache)
             if _bp:
                 _bt2 = _BUILD_PROBE_PERF()
-            h = self._compiled_post_attn(x, residual, post, comb)
+            # Lever 2: post_attn + ffn_pre fused into one compiled call.
+            normed, residual, post, comb = self._compiled_attn_to_ffn(
+                x, residual, post, comb
+            )
             if _bp:
                 _bt3 = _BUILD_PROBE_PERF()
-            normed, residual, post, comb = self._compiled_ffn_pre(h)
-            if _bp:
-                _bt4 = _BUILD_PROBE_PERF()
             x = self.ffn(normed, input_ids)
             if _bp:
-                _bt5 = _BUILD_PROBE_PERF()
+                _bt4 = _BUILD_PROBE_PERF()
             out = self._compiled_post_ffn(x, residual, post, comb)
             if _bp:
-                _bt6 = _BUILD_PROBE_PERF()
+                _bt5 = _BUILD_PROBE_PERF()
                 _BUILD_PROBE_ACC["attn_pre"] += (_bt1 - _bt0)
                 _BUILD_PROBE_ACC["attn"] += (_bt2 - _bt1)
-                _BUILD_PROBE_ACC["post_attn"] += (_bt3 - _bt2)
-                _BUILD_PROBE_ACC["ffn_pre"] += (_bt4 - _bt3)
-                _BUILD_PROBE_ACC["ffn"] += (_bt5 - _bt4)
-                _BUILD_PROBE_ACC["post_ffn"] += (_bt6 - _bt5)
+                # post_attn + ffn_pre fused: report combined into "attn_to_ffn".
+                _BUILD_PROBE_ACC.setdefault("attn_to_ffn", 0.0)
+                _BUILD_PROBE_ACC["attn_to_ffn"] += (_bt3 - _bt2)
+                _BUILD_PROBE_ACC["ffn"] += (_bt4 - _bt3)
+                _BUILD_PROBE_ACC["post_ffn"] += (_bt5 - _bt4)
                 _BUILD_PROBE_ACC["layer_count"] += 1
             return out
 
