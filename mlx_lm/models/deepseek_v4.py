@@ -725,56 +725,6 @@ def _sparse_pooled_attention_inner(
     return out.astype(q_scaled.dtype)
 
 
-def _to_4d_mask_fold(
-    m: Optional[mx.array],
-    B: int,
-    H: int,
-    L: int,
-    K: int,
-) -> mx.array:
-    """Lift any incoming mask to canonical (B*L, H, 1, K) bool for the fused
-    SDPA L-into-batch path in `_sparse_pooled_attention`.
-
-    Handles all shapes empirically observed at the call site for L in
-    [2, MAX_LFAST] (verify pass at gamma=2 has L=3):
-      - None:           all-pass (ones)
-      - 2D (L, K):      causal mask from create_attention_mask
-      - 3D (B, L, K):   unusual but supported
-      - 4D (B, 1, L, K) or (1, 1, L, K) or (B, H, L, K)
-
-    All upstream masks are bool. Additive float masks are NOT handled here;
-    the inner kernel covers them via the L>MAX_LFAST fall-through.
-    """
-    if m is None:
-        return mx.ones((B * L, H, 1, K), dtype=mx.bool_)
-    if m.ndim == 2:
-        m = m[None, None, :, :]
-    elif m.ndim == 3:
-        m = m[:, None, :, :]
-    elif m.ndim != 4:
-        raise ValueError(
-            f"_to_4d_mask_fold: unexpected ndim={m.ndim} shape={m.shape}"
-        )
-    bcast = list(m.shape)
-    if bcast[0] == 1 and B > 1:
-        bcast[0] = B
-    if bcast[1] == 1 and H > 1:
-        bcast[1] = H
-    if tuple(bcast) != tuple(m.shape):
-        m = mx.broadcast_to(m, tuple(bcast))
-    if m.dtype != mx.bool_:
-        m = m.astype(mx.bool_)
-    return m.transpose(0, 2, 1, 3).reshape(B * L, H, 1, K)
-
-
-# Max L_q for which the fused-SDPA L-into-batch path is enabled. Verify pass
-# at gamma=2 is L_q=3; supports gamma<=7. Prefill (L>>1) falls through to the
-# inner kernel.
-_SPARSE_POOLED_MAX_LFAST = int(
-    os.environ.get("EXO_DSV4_SPARSE_LFAST_MAX", "8")
-)
-
-
 def _sparse_pooled_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -868,61 +818,7 @@ def _sparse_pooled_attention(
             sinks=sinks,
         )
 
-    # L_q>1 paths:
-    #
-    # (a) Small L (verify pass at gamma>=2): fold L into batch and dispatch
-    #     ONE mx.fast.scaled_dot_product_attention call. Each (b, l) row has
-    #     its own gathered pooled K/V; reshaping to (B*L, ...) makes each row
-    #     an independent single-query attention call. Replaces the 10+ op
-    #     chain in _sparse_pooled_attention_inner with one fused Metal kernel.
-    #
-    # (b) Large L (prefill): inner kernel as before. Avoids the 2D causal
-    #     mask shape complication and the local_kv broadcast memory blow-up
-    #     at prefill (B*L*sw*D copy, sw can be 4096+, L up to ~100K).
-    #
-    # The reverted commit 4aa77635 tried to fold L unconditionally and hit a
-    # 2D-vs-4D mask shape mismatch at prefill. This version gates on L <=
-    # _SPARSE_POOLED_MAX_LFAST so prefill always stays on the inner kernel.
-    if L <= _SPARSE_POOLED_MAX_LFAST:
-        idx = topk[:, None, :, :, None]
-        pooled_gathered = mx.take_along_axis(
-            mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
-            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
-            axis=3,
-        )  # (B, 1, L, k, D)
-        k = pooled_gathered.shape[3]
-        sw = local_kv.shape[2]
-
-        # Fold L into batch.
-        q_bl = q.transpose(0, 2, 1, 3).reshape(B * L, H, 1, D)
-        pool_bl = pooled_gathered.transpose(0, 2, 1, 3, 4).reshape(
-            B * L, 1, k, D
-        )
-        local_bl = mx.broadcast_to(
-            local_kv[:, :, None, :, :], (B, 1, L, sw, D)
-        ).reshape(B * L, 1, sw, D)
-        combined_kv = mx.concatenate(
-            [local_bl, pool_bl], axis=2
-        )  # (B*L, 1, sw+k, D)
-
-        if local_mask is None and pooled_mask is None:
-            combined_mask = None
-        else:
-            lm_fold = _to_4d_mask_fold(local_mask, B, H, L, sw)
-            pm_fold = _to_4d_mask_fold(pooled_mask, B, H, L, k)
-            combined_mask = mx.concatenate([lm_fold, pm_fold], axis=-1)
-
-        out_bl = mx.fast.scaled_dot_product_attention(
-            q_bl,
-            combined_kv,
-            combined_kv,
-            scale=scale,
-            mask=combined_mask,
-            sinks=sinks,
-        )
-        return out_bl.reshape(B, L, H, D).transpose(0, 2, 1, 3)
-
-    # L > _SPARSE_POOLED_MAX_LFAST (prefill): inner kernel.
+    # L_q>1 fallback (e.g. MTP-on verify pass): use inner kernel as before
     idx = topk[:, None, :, :, None]
     pooled_gathered = mx.take_along_axis(
         mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
