@@ -2487,16 +2487,7 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
-        # Unconditional ping for diagnosis — writes to /tmp/mc_ping.txt
-        # if "model_call" in NOP targets, regardless of cache.
-        import os as _os
-        _nt = _get_nop_targets()
-        try:
-            with open("/tmp/mc_ping.txt", "a") as _f:
-                _f.write(f"pid={_os.getpid()} targets={_nt}\n")
-        except Exception:
-            pass
-        if "model_call" in _nt:
+        if "model_call" in _get_nop_targets():
             B = inputs.shape[0]
             L = inputs.shape[1] if inputs.ndim > 1 else 1
             return mx.zeros((B, L, self.args.vocab_size), dtype=mx.bfloat16)
