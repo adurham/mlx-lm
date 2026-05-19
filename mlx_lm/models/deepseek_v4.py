@@ -54,6 +54,61 @@ _BUILD_PROBE_ACC: Dict[str, float] = {
 # Each tracked op also gets a call-count so we can compute mean-per-call.
 _OP_PROBE_ENABLED = bool(os.environ.get("MLX_OP_PROBE"))
 
+# 2026-05-18 per-fence-point all_sum CPU-wall probe (env-gated EXO_DSV4_ALLSUM_PROBE=1).
+# Measures the CPU wall-clock spent inside mx.eval(y) at each fence-taken layer
+# in DeepseekV4MoE.__call__ (both the fast path and the span path). Used to
+# characterize verify-phase tail variance — see
+# .hermes/plans/2026-05-18_1830-dsv4-verify-tail-investigation.md.
+#
+# Cost when off: a single bool read (the global ref) per fence-taken layer.
+# Zero env-var reads in the hot path. Zero impact on the mx.eval call itself.
+#
+# Cost when on: ~1 us per fence-taken layer (perf_counter pair + dict
+# setdefault + list append). The mx.eval CPU-wall it measures is typically
+# 0.1-10 ms; ~1 us probe overhead is well within noise.
+#
+# Output format (per dump cycle, every _ALLSUM_PROBE_LOG_EVERY full forward
+# passes through the last layer):
+#   [ALLSUM-PROBE pid=N] cycles=N layer=L n=N p50=X.XXms p99=X.XXms max=X.XXms ...
+# One line per fence-taken layer. Stats are over the most recent
+# _ALLSUM_PROBE_LOG_EVERY forward passes; _ACC is cleared after each dump.
+_ALLSUM_PROBE_ENABLED = bool(os.environ.get("EXO_DSV4_ALLSUM_PROBE"))
+_ALLSUM_PROBE_LOG_EVERY = int(os.environ.get("EXO_DSV4_ALLSUM_PROBE_LOG_EVERY", "50"))
+_ALLSUM_PROBE_ACC: Dict[int, List[float]] = {}    # layer_idx -> list[ms]
+_ALLSUM_PROBE_CYCLES: int = 0
+
+
+def _allsum_probe_dump() -> None:
+    """Format and emit per-layer p50/p99/max from _ALLSUM_PROBE_ACC, then reset."""
+    import statistics as _ap_stats
+    if not _ALLSUM_PROBE_ACC:
+        return
+    layers = sorted(_ALLSUM_PROBE_ACC.keys())
+    lines = [
+        f"[ALLSUM-PROBE pid={os.getpid()}] cycles={_ALLSUM_PROBE_CYCLES} "
+        f"window={_ALLSUM_PROBE_LOG_EVERY} fence_layers={len(layers)}"
+    ]
+    for L in layers:
+        vals = _ALLSUM_PROBE_ACC[L]
+        n = len(vals)
+        if n == 0:
+            continue
+        s = sorted(vals)
+        p50 = s[n // 2]
+        p99 = s[min(n - 1, int(n * 0.99))]
+        mn = s[0]
+        mx_ = s[-1]
+        mean = sum(vals) / n
+        lines.append(
+            f"[ALLSUM-PROBE pid={os.getpid()}]   layer={L:3d} n={n:4d} "
+            f"mean={mean:6.3f}ms min={mn:6.3f}ms p50={p50:6.3f}ms "
+            f"p99={p99:6.3f}ms max={mx_:6.3f}ms"
+        )
+    _bp_sys.stderr.write("\n".join(lines) + "\n")
+    _bp_sys.stderr.flush()
+    _ALLSUM_PROBE_ACC.clear()
+
+
 # 2026-05-13 NOP-probe diagnostic. File-based switch (changed between bench
 # runs without restarting the cluster). Reads /tmp/dsv4_nop_targets; cached
 # for 1 sec to avoid file IO per layer call. Targets are comma-separated:
@@ -1049,6 +1104,10 @@ class DeepseekV4MoE(nn.Module):
         return y
 
     def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
+        # 2026-05-18 allsum probe: declare _ALLSUM_PROBE_CYCLES as global so
+        # the per-branch increments at the two fence sites below are well-
+        # formed regardless of which branch runs first. Free when probe off.
+        global _ALLSUM_PROBE_CYCLES
         if "moe" in _get_nop_targets():
             return mx.zeros(x.shape, dtype=x.dtype)
         # ROUTE_HIST probe: EXO_DSV4_ROUTE_HIST=1 records expert routing.
@@ -1084,7 +1143,24 @@ class DeepseekV4MoE(nn.Module):
                     self._fence_every_n - 1
                 )
                 if _is_last or _is_fence_idx:
-                    mx.eval(y)
+                    if _ALLSUM_PROBE_ENABLED:
+                        import time as _ap_t
+                        _t0 = _ap_t.perf_counter()
+                        mx.eval(y)
+                        _ms = (_ap_t.perf_counter() - _t0) * 1000.0
+                        _ALLSUM_PROBE_ACC.setdefault(
+                            self.layer_idx, []
+                        ).append(_ms)
+                        if _is_last:
+                            _ALLSUM_PROBE_CYCLES += 1
+                            if (
+                                _ALLSUM_PROBE_CYCLES
+                                % _ALLSUM_PROBE_LOG_EVERY
+                                == 0
+                            ):
+                                _allsum_probe_dump()
+                    else:
+                        mx.eval(y)
             return y
 
         with span("ffn"):
@@ -1121,7 +1197,28 @@ class DeepseekV4MoE(nn.Module):
                     # that ordering window. Required for the re-sharded
                     # MTP MoE path (auto_parallel.py:935 Phase H Lever 1)
                     # to remain bit-equivalent across ranks at c=2 temp=0.
-                    mx.eval(y)
+                    if _ALLSUM_PROBE_ENABLED:
+                        import time as _ap_t
+                        _t0 = _ap_t.perf_counter()
+                        mx.eval(y)
+                        _ms = (_ap_t.perf_counter() - _t0) * 1000.0
+                        _ALLSUM_PROBE_ACC.setdefault(
+                            self.layer_idx, []
+                        ).append(_ms)
+                        _is_last_span = (
+                            self.layer_idx
+                            == self._num_total_layers - 1
+                        )
+                        if _is_last_span:
+                            _ALLSUM_PROBE_CYCLES += 1
+                            if (
+                                _ALLSUM_PROBE_CYCLES
+                                % _ALLSUM_PROBE_LOG_EVERY
+                                == 0
+                            ):
+                                _allsum_probe_dump()
+                    else:
+                        mx.eval(y)
                     y = finalize(y)
             return y
 
