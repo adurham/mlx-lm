@@ -150,6 +150,32 @@ if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
     mx.distributed.all_sum = _all_sum_nop_aware
 
 
+# Token-tree drafting verify-pass side channel. Set by the exo
+# DSv4MTPBatchGenerator BEFORE calling model(verify_input, ...) when a tree
+# verify is desired; cleared AFTER. When `tree_mask` is non-None, the
+# DeepseekV4Model.__call__ uses it instead of the standard causal mask; and
+# the three Attention.__call__ classes use `tree_positions` (instead of the
+# implicit `cache.offset + arange(L_q)`) for RoPE.
+#
+# This is a side-channel rather than a kwarg so we don't have to thread it
+# through every layer + attention class signature -- mirrors the existing
+# `_captured["pre_norm"]` pattern used by MTPBatchGenerator's wrapped final
+# norm. Single-threaded per process: each worker has one inference thread.
+#
+# tree_mask shape: (L_q, L_kv + L_q) additive (-inf at do-not-attend, 0 at
+#   attend). Broadcasts to (B=1, n_heads, L_q, L_k).
+# tree_positions shape: (L_q,) int -- the RoPE position of each tree node.
+#   Same-depth siblings share a position; depth-d node has position L_kv + d.
+_TREE_VERIFY_CTX: Dict[str, Any] = {"mask": None, "positions": None}
+
+
+def _set_tree_verify_ctx(mask: Optional[mx.array],
+                          positions: Optional[mx.array]) -> None:
+    """Caller-side helper: install or clear the tree-verify side channel."""
+    _TREE_VERIFY_CTX["mask"] = mask
+    _TREE_VERIFY_CTX["positions"] = positions
+
+
 # ROUTE_HIST: per-(layer, expert) routing histogram probe.
 _ROUTE_HIST_DIR = "/tmp/dsv4_route_hist"
 _route_hist_counts: dict = {}
@@ -677,6 +703,82 @@ def _apply_score_mask(scores: mx.array, mask: Optional[mx.array]) -> mx.array:
     if mask.dtype == mx.bool_:
         return mx.where(mask, scores, mx.finfo(scores.dtype).min)
     return scores + mask.astype(scores.dtype)
+
+
+def _rope_with_positions(
+    rope: "DeepseekV4RoPE",
+    x: mx.array,
+    positions: mx.array,
+    inverse: bool = False,
+) -> mx.array:
+    """Apply RoPE with PER-TOKEN positions (not contiguous from offset).
+
+    mx.fast.rope's `offset` arg accepts a scalar OR a per-BATCH vector --
+    NOT a per-token vector. For tree-attention we need per-token positions
+    (same-depth tree siblings share a position). Trick: reshape so L_q is
+    the batch axis, pass per-batch offsets, reshape back.
+
+    Args:
+        rope: DeepseekV4RoPE instance (for `_get_freqs` and `freq_scale`).
+        x: shape `(B, n_heads, L_q, head_dim)` -- the standard attention
+            tensor layout (Q or K or V or attention output).
+        positions: shape `(L_q,)` int -- per-token RoPE positions.
+        inverse: True to apply the inverse rotation (used post-SDPA on
+            output to undo the Q-side rotation; see deepseek_v4 attention
+            classes' `out = self.rope(out, offset, inverse=True)` calls).
+
+    Returns: rotated tensor with same shape as `x`.
+    """
+    B, H, L_q, D = x.shape
+    if B != 1:
+        raise NotImplementedError(
+            "_rope_with_positions: B>1 not supported in v1 (tree drafting "
+            "currently is c=1 only)."
+        )
+    head_dim = D
+    freqs = rope._get_freqs(head_dim, inverse)
+    # Move L_q to the batch axis so mx.fast.rope's per-batch `offset` vector
+    # gives each token its own RoPE position.
+    # (1, H, L_q, D) -> (L_q, H, 1, D)
+    x_re = x.transpose(2, 1, 0, 3)  # (L_q, H, 1, D)
+    # Apply rope; offset shape (L_q,) matches the new batch dim.
+    pos = positions
+    if rope.freq_scale != 1:
+        pos = pos // rope.freq_scale
+    out = mx.fast.rope(
+        x_re,
+        head_dim,
+        traditional=True,
+        base=None,
+        scale=1.0,
+        offset=pos,
+        freqs=freqs,
+    )
+    # Reshape back: (L_q, H, 1, D) -> (1, H, L_q, D).
+    return out.transpose(2, 1, 0, 3)
+
+
+def _rope_dispatch(
+    rope: "DeepseekV4RoPE",
+    x: mx.array,
+    offset: Any,
+    inverse: bool = False,
+) -> mx.array:
+    """Dispatch RoPE: tree positions when set, fall through to standard rope.
+
+    Used at attention Q/K/V/out RoPE sites in the 3 DSv4 attention classes
+    and the Indexer's Q RoPE. When the tree-verify side channel has
+    `positions` set, route to `_rope_with_positions` (per-token positions);
+    otherwise call `rope(x, offset, inverse)` as before.
+
+    `x` is expected to be in `(B, H, L_q, D)` layout (the same layout that
+    attention classes hand to `self.rope`). For the indexer's Q tensor
+    (also `(B, H, L, D)`) the same dispatch applies.
+    """
+    positions = _TREE_VERIFY_CTX.get("positions")
+    if positions is not None and x.shape[2] == positions.shape[0]:
+        return _rope_with_positions(rope, x, positions, inverse=inverse)
+    return rope(x, offset, inverse=inverse) if inverse else rope(x, offset)
 
 
 def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int):
@@ -1581,7 +1683,7 @@ class Indexer(nn.Module):
 
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
         q = q.transpose(0, 2, 1, 3)
-        q = position_rope(q, offset)
+        q = _rope_dispatch(position_rope, q, offset)
 
         scores = _indexer_score(
             q,
@@ -1700,10 +1802,10 @@ class LocalAttention(nn.Module):
                 B, L, self.n_heads, self.head_dim,
                 self.config.rms_norm_eps,
             )
-            q = self.rope(q, offset)
+            q = _rope_dispatch(self.rope, q, offset)
 
             kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = self.rope(kv, offset)
+            kv = _rope_dispatch(self.rope, kv, offset)
             if cache is not None:
                 kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
@@ -1719,7 +1821,7 @@ class LocalAttention(nn.Module):
                         sinks=self.attn_sink.astype(q.dtype),
                     )
                 )
-            out = self.rope(out, offset, inverse=True)
+            out = _rope_dispatch(self.rope, out, offset, inverse=True)
 
             out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
             out = self.wo_a(out)
@@ -1810,10 +1912,10 @@ class CompressedAttention(nn.Module):
                 B, L, self.n_heads, self.head_dim,
                 self.config.rms_norm_eps,
             )
-            q = self.rope(q, offset)
+            q = _rope_dispatch(self.rope, q, offset)
 
             kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = self.rope(kv, offset)
+            kv = _rope_dispatch(self.rope, kv, offset)
             if local_cache is not None:
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
@@ -1844,7 +1946,7 @@ class CompressedAttention(nn.Module):
                             sinks=self.attn_sink.astype(q.dtype),
                         )
                     )
-            out = self.rope(out, offset, inverse=True)
+            out = _rope_dispatch(self.rope, out, offset, inverse=True)
 
             out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
             out = self.wo_a(out)
@@ -1937,10 +2039,10 @@ class SparseCompressedAttention(nn.Module):
                 B, L, self.n_heads, self.head_dim,
                 self.config.rms_norm_eps,
             )
-            q = self.rope(q, offset)
+            q = _rope_dispatch(self.rope, q, offset)
 
             kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = self.rope(kv, offset)
+            kv = _rope_dispatch(self.rope, kv, offset)
             if local_cache is not None:
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
@@ -2042,7 +2144,7 @@ class SparseCompressedAttention(nn.Module):
                         )
                 out = finalize(out)
 
-            out = self.rope(out, offset, inverse=True)
+            out = _rope_dispatch(self.rope, out, offset, inverse=True)
 
             out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
             out = self.wo_a(out)
@@ -2394,14 +2496,27 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             first_cache[0] if isinstance(first_cache, CacheList) else first_cache
         )
         with span("model.attn_mask"):
-            mask = create_attention_mask(
-                h[:, :, 0, :],
-                mask_cache,
-                window_size=self.args.sliding_window,
-                return_array=True,
-            )
-            if mask is not None:
+            # Token-tree drafting side channel: when set, skip the standard
+            # causal mask and use the caller-supplied per-node tree mask.
+            # The tree mask is (L_q, L_kv + L_q) additive; we broadcast it
+            # to (1, 1, L_q, L_k) so it works with mx.fast.scaled_dot_product_attention.
+            _tree_mask = _TREE_VERIFY_CTX.get("mask")
+            if _tree_mask is not None:
+                # Shape into the broadcast-friendly 4D layout SDPA expects.
+                if _tree_mask.ndim == 2:
+                    mask = _tree_mask[None, None, :, :]
+                else:
+                    mask = _tree_mask
                 finalize(mask)
+            else:
+                mask = create_attention_mask(
+                    h[:, :, 0, :],
+                    mask_cache,
+                    window_size=self.args.sliding_window,
+                    return_array=True,
+                )
+                if mask is not None:
+                    finalize(mask)
         if _bp:
             _bp_t_post_mask = _BUILD_PROBE_PERF()
             _BUILD_PROBE_ACC["attn_mask"] += (_bp_t_post_mask - _bp_t_post_embed)
