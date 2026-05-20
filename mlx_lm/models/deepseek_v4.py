@@ -1465,6 +1465,25 @@ class Compressor(nn.Module):
     ) -> mx.array:
         B, _, _ = x.shape
         kv, gate = self._project_kv_gate(x)
+
+        # Tree-verify path: do NOT mutate pool_cache. The pre-verify pool
+        # represents prefill-derived KV summaries; mixing tree-input KV
+        # (which packs same-depth siblings into contradictory positions)
+        # corrupts BOTH the within-cycle attention (the new "pooled"
+        # entries return contradictory siblings to the SDPA Q) AND
+        # subsequent cycles (the committed pool stays contaminated even
+        # after the local-cache rollback to L_kv).
+        #
+        # During tree verify the verify-tokens are TRANSIENT -- they're
+        # rolled back from local_cache anyway. The pool must stay frozen
+        # so subsequent cycles see only causally-consistent summaries.
+        # Just return the current committed pool prefix (or None when
+        # the pool is empty), bypassing accumulate_windows entirely.
+        if pool_cache is not None and _TREE_VERIFY_CTX.get("positions") is not None:
+            if pool_cache.pooled is None:
+                return mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
+            return pool_cache.pooled
+
         if pool_cache is None:
             usable = (kv.shape[1] // self.compress_ratio) * self.compress_ratio
             ready_kv, ready_gate = kv[:, :usable], gate[:, :usable]
