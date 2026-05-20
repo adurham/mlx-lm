@@ -176,6 +176,55 @@ def _set_tree_verify_ctx(mask: Optional[mx.array],
     _TREE_VERIFY_CTX["positions"] = positions
 
 
+def _tree_pmask(pool_cache, positions: mx.array):
+    """Tree-aware drop-in replacement for ``PoolingCache.make_mask``.
+
+    The stock ``PoolingCache.make_mask(L, offset)`` builds a row-causal
+    pmask whose row ``j`` uses ``query_idx = offset + j + 1``. That's
+    correct for linear-causal input where each query row sits at a
+    monotonically increasing absolute position. Token-tree drafting
+    violates that assumption: same-depth siblings share an absolute
+    position, deeper siblings share a position with each other, so the
+    row index is NOT the right cutoff -- the depth (= position - offset)
+    is.
+
+    This helper uses the per-token absolute positions from
+    ``_TREE_VERIFY_CTX["positions"]`` to build a pmask whose row ``i``
+    uses cutoff ``(positions[i] + 1) // pool_cache.ratio``. Same-depth
+    siblings get IDENTICAL pmask rows -- which is what the linear-causal
+    case satisfies trivially but the tree case must enforce explicitly.
+
+    Returns ``(L_q, P)`` bool mask, or ``None`` when the pool is empty
+    (matches ``make_mask`` semantics).
+    """
+    if pool_cache is None or pool_cache.pooled is None:
+        return None
+    P = pool_cache.pooled.shape[1]
+    pool_idx = mx.arange(P)
+    # (positions + 1) // ratio gives each row's per-token cutoff. Cast to
+    # int32 to match make_mask's arange dtype and keep the comparison cheap.
+    query_idx = (positions + 1).astype(mx.int32)
+    return pool_idx < (query_idx[:, None] // pool_cache.ratio)
+
+
+def _dispatch_pmask(pool_cache, L: int, offset):
+    """Pick the right pmask builder: tree-aware when the verify side
+    channel is active and the L_q matches, otherwise the stock
+    row-causal ``PoolingCache.make_mask``.
+
+    Called at the three sites that consume the pool's row-causal mask:
+    CompressedAttention.__call__, SparseCompressedAttention.__call__,
+    and Indexer.__call__. Keeps the linear path bit-exact (returns the
+    same object the stock call returns) when the side channel is None.
+    """
+    if pool_cache is None:
+        return None
+    positions = _TREE_VERIFY_CTX.get("positions")
+    if positions is not None and L == positions.shape[0]:
+        return _tree_pmask(pool_cache, positions)
+    return pool_cache.make_mask(L, offset)
+
+
 # ROUTE_HIST: per-(layer, expert) routing histogram probe.
 _ROUTE_HIST_DIR = "/tmp/dsv4_route_hist"
 _route_hist_counts: dict = {}
@@ -1692,7 +1741,10 @@ class Indexer(nn.Module):
             self.scale,
             self.n_heads**-0.5,
         )
-        pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
+        # Tree-aware pmask dispatch: same-depth tree siblings need IDENTICAL
+        # pmask rows, but make_mask is row-causal-by-row-index. See
+        # ``_tree_pmask`` for the fix; linear path is bit-exact.
+        pmask = _dispatch_pmask(pool_cache, L, offset)
         if pmask is not None:
             scores = mx.where(
                 pmask if pmask.ndim == 3 else pmask[None],
@@ -1924,9 +1976,8 @@ class CompressedAttention(nn.Module):
                 pooled = finalize(self.compressor(x, pool_cache, offset))
             pooled_mask = None
             if pooled.shape[1] > 0:
-                pooled_mask = (
-                    pool_cache.make_mask(L, offset) if pool_cache is not None else None
-                )
+                # Tree-aware pmask dispatch: see _tree_pmask docstring.
+                pooled_mask = _dispatch_pmask(pool_cache, L, offset)
                 kv = mx.concatenate([kv, pooled[:, None]], axis=2)
 
             mask = _extend_mask(mask, pooled_mask, kv.shape[2])
@@ -2048,7 +2099,8 @@ class SparseCompressedAttention(nn.Module):
 
             with span("attn.compressor"):
                 pooled = finalize(self.compressor(x, comp_cache, offset))
-            pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
+            # Tree-aware pmask dispatch: see _tree_pmask docstring.
+            pmask = _dispatch_pmask(comp_cache, L, offset)
             with span("attn.indexer"):
                 if "indexer" in _get_nop_targets():
                     # Indexer returns argsort(-scores)[..., :k] over scores shaped
