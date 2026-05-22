@@ -176,6 +176,27 @@ def _set_tree_verify_ctx(mask: Optional[mx.array],
     _TREE_VERIFY_CTX["positions"] = positions
 
 
+# Eagle-style soft-embedding side channel for chained MTP drafting.
+# When ``_EAGLE_CTX["soft_emb"]`` is set to a (B, S, hidden) array, the
+# MTP module skips its hard-argmax ``embed_tokens(next_token)`` lookup
+# and uses the supplied embedding mixture instead. Caller computes the
+# mixture from the previous draft step's full logit distribution
+# (probability-weighted top-K of ``embed_tokens(topk_ids)``) and clears
+# the channel after the predict() call so subsequent forwards revert
+# to the hard-embed path. Same module-level side-channel pattern as
+# ``_TREE_VERIFY_CTX`` — single-threaded per worker process.
+#
+# Gated by ``EXO_DSV4_MTP_EAGLE_K`` on the exo side; mlx-lm just honors
+# the channel when it's populated. When unset (default), behavior is
+# bit-exact with the prior hard-embed path. See Phase 14 plan B.2.
+_EAGLE_CTX: Dict[str, Any] = {"soft_emb": None}
+
+
+def _set_eagle_soft_emb(soft_emb: Optional[mx.array]) -> None:
+    """Caller-side helper: install or clear the Eagle soft-embedding."""
+    _EAGLE_CTX["soft_emb"] = soft_emb
+
+
 def _tree_pmask(pool_cache, positions: mx.array):
     """Tree-aware drop-in replacement for ``PoolingCache.make_mask``.
 
@@ -2465,7 +2486,22 @@ class DeepseekV4MTPModule(nn.Module):
         #    h_proj + e_proj are seen as the two halves of M_k.) No
         #    intermediate norm here — Qwen3.5's MTPPredictor uses the
         #    same pattern and treats `mtp.norm` as the FINAL norm.
-        emb = embed_tokens(next_token)  # (B, L, hidden_size)
+        #
+        # Eagle soft-embedding override: when the caller has stashed a
+        # (B, L, hidden_size) probability-weighted embedding mixture in
+        # ``_EAGLE_CTX["soft_emb"]``, use it instead of the hard
+        # ``embed_tokens(next_token)`` lookup. ``next_token`` is still
+        # passed by the caller for cache bookkeeping / signature parity,
+        # but its embedding is ignored. The caller is responsible for
+        # clearing the channel after the predict() call so the next
+        # forward reverts to the hard-embed path. Default-off — when
+        # ``_EAGLE_CTX["soft_emb"]`` is None the path is bit-exact with
+        # the prior implementation.
+        _eagle_soft = _EAGLE_CTX.get("soft_emb")
+        if _eagle_soft is not None:
+            emb = _eagle_soft  # (B, L, hidden_size)
+        else:
+            emb = embed_tokens(next_token)  # (B, L, hidden_size)
         e_normed = self.enorm(emb)
         h_normed = self.hnorm(prev_hidden)
         x = self.e_proj(e_normed) + self.h_proj(h_normed)
