@@ -2013,7 +2013,13 @@ class CompressedAttention(nn.Module):
 
             # Pool tokens into compressed KV and concatenate with local KV
             with span("attn.compressor"):
-                pooled = finalize(self.compressor(x, pool_cache, offset))
+                if "compressor" in _get_nop_targets():
+                    # NOP: emit an empty pooled tensor with the same dtype and
+                    # batch dim. attn proceeds with only local KV. Quality
+                    # intentionally broken — bench tok/s only.
+                    pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
+                else:
+                    pooled = finalize(self.compressor(x, pool_cache, offset))
             pooled_mask = None
             if pooled.shape[1] > 0:
                 # Tree-aware pmask dispatch: see _tree_pmask docstring.
@@ -2138,7 +2144,12 @@ class SparseCompressedAttention(nn.Module):
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
             with span("attn.compressor"):
-                pooled = finalize(self.compressor(x, comp_cache, offset))
+                if "compressor" in _get_nop_targets():
+                    # NOP: see CompressedAttention.__call__ above. Quality
+                    # intentionally broken — bench tok/s only.
+                    pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
+                else:
+                    pooled = finalize(self.compressor(x, comp_cache, offset))
             # Tree-aware pmask dispatch: see _tree_pmask docstring.
             pmask = _dispatch_pmask(comp_cache, L, offset)
             with span("attn.indexer"):
