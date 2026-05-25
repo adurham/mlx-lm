@@ -1485,7 +1485,19 @@ class Compressor(nn.Module):
         offset: Union[int, mx.array],
     ) -> mx.array:
         B, _, _ = x.shape
-        kv, gate = self._project_kv_gate(x)
+        # W4 sub-op NOP toggles — each independent of the others. Replaces the
+        # output with a zero-shaped placeholder that downstream code accepts.
+        # Quality intentionally broken when any sub-toggle is on. Toggles:
+        #   compressor_proj   → skip _project_kv_gate (fake kv/gate as zeros)
+        #   compressor_accum  → skip accumulate_windows (treat as no ready chunk)
+        #   compressor_compress → skip compress+norm+rope (return zeros for new_pooled)
+        #   compressor_pool   → skip pool_cache.update_and_fetch (drop the pool write)
+        _nop = _get_nop_targets()
+        if "compressor_proj" in _nop:
+            kv = mx.zeros((B, x.shape[1], self.out_dim), dtype=x.dtype)
+            gate = mx.zeros((B, x.shape[1], self.out_dim), dtype=x.dtype)
+        else:
+            kv, gate = self._project_kv_gate(x)
 
         # Tree-verify path: do NOT mutate pool_cache. The pre-verify pool
         # represents prefill-derived KV summaries; mixing tree-input KV
@@ -1505,7 +1517,12 @@ class Compressor(nn.Module):
                 return mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
             return pool_cache.pooled
 
-        if pool_cache is None:
+        if "compressor_accum" in _nop:
+            # Pretend no ready chunk this step. Compress kernel never fires.
+            ready_kv = mx.zeros((B, 0, kv.shape[-1]), dtype=x.dtype)
+            ready_gate = mx.zeros((B, 0, gate.shape[-1]), dtype=x.dtype)
+            pool_base = 0
+        elif pool_cache is None:
             usable = (kv.shape[1] // self.compress_ratio) * self.compress_ratio
             ready_kv, ready_gate = kv[:, :usable], gate[:, :usable]
             pool_base = offset
@@ -1514,7 +1531,7 @@ class Compressor(nn.Module):
                 kv, gate, offset
             )
 
-        if ready_kv.size == 0:
+        if "compressor_compress" in _nop or ready_kv.size == 0:
             new_pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
         else:
             compress_func = (
@@ -1532,7 +1549,7 @@ class Compressor(nn.Module):
             # pair and save two array ops per call.
             new_pooled = self.rope(new_pooled, offset=pool_base)
 
-        if pool_cache is not None:
+        if pool_cache is not None and "compressor_pool" not in _nop:
             new_pooled = pool_cache.update_and_fetch(new_pooled)
 
         return new_pooled
