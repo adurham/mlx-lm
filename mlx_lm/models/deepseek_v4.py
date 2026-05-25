@@ -1493,6 +1493,13 @@ class Compressor(nn.Module):
         #   compressor_compress → skip compress+norm+rope (return zeros for new_pooled)
         #   compressor_pool   → skip pool_cache.update_and_fetch (drop the pool write)
         _nop = _get_nop_targets()
+        # W4 path-1: when running the deferred-update path, apply any
+        # offset bump staged by the prior step's call BEFORE we read
+        # pool_cache state for this step. This makes the just-written
+        # entry from the prior step's deferred update visible to this
+        # step's pooled view (one step of staleness, by design).
+        if pool_cache is not None:
+            pool_cache.commit_pending()
         if "compressor_proj" in _nop:
             kv = mx.zeros((B, x.shape[1], self.out_dim), dtype=x.dtype)
             gate = mx.zeros((B, x.shape[1], self.out_dim), dtype=x.dtype)
@@ -1550,28 +1557,19 @@ class Compressor(nn.Module):
             new_pooled = self.rope(new_pooled, offset=pool_base)
 
         if pool_cache is not None and "compressor_pool" not in _nop:
-            # W4 path-1 (2026-05-25): "compressor_defer" toggle returns the
-            # PRE-UPDATE pool prefix so SDPA can run immediately, while the
-            # compress kernel + pool write resolve asynchronously in the lazy
-            # graph. Without this, SDPA's `kv = concat(kv, pooled)` reads
-            # `new_pooled` which depends on the compress kernel, forcing
-            # SDPA to wait. Quality cost: one decode token of staleness on
-            # the compressed view (compressed entries only become visible
-            # one step late). Pool only updates every 4 or 128 decode
-            # steps, so this is at most a 1-of-4 or 1-of-128 staleness on
-            # already-aggregated history. Validation gate: 100K needle ✓
-            # and short-prompt smoke ✓.
+            # W4 path-1: "compressor_defer" toggle returns the PRE-WRITE
+            # pool prefix so SDPA can run immediately, while the compress
+            # kernel + pool slice-assign resolve asynchronously in the
+            # lazy graph. Without this, SDPA's `kv = concat(kv, pooled)`
+            # reads a tensor that depends on the compress kernel, forcing
+            # SDPA to wait. Quality cost: one decode-step of staleness
+            # on the just-pooled entry — it becomes visible NEXT step
+            # via commit_pending(). Pool only updates every 4 or 128
+            # decode steps, so this is at most one stale entry out of
+            # N pooled entries per layer per step. Validation gate:
+            # 100K needle ✓ and short-prompt smoke ✓.
             if "compressor_defer" in _nop:
-                old_pooled = pool_cache.pooled
-                # Issue the pool update (lazy slice-assign + offset bump)
-                _ = pool_cache.update_and_fetch(new_pooled)
-                # Return the pre-update view — SDPA reads this with NO
-                # dependency on the compress kernel chain.
-                new_pooled = (
-                    old_pooled
-                    if old_pooled is not None
-                    else mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
-                )
+                new_pooled = pool_cache.update_and_fetch_deferred(new_pooled)
             else:
                 new_pooled = pool_cache.update_and_fetch(new_pooled)
 
