@@ -2015,6 +2015,25 @@ class CompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
+            # W4 path-1 (2026-05-24): issue the compressor BEFORE the q/k/v
+            # projections so its independent kernel chain (project_kv_gate →
+            # accumulate_windows → optional compress+norm+rope) is queued
+            # first in the lazy graph. The compressor consumes only `x`; the
+            # main attention's projections also consume only `x`. With the
+            # compressor queued first, mlx's async dispatch can overlap the
+            # rare-but-heavy compress kernel with the always-on q/k/v
+            # projections that follow. Previously the compressor was
+            # serialized after kv was ready, even though it has no data
+            # dependency on q/k/v.
+            with span("attn.compressor"):
+                if "compressor" in _get_nop_targets():
+                    # NOP: emit an empty pooled tensor with the same dtype and
+                    # batch dim. attn proceeds with only local KV. Quality
+                    # intentionally broken — bench tok/s only.
+                    pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
+                else:
+                    pooled = finalize(self.compressor(x, pool_cache, offset))
+
             q_lora, kv_pre = self._project_qa_kv(x)
             q = _q_finalize(
                 self.wq_b(self.q_norm(q_lora)),
@@ -2027,16 +2046,6 @@ class CompressedAttention(nn.Module):
             kv = _rope_dispatch(self.rope, kv, offset)
             if local_cache is not None:
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
-
-            # Pool tokens into compressed KV and concatenate with local KV
-            with span("attn.compressor"):
-                if "compressor" in _get_nop_targets():
-                    # NOP: emit an empty pooled tensor with the same dtype and
-                    # batch dim. attn proceeds with only local KV. Quality
-                    # intentionally broken — bench tok/s only.
-                    pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
-                else:
-                    pooled = finalize(self.compressor(x, pool_cache, offset))
             pooled_mask = None
             if pooled.shape[1] > 0:
                 # Tree-aware pmask dispatch: see _tree_pmask docstring.
@@ -2146,6 +2155,16 @@ class SparseCompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
+            # W4 path-1 (2026-05-24): issue compressor first; see
+            # CompressedAttention.__call__ for rationale.
+            with span("attn.compressor"):
+                if "compressor" in _get_nop_targets():
+                    # NOP: see CompressedAttention.__call__ above. Quality
+                    # intentionally broken — bench tok/s only.
+                    pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
+                else:
+                    pooled = finalize(self.compressor(x, comp_cache, offset))
+
             q_lora, kv_pre = self._project_qa_kv(x)
             q_residual = self.q_norm(q_lora)
             q = _q_finalize(
@@ -2159,14 +2178,6 @@ class SparseCompressedAttention(nn.Module):
             kv = _rope_dispatch(self.rope, kv, offset)
             if local_cache is not None:
                 kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
-
-            with span("attn.compressor"):
-                if "compressor" in _get_nop_targets():
-                    # NOP: see CompressedAttention.__call__ above. Quality
-                    # intentionally broken — bench tok/s only.
-                    pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
-                else:
-                    pooled = finalize(self.compressor(x, comp_cache, offset))
             # Tree-aware pmask dispatch: see _tree_pmask docstring.
             pmask = _dispatch_pmask(comp_cache, L, offset)
             with span("attn.indexer"):
