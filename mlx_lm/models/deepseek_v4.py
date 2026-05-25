@@ -1550,7 +1550,30 @@ class Compressor(nn.Module):
             new_pooled = self.rope(new_pooled, offset=pool_base)
 
         if pool_cache is not None and "compressor_pool" not in _nop:
-            new_pooled = pool_cache.update_and_fetch(new_pooled)
+            # W4 path-1 (2026-05-25): "compressor_defer" toggle returns the
+            # PRE-UPDATE pool prefix so SDPA can run immediately, while the
+            # compress kernel + pool write resolve asynchronously in the lazy
+            # graph. Without this, SDPA's `kv = concat(kv, pooled)` reads
+            # `new_pooled` which depends on the compress kernel, forcing
+            # SDPA to wait. Quality cost: one decode token of staleness on
+            # the compressed view (compressed entries only become visible
+            # one step late). Pool only updates every 4 or 128 decode
+            # steps, so this is at most a 1-of-4 or 1-of-128 staleness on
+            # already-aggregated history. Validation gate: 100K needle ✓
+            # and short-prompt smoke ✓.
+            if "compressor_defer" in _nop:
+                old_pooled = pool_cache.pooled
+                # Issue the pool update (lazy slice-assign + offset bump)
+                _ = pool_cache.update_and_fetch(new_pooled)
+                # Return the pre-update view — SDPA reads this with NO
+                # dependency on the compress kernel chain.
+                new_pooled = (
+                    old_pooled
+                    if old_pooled is not None
+                    else mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
+                )
+            else:
+                new_pooled = pool_cache.update_and_fetch(new_pooled)
 
         return new_pooled
 
