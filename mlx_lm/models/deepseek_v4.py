@@ -1557,21 +1557,29 @@ class Compressor(nn.Module):
             new_pooled = self.rope(new_pooled, offset=pool_base)
 
         if pool_cache is not None and "compressor_pool" not in _nop:
-            # W4 path-1: "compressor_defer" toggle returns the PRE-WRITE
-            # pool prefix so SDPA can run immediately, while the compress
-            # kernel + pool slice-assign resolve asynchronously in the
-            # lazy graph. Without this, SDPA's `kv = concat(kv, pooled)`
-            # reads a tensor that depends on the compress kernel, forcing
-            # SDPA to wait. Quality cost: one decode-step of staleness
-            # on the just-pooled entry — it becomes visible NEXT step
-            # via commit_pending(). Pool only updates every 4 or 128
-            # decode steps, so this is at most one stale entry out of
-            # N pooled entries per layer per step. Validation gate:
-            # 100K needle ✓ and short-prompt smoke ✓.
-            if "compressor_defer" in _nop:
-                new_pooled = pool_cache.update_and_fetch_deferred(new_pooled)
-            else:
+            # W4 path-1 (2026-05-25, promoted to default): write the
+            # just-pooled entry to pool storage with the offset bump
+            # DEFERRED to the next step's commit_pending(). SDPA reads
+            # the PRE-WRITE prefix, breaking the compress→SDPA serialization
+            # chain. The slice-assign of new_pooled into the deferred slot
+            # still depends on the compress kernel but SDPA's lazy graph
+            # never touches that slot.
+            #
+            # Quality cost: the just-pooled entry becomes attendable NEXT
+            # decode step instead of the current one. Pool only updates
+            # every `compress_ratio` (4 or 128) decode steps per layer,
+            # so this is at most one stale entry out of N pooled per
+            # layer per step. Validated 2026-05-25: 100K needle ✓,
+            # short-prompt smoke ✓, +0.86 t/s (+3.0%, Welch t=13.96
+            # p<<0.001) over the K=8 baseline.
+            #
+            # Escape hatch: putting "compressor_defer_off" in
+            # /tmp/dsv4_nop_targets reverts to the synchronous path
+            # for forensic A/B if a regression surfaces.
+            if "compressor_defer_off" in _nop:
                 new_pooled = pool_cache.update_and_fetch(new_pooled)
+            else:
+                new_pooled = pool_cache.update_and_fetch_deferred(new_pooled)
 
         return new_pooled
 
