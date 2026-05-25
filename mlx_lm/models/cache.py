@@ -1376,6 +1376,23 @@ class PoolingCache(_BaseCache):
 class BatchPoolingCache(_BaseCache):
     """Batched pooling cache with per-element variable-length tracking."""
 
+    def commit_pending(self) -> None:
+        """Stub for API parity with PoolingCache. BatchPoolingCache does NOT
+        support deferred updates; Compressor.__call__'s defer path is
+        c=1-only (user policy 2026-05-24: c=2 frozen). Calling this is a
+        no-op so Compressor.__call__ can call it unconditionally without
+        an isinstance branch.
+        """
+        pass
+
+    def update_and_fetch_deferred(self, px: mx.array):
+        """BatchPoolingCache does NOT support deferred updates. Fall back to
+        the synchronous path; defer doesn't apply at c>=2 (frozen). If the
+        toggle is set at c=2 anyway, this preserves correctness at the cost
+        of the toggle being a no-op for c>=2 requests.
+        """
+        return self.update_and_fetch(px)
+
     def __init__(self, ratio: int, left_padding: List[int]):
         self.ratio = ratio
 
