@@ -1934,18 +1934,29 @@ class LocalAttention(nn.Module):
             offset = cache.offset if cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q_lora, kv_pre = self._project_qa_kv(x)
-            q = _q_finalize(
-                self.wq_b(self.q_norm(q_lora)),
-                B, L, self.n_heads, self.head_dim,
-                self.config.rms_norm_eps,
-            )
-            q = _rope_dispatch(self.rope, q, offset)
-
-            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = _rope_dispatch(self.rope, kv, offset)
+            # Sub-span attribution for the 2026-05-25 "16% unaccounted attn
+            # wall" investigation: project_qa_kv + q_norm + wq_b + _q_finalize +
+            # kv_norm + reshape. Bracketed by finalize() so the perf_counter
+            # measures real compute, not lazy graph build.
+            with span("attn.proj_qkv"):
+                q_lora, kv_pre = self._project_qa_kv(x)
+                q = _q_finalize(
+                    self.wq_b(self.q_norm(q_lora)),
+                    B, L, self.n_heads, self.head_dim,
+                    self.config.rms_norm_eps,
+                )
+                kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+                q = finalize(q)
+                kv = finalize(kv)
+            with span("attn.rope_in"):
+                q = _rope_dispatch(self.rope, q, offset)
+                kv = _rope_dispatch(self.rope, kv, offset)
+                q = finalize(q)
+                kv = finalize(kv)
             if cache is not None:
-                kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                with span("attn.kv_cache"):
+                    kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv = finalize(kv)
 
             with span("attn.sdpa"):
                 out = finalize(
@@ -1959,12 +1970,16 @@ class LocalAttention(nn.Module):
                         sinks=self.attn_sink.astype(q.dtype),
                     )
                 )
-            out = _rope_dispatch(self.rope, out, offset, inverse=True)
+            with span("attn.rope_out"):
+                out = _rope_dispatch(self.rope, out, offset, inverse=True)
+                out = finalize(out)
 
-            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-            out = self.wo_a(out)
-            out = _o_pre_b(out)
-            out = self.wo_b(out)
+            with span("attn.o_proj"):
+                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+                out = self.wo_a(out)
+                out = _o_pre_b(out)
+                out = self.wo_b(out)
+                out = finalize(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
@@ -2063,25 +2078,36 @@ class CompressedAttention(nn.Module):
                 else:
                     pooled = finalize(self.compressor(x, pool_cache, offset))
 
-            q_lora, kv_pre = self._project_qa_kv(x)
-            q = _q_finalize(
-                self.wq_b(self.q_norm(q_lora)),
-                B, L, self.n_heads, self.head_dim,
-                self.config.rms_norm_eps,
-            )
-            q = _rope_dispatch(self.rope, q, offset)
-
-            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = _rope_dispatch(self.rope, kv, offset)
+            # Sub-span attribution for the 2026-05-25 "16% unaccounted attn
+            # wall" investigation — see LocalAttention.__call__ for the same
+            # set of spans.
+            with span("attn.proj_qkv"):
+                q_lora, kv_pre = self._project_qa_kv(x)
+                q = _q_finalize(
+                    self.wq_b(self.q_norm(q_lora)),
+                    B, L, self.n_heads, self.head_dim,
+                    self.config.rms_norm_eps,
+                )
+                kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+                q = finalize(q)
+                kv = finalize(kv)
+            with span("attn.rope_in"):
+                q = _rope_dispatch(self.rope, q, offset)
+                kv = _rope_dispatch(self.rope, kv, offset)
+                q = finalize(q)
+                kv = finalize(kv)
             if local_cache is not None:
-                kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                with span("attn.kv_cache"):
+                    kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv = finalize(kv)
             pooled_mask = None
-            if pooled.shape[1] > 0:
-                # Tree-aware pmask dispatch: see _tree_pmask docstring.
-                pooled_mask = _dispatch_pmask(pool_cache, L, offset)
-                kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-
-            mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+            with span("attn.mask"):
+                if pooled.shape[1] > 0:
+                    # Tree-aware pmask dispatch: see _tree_pmask docstring.
+                    pooled_mask = _dispatch_pmask(pool_cache, L, offset)
+                    kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+                mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+                kv = finalize(kv)
 
             with span("attn.sdpa"):
                 if "compressed_attn" in _get_nop_targets():
@@ -2098,12 +2124,16 @@ class CompressedAttention(nn.Module):
                             sinks=self.attn_sink.astype(q.dtype),
                         )
                     )
-            out = _rope_dispatch(self.rope, out, offset, inverse=True)
+            with span("attn.rope_out"):
+                out = _rope_dispatch(self.rope, out, offset, inverse=True)
+                out = finalize(out)
 
-            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-            out = self.wo_a(out)
-            out = _o_pre_b(out)
-            out = self.wo_b(out)
+            with span("attn.o_proj"):
+                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+                out = self.wo_a(out)
+                out = _o_pre_b(out)
+                out = self.wo_b(out)
+                out = finalize(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
@@ -2194,21 +2224,35 @@ class SparseCompressedAttention(nn.Module):
                 else:
                     pooled = finalize(self.compressor(x, comp_cache, offset))
 
-            q_lora, kv_pre = self._project_qa_kv(x)
-            q_residual = self.q_norm(q_lora)
-            q = _q_finalize(
-                self.wq_b(q_residual),
-                B, L, self.n_heads, self.head_dim,
-                self.config.rms_norm_eps,
-            )
-            q = _rope_dispatch(self.rope, q, offset)
-
-            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = _rope_dispatch(self.rope, kv, offset)
+            # Sub-span attribution for the 2026-05-25 "16% unaccounted attn
+            # wall" investigation — see LocalAttention.__call__ for the same
+            # set of spans. q_residual is preserved because the indexer needs
+            # it (it consumes the pre-wq_b q lora).
+            with span("attn.proj_qkv"):
+                q_lora, kv_pre = self._project_qa_kv(x)
+                q_residual = self.q_norm(q_lora)
+                q = _q_finalize(
+                    self.wq_b(q_residual),
+                    B, L, self.n_heads, self.head_dim,
+                    self.config.rms_norm_eps,
+                )
+                kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+                q = finalize(q)
+                kv = finalize(kv)
+            with span("attn.rope_in"):
+                q = _rope_dispatch(self.rope, q, offset)
+                kv = _rope_dispatch(self.rope, kv, offset)
+                q = finalize(q)
+                kv = finalize(kv)
             if local_cache is not None:
-                kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
-            # Tree-aware pmask dispatch: see _tree_pmask docstring.
-            pmask = _dispatch_pmask(comp_cache, L, offset)
+                with span("attn.kv_cache"):
+                    kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv = finalize(kv)
+            with span("attn.mask"):
+                # Tree-aware pmask dispatch: see _tree_pmask docstring.
+                pmask = _dispatch_pmask(comp_cache, L, offset)
+                if pmask is not None:
+                    pmask = finalize(pmask)
             with span("attn.indexer"):
                 if "indexer" in _get_nop_targets():
                     # Indexer returns argsort(-scores)[..., :k] over scores shaped
@@ -2304,12 +2348,16 @@ class SparseCompressedAttention(nn.Module):
                         )
                 out = finalize(out)
 
-            out = _rope_dispatch(self.rope, out, offset, inverse=True)
+            with span("attn.rope_out"):
+                out = _rope_dispatch(self.rope, out, offset, inverse=True)
+                out = finalize(out)
 
-            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-            out = self.wo_a(out)
-            out = _o_pre_b(out)
-            out = self.wo_b(out)
+            with span("attn.o_proj"):
+                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+                out = self.wo_a(out)
+                out = _o_pre_b(out)
+                out = self.wo_b(out)
+                out = finalize(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
