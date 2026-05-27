@@ -1110,6 +1110,24 @@ class PoolingCache(_BaseCache):
 
         self._pool_storage = None
         self._pool_offset = 0
+        # W4 deferred-update support. update_and_fetch_deferred stages an
+        # offset bump here without making the just-written entry visible.
+        # commit_pending() applies the bump and must be called BEFORE any
+        # read of self.pooled / self.offset / self.state in the next decode
+        # step. Callers (Compressor.__call__) invoke commit_pending at the
+        # top of __call__ so all in-call reads see consistent state.
+        self._pending_offset_bump = 0
+
+    def commit_pending(self) -> None:
+        """Apply any staged offset bump from update_and_fetch_deferred.
+
+        Idempotent and free when no bump is staged. MUST be called before
+        any read of pool state (pooled, offset, state) when running the
+        deferred-update path.
+        """
+        if self._pending_offset_bump > 0:
+            self._pool_offset += self._pending_offset_bump
+            self._pending_offset_bump = 0
 
     @property
     def pooled(self):
@@ -1219,6 +1237,75 @@ class PoolingCache(_BaseCache):
         self._pool_offset = new_offset
         return self._pool_storage[:, : self._pool_offset]
 
+    def update_and_fetch_deferred(self, px: mx.array):
+        """Write ``px`` into pool storage NOW; defer the visible-offset bump
+        to the next call to ``commit_pending``.
+
+        Returns the PRE-WRITE pool prefix view, so callers (SDPA) consume a
+        tensor with no lazy-graph dependency on the compress kernel that
+        produced ``px``. The slice-assign at line
+        ``self._pool_storage[..., self._pool_offset : new_offset] = px``
+        IS queued lazily and depends on the compress kernel, but the
+        returned ``visible`` view does NOT touch the just-written slot,
+        so SDPA's lazy graph never references it.
+
+        Quality cost: the just-pooled entry becomes attendable one decode
+        step late. Pool only updates every ``ratio`` (4 or 128) decode
+        steps, so this is at most one stale entry out of N pooled entries
+        per layer per step.
+
+        Two structural invariants:
+          1. ``self._pool_storage`` MUST be pre-allocated with room for
+             one extra entry (the deferred slot), so the slice-assign
+             never triggers a resize that races with the pre-write read.
+             Resize-on-the-fly would break the no-dependency contract
+             because the new storage tensor is a fresh allocation.
+          2. ``self._pending_offset_bump`` tracks the staged bump.
+             Callers MUST call ``commit_pending()`` before the next
+             ``update_and_fetch_deferred`` (which is enforced at the top
+             of ``Compressor.__call__``).
+        """
+        if px.shape[1] == 0:
+            # No write to schedule; just return current visible prefix.
+            if self._pool_storage is None:
+                return mx.zeros((px.shape[0], 0, px.shape[-1]), dtype=px.dtype)
+            return self._pool_storage[:, : self._pool_offset]
+
+        B, num_new, D = px.shape
+        new_offset = self._pool_offset + num_new
+
+        # Allocate / grow storage SYNCHRONOUSLY (Python int sizing). When the
+        # storage grows, we reassign self._pool_storage to a fresh tensor and
+        # copy the old visible prefix. The PRE-WRITE view returned to the
+        # caller is captured BEFORE this reassignment so it doesn't get
+        # invalidated downstream.
+        if self._pool_storage is None:
+            new_size = max(self.step, num_new + 1)
+            self._pool_storage = mx.zeros((B, new_size, D), dtype=px.dtype)
+            pre_write = mx.zeros((B, 0, D), dtype=px.dtype)
+        elif new_offset > self._pool_storage.shape[1]:
+            # Grow. The old storage's prefix is what the caller will read;
+            # capture it BEFORE we point self._pool_storage at the new
+            # tensor. After the swap, schedule the data copy + the new
+            # entry's slice-assign into the fresh tensor.
+            current_size = self._pool_storage.shape[1]
+            grow_by = max(self.step, new_offset - current_size + 1)
+            new_size = current_size + grow_by
+            old = self._pool_storage
+            pre_write = old[:, : self._pool_offset]
+            self._pool_storage = mx.zeros((B, new_size, D), dtype=px.dtype)
+            self._pool_storage[:, : self._pool_offset] = old[:, : self._pool_offset]
+        else:
+            pre_write = self._pool_storage[:, : self._pool_offset]
+
+        # Queue the lazy slice-assign. SDPA reads pre_write which doesn't
+        # include this slot, so SDPA has no dependency on the compress
+        # kernel that produced px.
+        self._pool_storage[:, self._pool_offset : new_offset] = px
+        # Stage the offset bump for next-step commit.
+        self._pending_offset_bump += num_new
+        return pre_write
+
     def make_mask(self, L: int = 1, offset: int = 0):
         """Build a causal validity mask for pooled positions.
 
@@ -1288,6 +1375,23 @@ class PoolingCache(_BaseCache):
 
 class BatchPoolingCache(_BaseCache):
     """Batched pooling cache with per-element variable-length tracking."""
+
+    def commit_pending(self) -> None:
+        """Stub for API parity with PoolingCache. BatchPoolingCache does NOT
+        support deferred updates; Compressor.__call__'s defer path is
+        c=1-only (user policy 2026-05-24: c=2 frozen). Calling this is a
+        no-op so Compressor.__call__ can call it unconditionally without
+        an isinstance branch.
+        """
+        pass
+
+    def update_and_fetch_deferred(self, px: mx.array):
+        """BatchPoolingCache does NOT support deferred updates. Fall back to
+        the synchronous path; defer doesn't apply at c>=2 (frozen). If the
+        toggle is set at c=2 anyway, this preserves correctness at the cost
+        of the toggle being a no-op for c>=2 requests.
+        """
+        return self.update_and_fetch(px)
 
     def __init__(self, ratio: int, left_padding: List[int]):
         self.ratio = ratio

@@ -176,6 +176,27 @@ def _set_tree_verify_ctx(mask: Optional[mx.array],
     _TREE_VERIFY_CTX["positions"] = positions
 
 
+# Eagle-style soft-embedding side channel for chained MTP drafting.
+# When ``_EAGLE_CTX["soft_emb"]`` is set to a (B, S, hidden) array, the
+# MTP module skips its hard-argmax ``embed_tokens(next_token)`` lookup
+# and uses the supplied embedding mixture instead. Caller computes the
+# mixture from the previous draft step's full logit distribution
+# (probability-weighted top-K of ``embed_tokens(topk_ids)``) and clears
+# the channel after the predict() call so subsequent forwards revert
+# to the hard-embed path. Same module-level side-channel pattern as
+# ``_TREE_VERIFY_CTX`` — single-threaded per worker process.
+#
+# Gated by ``EXO_DSV4_MTP_EAGLE_K`` on the exo side; mlx-lm just honors
+# the channel when it's populated. When unset (default), behavior is
+# bit-exact with the prior hard-embed path. See Phase 14 plan B.2.
+_EAGLE_CTX: Dict[str, Any] = {"soft_emb": None}
+
+
+def _set_eagle_soft_emb(soft_emb: Optional[mx.array]) -> None:
+    """Caller-side helper: install or clear the Eagle soft-embedding."""
+    _EAGLE_CTX["soft_emb"] = soft_emb
+
+
 def _tree_pmask(pool_cache, positions: mx.array):
     """Tree-aware drop-in replacement for ``PoolingCache.make_mask``.
 
@@ -1464,7 +1485,26 @@ class Compressor(nn.Module):
         offset: Union[int, mx.array],
     ) -> mx.array:
         B, _, _ = x.shape
-        kv, gate = self._project_kv_gate(x)
+        # W4 sub-op NOP toggles — each independent of the others. Replaces the
+        # output with a zero-shaped placeholder that downstream code accepts.
+        # Quality intentionally broken when any sub-toggle is on. Toggles:
+        #   compressor_proj   → skip _project_kv_gate (fake kv/gate as zeros)
+        #   compressor_accum  → skip accumulate_windows (treat as no ready chunk)
+        #   compressor_compress → skip compress+norm+rope (return zeros for new_pooled)
+        #   compressor_pool   → skip pool_cache.update_and_fetch (drop the pool write)
+        _nop = _get_nop_targets()
+        # W4 path-1: when running the deferred-update path, apply any
+        # offset bump staged by the prior step's call BEFORE we read
+        # pool_cache state for this step. This makes the just-written
+        # entry from the prior step's deferred update visible to this
+        # step's pooled view (one step of staleness, by design).
+        if pool_cache is not None:
+            pool_cache.commit_pending()
+        if "compressor_proj" in _nop:
+            kv = mx.zeros((B, x.shape[1], self.out_dim), dtype=x.dtype)
+            gate = mx.zeros((B, x.shape[1], self.out_dim), dtype=x.dtype)
+        else:
+            kv, gate = self._project_kv_gate(x)
 
         # Tree-verify path: do NOT mutate pool_cache. The pre-verify pool
         # represents prefill-derived KV summaries; mixing tree-input KV
@@ -1484,7 +1524,12 @@ class Compressor(nn.Module):
                 return mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
             return pool_cache.pooled
 
-        if pool_cache is None:
+        if "compressor_accum" in _nop:
+            # Pretend no ready chunk this step. Compress kernel never fires.
+            ready_kv = mx.zeros((B, 0, kv.shape[-1]), dtype=x.dtype)
+            ready_gate = mx.zeros((B, 0, gate.shape[-1]), dtype=x.dtype)
+            pool_base = 0
+        elif pool_cache is None:
             usable = (kv.shape[1] // self.compress_ratio) * self.compress_ratio
             ready_kv, ready_gate = kv[:, :usable], gate[:, :usable]
             pool_base = offset
@@ -1493,7 +1538,7 @@ class Compressor(nn.Module):
                 kv, gate, offset
             )
 
-        if ready_kv.size == 0:
+        if "compressor_compress" in _nop or ready_kv.size == 0:
             new_pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
         else:
             compress_func = (
@@ -1511,8 +1556,30 @@ class Compressor(nn.Module):
             # pair and save two array ops per call.
             new_pooled = self.rope(new_pooled, offset=pool_base)
 
-        if pool_cache is not None:
-            new_pooled = pool_cache.update_and_fetch(new_pooled)
+        if pool_cache is not None and "compressor_pool" not in _nop:
+            # W4 path-1 (2026-05-25, promoted to default): write the
+            # just-pooled entry to pool storage with the offset bump
+            # DEFERRED to the next step's commit_pending(). SDPA reads
+            # the PRE-WRITE prefix, breaking the compress→SDPA serialization
+            # chain. The slice-assign of new_pooled into the deferred slot
+            # still depends on the compress kernel but SDPA's lazy graph
+            # never touches that slot.
+            #
+            # Quality cost: the just-pooled entry becomes attendable NEXT
+            # decode step instead of the current one. Pool only updates
+            # every `compress_ratio` (4 or 128) decode steps per layer,
+            # so this is at most one stale entry out of N pooled per
+            # layer per step. Validated 2026-05-25: 100K needle ✓,
+            # short-prompt smoke ✓, +0.86 t/s (+3.0%, Welch t=13.96
+            # p<<0.001) over the K=8 baseline.
+            #
+            # Escape hatch: putting "compressor_defer_off" in
+            # /tmp/dsv4_nop_targets reverts to the synchronous path
+            # for forensic A/B if a regression surfaces.
+            if "compressor_defer_off" in _nop:
+                new_pooled = pool_cache.update_and_fetch(new_pooled)
+            else:
+                new_pooled = pool_cache.update_and_fetch_deferred(new_pooled)
 
         return new_pooled
 
@@ -1867,18 +1934,29 @@ class LocalAttention(nn.Module):
             offset = cache.offset if cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q_lora, kv_pre = self._project_qa_kv(x)
-            q = _q_finalize(
-                self.wq_b(self.q_norm(q_lora)),
-                B, L, self.n_heads, self.head_dim,
-                self.config.rms_norm_eps,
-            )
-            q = _rope_dispatch(self.rope, q, offset)
-
-            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = _rope_dispatch(self.rope, kv, offset)
+            # Sub-span attribution for the 2026-05-25 "16% unaccounted attn
+            # wall" investigation: project_qa_kv + q_norm + wq_b + _q_finalize +
+            # kv_norm + reshape. Bracketed by finalize() so the perf_counter
+            # measures real compute, not lazy graph build.
+            with span("attn.proj_qkv"):
+                q_lora, kv_pre = self._project_qa_kv(x)
+                q = _q_finalize(
+                    self.wq_b(self.q_norm(q_lora)),
+                    B, L, self.n_heads, self.head_dim,
+                    self.config.rms_norm_eps,
+                )
+                kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+                q = finalize(q)
+                kv = finalize(kv)
+            with span("attn.rope_in"):
+                q = _rope_dispatch(self.rope, q, offset)
+                kv = _rope_dispatch(self.rope, kv, offset)
+                q = finalize(q)
+                kv = finalize(kv)
             if cache is not None:
-                kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                with span("attn.kv_cache"):
+                    kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv = finalize(kv)
 
             with span("attn.sdpa"):
                 out = finalize(
@@ -1892,12 +1970,16 @@ class LocalAttention(nn.Module):
                         sinks=self.attn_sink.astype(q.dtype),
                     )
                 )
-            out = _rope_dispatch(self.rope, out, offset, inverse=True)
+            with span("attn.rope_out"):
+                out = _rope_dispatch(self.rope, out, offset, inverse=True)
+                out = finalize(out)
 
-            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-            out = self.wo_a(out)
-            out = _o_pre_b(out)
-            out = self.wo_b(out)
+            with span("attn.o_proj"):
+                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+                out = self.wo_a(out)
+                out = _o_pre_b(out)
+                out = self.wo_b(out)
+                out = finalize(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
@@ -1977,29 +2059,55 @@ class CompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q_lora, kv_pre = self._project_qa_kv(x)
-            q = _q_finalize(
-                self.wq_b(self.q_norm(q_lora)),
-                B, L, self.n_heads, self.head_dim,
-                self.config.rms_norm_eps,
-            )
-            q = _rope_dispatch(self.rope, q, offset)
-
-            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = _rope_dispatch(self.rope, kv, offset)
-            if local_cache is not None:
-                kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
-
-            # Pool tokens into compressed KV and concatenate with local KV
+            # W4 path-1 (2026-05-24): issue the compressor BEFORE the q/k/v
+            # projections so its independent kernel chain (project_kv_gate →
+            # accumulate_windows → optional compress+norm+rope) is queued
+            # first in the lazy graph. The compressor consumes only `x`; the
+            # main attention's projections also consume only `x`. With the
+            # compressor queued first, mlx's async dispatch can overlap the
+            # rare-but-heavy compress kernel with the always-on q/k/v
+            # projections that follow. Previously the compressor was
+            # serialized after kv was ready, even though it has no data
+            # dependency on q/k/v.
             with span("attn.compressor"):
-                pooled = finalize(self.compressor(x, pool_cache, offset))
-            pooled_mask = None
-            if pooled.shape[1] > 0:
-                # Tree-aware pmask dispatch: see _tree_pmask docstring.
-                pooled_mask = _dispatch_pmask(pool_cache, L, offset)
-                kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+                if "compressor" in _get_nop_targets():
+                    # NOP: emit an empty pooled tensor with the same dtype and
+                    # batch dim. attn proceeds with only local KV. Quality
+                    # intentionally broken — bench tok/s only.
+                    pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
+                else:
+                    pooled = finalize(self.compressor(x, pool_cache, offset))
 
-            mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+            # Sub-span attribution for the 2026-05-25 "16% unaccounted attn
+            # wall" investigation — see LocalAttention.__call__ for the same
+            # set of spans.
+            with span("attn.proj_qkv"):
+                q_lora, kv_pre = self._project_qa_kv(x)
+                q = _q_finalize(
+                    self.wq_b(self.q_norm(q_lora)),
+                    B, L, self.n_heads, self.head_dim,
+                    self.config.rms_norm_eps,
+                )
+                kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+                q = finalize(q)
+                kv = finalize(kv)
+            with span("attn.rope_in"):
+                q = _rope_dispatch(self.rope, q, offset)
+                kv = _rope_dispatch(self.rope, kv, offset)
+                q = finalize(q)
+                kv = finalize(kv)
+            if local_cache is not None:
+                with span("attn.kv_cache"):
+                    kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv = finalize(kv)
+            pooled_mask = None
+            with span("attn.mask"):
+                if pooled.shape[1] > 0:
+                    # Tree-aware pmask dispatch: see _tree_pmask docstring.
+                    pooled_mask = _dispatch_pmask(pool_cache, L, offset)
+                    kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+                mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+                kv = finalize(kv)
 
             with span("attn.sdpa"):
                 if "compressed_attn" in _get_nop_targets():
@@ -2016,12 +2124,16 @@ class CompressedAttention(nn.Module):
                             sinks=self.attn_sink.astype(q.dtype),
                         )
                     )
-            out = _rope_dispatch(self.rope, out, offset, inverse=True)
+            with span("attn.rope_out"):
+                out = _rope_dispatch(self.rope, out, offset, inverse=True)
+                out = finalize(out)
 
-            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-            out = self.wo_a(out)
-            out = _o_pre_b(out)
-            out = self.wo_b(out)
+            with span("attn.o_proj"):
+                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+                out = self.wo_a(out)
+                out = _o_pre_b(out)
+                out = self.wo_b(out)
+                out = finalize(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
@@ -2102,24 +2214,45 @@ class SparseCompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-            q_lora, kv_pre = self._project_qa_kv(x)
-            q_residual = self.q_norm(q_lora)
-            q = _q_finalize(
-                self.wq_b(q_residual),
-                B, L, self.n_heads, self.head_dim,
-                self.config.rms_norm_eps,
-            )
-            q = _rope_dispatch(self.rope, q, offset)
-
-            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-            kv = _rope_dispatch(self.rope, kv, offset)
-            if local_cache is not None:
-                kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
-
+            # W4 path-1 (2026-05-24): issue compressor first; see
+            # CompressedAttention.__call__ for rationale.
             with span("attn.compressor"):
-                pooled = finalize(self.compressor(x, comp_cache, offset))
-            # Tree-aware pmask dispatch: see _tree_pmask docstring.
-            pmask = _dispatch_pmask(comp_cache, L, offset)
+                if "compressor" in _get_nop_targets():
+                    # NOP: see CompressedAttention.__call__ above. Quality
+                    # intentionally broken — bench tok/s only.
+                    pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
+                else:
+                    pooled = finalize(self.compressor(x, comp_cache, offset))
+
+            # Sub-span attribution for the 2026-05-25 "16% unaccounted attn
+            # wall" investigation — see LocalAttention.__call__ for the same
+            # set of spans. q_residual is preserved because the indexer needs
+            # it (it consumes the pre-wq_b q lora).
+            with span("attn.proj_qkv"):
+                q_lora, kv_pre = self._project_qa_kv(x)
+                q_residual = self.q_norm(q_lora)
+                q = _q_finalize(
+                    self.wq_b(q_residual),
+                    B, L, self.n_heads, self.head_dim,
+                    self.config.rms_norm_eps,
+                )
+                kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+                q = finalize(q)
+                kv = finalize(kv)
+            with span("attn.rope_in"):
+                q = _rope_dispatch(self.rope, q, offset)
+                kv = _rope_dispatch(self.rope, kv, offset)
+                q = finalize(q)
+                kv = finalize(kv)
+            if local_cache is not None:
+                with span("attn.kv_cache"):
+                    kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv = finalize(kv)
+            with span("attn.mask"):
+                # Tree-aware pmask dispatch: see _tree_pmask docstring.
+                pmask = _dispatch_pmask(comp_cache, L, offset)
+                if pmask is not None:
+                    pmask = finalize(pmask)
             with span("attn.indexer"):
                 if "indexer" in _get_nop_targets():
                     # Indexer returns argsort(-scores)[..., :k] over scores shaped
@@ -2215,12 +2348,16 @@ class SparseCompressedAttention(nn.Module):
                         )
                 out = finalize(out)
 
-            out = _rope_dispatch(self.rope, out, offset, inverse=True)
+            with span("attn.rope_out"):
+                out = _rope_dispatch(self.rope, out, offset, inverse=True)
+                out = finalize(out)
 
-            out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
-            out = self.wo_a(out)
-            out = _o_pre_b(out)
-            out = self.wo_b(out)
+            with span("attn.o_proj"):
+                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+                out = self.wo_a(out)
+                out = _o_pre_b(out)
+                out = self.wo_b(out)
+                out = finalize(out)
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
@@ -2465,7 +2602,22 @@ class DeepseekV4MTPModule(nn.Module):
         #    h_proj + e_proj are seen as the two halves of M_k.) No
         #    intermediate norm here — Qwen3.5's MTPPredictor uses the
         #    same pattern and treats `mtp.norm` as the FINAL norm.
-        emb = embed_tokens(next_token)  # (B, L, hidden_size)
+        #
+        # Eagle soft-embedding override: when the caller has stashed a
+        # (B, L, hidden_size) probability-weighted embedding mixture in
+        # ``_EAGLE_CTX["soft_emb"]``, use it instead of the hard
+        # ``embed_tokens(next_token)`` lookup. ``next_token`` is still
+        # passed by the caller for cache bookkeeping / signature parity,
+        # but its embedding is ignored. The caller is responsible for
+        # clearing the channel after the predict() call so the next
+        # forward reverts to the hard-embed path. Default-off — when
+        # ``_EAGLE_CTX["soft_emb"]`` is None the path is bit-exact with
+        # the prior implementation.
+        _eagle_soft = _EAGLE_CTX.get("soft_emb")
+        if _eagle_soft is not None:
+            emb = _eagle_soft  # (B, L, hidden_size)
+        else:
+            emb = embed_tokens(next_token)  # (B, L, hidden_size)
         e_normed = self.enorm(emb)
         h_normed = self.hnorm(prev_hidden)
         x = self.e_proj(e_normed) + self.h_proj(h_normed)
