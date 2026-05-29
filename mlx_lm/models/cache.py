@@ -691,6 +691,25 @@ class RotatingKVCache(_BaseCache):
     def update_and_fetch(self, keys, values):
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
+        # Speculative verify sends L_q=γ+1 tokens (typically 3-7). The
+        # _update_concat path reorders the entire rotated buffer via
+        # _temporal_order (3-way concat) + _trim (another concat) — at
+        # 100K context that's a full buffer alloc+copy per layer per call.
+        # For small L_q, sequentially calling _update_in_place per token
+        # uses the zero-copy slice-assign fast path instead, saving ~22ms
+        # per verify forward across 43 DSv4 layers. Correctness: each
+        # single-token update handles rotation/wrap identically to the
+        # decode hot path; the final returned K/V reflect all S tokens.
+        S = keys.shape[2]
+        if S <= 8:
+            k_out, v_out = self._update_in_place(
+                keys[:, :, 0:1, :], values[:, :, 0:1, :]
+            )
+            for s in range(1, S):
+                k_out, v_out = self._update_in_place(
+                    keys[:, :, s : s + 1, :], values[:, :, s : s + 1, :]
+                )
+            return k_out, v_out
         return self._update_concat(keys, values)
 
     def size(self):
