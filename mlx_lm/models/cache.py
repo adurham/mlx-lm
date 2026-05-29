@@ -1353,6 +1353,68 @@ class PoolingCache(_BaseCache):
         self.remainder -= n
         return n
 
+    def save_meta(self):
+        """Snapshot the full mutable pool state for speculative rollback.
+
+        The speculative verify forward processes [y, draft_0, ...,
+        draft_{gamma-1}] in one prompt-mode pass, which mutates this cache
+        (flushes pooled windows, advances ``_pool_offset``, rewrites the
+        remainder buffer) based on tokens that may be REJECTED. ``trim()``
+        can only shrink ``remainder`` — it cannot un-flush a pooled entry
+        or restore overwritten buffer contents. So the spec orchestrator
+        snapshots here BEFORE verify and, on rejection, calls
+        ``restore_meta`` to rewind to the pre-verify state, then re-pools
+        only the committed tokens via a commit-forward.
+
+        Returns an opaque tuple. The remainder buffer slices are
+        materialized (copied) because ``accumulate_windows`` slice-assigns
+        into ``buf_kv``/``buf_gate`` in place during verify, which would
+        otherwise corrupt a view-based snapshot.
+        """
+        buf_kv = None
+        buf_gate = None
+        if (
+            self.buf_kv is not None
+            and self.buf_gate is not None
+            and self.remainder > 0
+        ):
+            buf_kv = mx.array(self.buf_kv[:, : self.remainder])
+            buf_gate = mx.array(self.buf_gate[:, : self.remainder])
+        return (
+            self._pool_offset,
+            self._pending_offset_bump,
+            self.remainder,
+            buf_kv,
+            buf_gate,
+        )
+
+    def restore_meta(self, snap):
+        """Rewind to a ``save_meta`` snapshot (speculative rollback).
+
+        ``_pool_offset`` is rewound so any pooled entries flushed from
+        rejected drafts during verify become invisible (and their storage
+        slots are overwritten by the subsequent commit-forward). The
+        remainder buffer contents are restored from the materialized
+        snapshot so a future flush can't pack a rejected token into a
+        pooled window.
+        """
+        pool_offset, pending_bump, remainder, buf_kv, buf_gate = snap
+        self._pool_offset = pool_offset
+        self._pending_offset_bump = pending_bump
+        self.remainder = remainder
+        if buf_kv is not None:
+            if self.buf_kv is None or self.buf_gate is None:
+                self.buf_kv = mx.zeros(
+                    (buf_kv.shape[0], self.ratio, buf_kv.shape[2]),
+                    dtype=buf_kv.dtype,
+                )
+                self.buf_gate = mx.zeros(
+                    (buf_gate.shape[0], self.ratio, buf_gate.shape[2]),
+                    dtype=buf_gate.dtype,
+                )
+            self.buf_kv[:, : buf_kv.shape[1]] = buf_kv
+            self.buf_gate[:, : buf_gate.shape[1]] = buf_gate
+
     def size(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
 
