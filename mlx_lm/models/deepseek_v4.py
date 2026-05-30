@@ -168,6 +168,18 @@ if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
 #   Same-depth siblings share a position; depth-d node has position L_kv + d.
 _TREE_VERIFY_CTX: Dict[str, Any] = {"mask": None, "positions": None}
 
+# Pool-freeze flag for linear speculative verify. When True, the
+# Compressor skips accumulate_windows + compress entirely and returns the
+# current committed pool prefix — same freeze the tree path uses via
+# _TREE_VERIFY_CTX, but without the tree-specific mask/position overrides.
+# Set by the spec orchestrator around the verify forward; cleared after.
+_POOL_FREEZE: bool = False
+
+
+def _set_pool_freeze(freeze: bool) -> None:
+    global _POOL_FREEZE
+    _POOL_FREEZE = freeze
+
 
 def _set_tree_verify_ctx(mask: Optional[mx.array],
                           positions: Optional[mx.array]) -> None:
@@ -1519,7 +1531,9 @@ class Compressor(nn.Module):
         # so subsequent cycles see only causally-consistent summaries.
         # Just return the current committed pool prefix (or None when
         # the pool is empty), bypassing accumulate_windows entirely.
-        if pool_cache is not None and _TREE_VERIFY_CTX.get("positions") is not None:
+        if pool_cache is not None and (
+            _TREE_VERIFY_CTX.get("positions") is not None or _POOL_FREEZE
+        ):
             if pool_cache.pooled is None:
                 return mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
             return pool_cache.pooled
