@@ -2291,10 +2291,17 @@ class SparseCompressedAttention(nn.Module):
             # c=1 finds — is the offset wrong, or the block selection?
             if (
                 _topk_os.environ.get("EXO_DSV4_BATCH_POOL_DIAG") == "1"
-                and self.layer_idx == 0
                 and L == 1
                 and pooled.shape[1] > 0
+                and getattr(SparseCompressedAttention, "_idx_diag_n", 0) < 40
             ):
+                # Layer 0 is a DeltaNet layer, not sparse, so a layer_idx==0
+                # gate never matched. Log the first 40 sparse-layer decode
+                # calls per process (class-level counter) so we capture this
+                # layer across the first several decode steps.
+                SparseCompressedAttention._idx_diag_n = (
+                    getattr(SparseCompressedAttention, "_idx_diag_n", 0) + 1
+                )
                 try:
                     import os as _ios
                     _off_l = (
@@ -2308,7 +2315,8 @@ class SparseCompressedAttention(nn.Module):
                         f"/tmp/dsv4_idx_diag_pid{_ios.getpid()}.log", "a"
                     ) as _idf:
                         _idf.write(
-                            f"B={_B} offset={_off_l} pooled_blocks={pooled.shape[1]} "
+                            f"layer={self.layer_idx} B={_B} offset={_off_l} "
+                            f"pooled_blocks={pooled.shape[1]} "
                             f"topk_k={_tk.shape[-1]} topk_min={_tkmin} "
                             f"topk_max={_tkmax}\n"
                         )
