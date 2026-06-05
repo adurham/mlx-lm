@@ -2120,54 +2120,6 @@ class CompressedAttention(nn.Module):
                     # Tree-aware pmask dispatch: see _tree_pmask docstring.
                     pooled_mask = _dispatch_pmask(pool_cache, L, offset)
                     kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-                # CompressedAttention is the ratio==128 long-range layer that
-                # actually retrieves the 100K needle. Diagnostic
-                # (EXO_DSV4_BATCH_POOL_DIAG=1): dump per-stream offset, pooled
-                # block count, local mask width, and per-stream pooled-valid
-                # counts for the first 40 decode calls. Compares c=1 (finds
-                # needle) vs c=2 (misses) to localize the long-range retrieval
-                # divergence.
-                if (
-                    _topk_os.environ.get("EXO_DSV4_BATCH_POOL_DIAG") == "1"
-                    and L == 1
-                    and pooled.shape[1] > 0
-                    and getattr(CompressedAttention, "_cmp_diag_n", 0) < 40
-                ):
-                    CompressedAttention._cmp_diag_n = (
-                        getattr(CompressedAttention, "_cmp_diag_n", 0) + 1
-                    )
-                    try:
-                        import os as _cios
-                        _off_l = (
-                            offset.tolist() if hasattr(offset, "tolist") else offset
-                        )
-                        _lm = mask  # local mask BEFORE _extend_mask
-                        _lm_shape = None if _lm is None else tuple(_lm.shape)
-                        _pm_valid = None
-                        if pooled_mask is not None:
-                            _pmb = pooled_mask
-                            if _pmb.ndim >= 2:
-                                # per-stream count of valid pooled blocks
-                                _pm_valid = _pmb.reshape(
-                                    _pmb.shape[0], -1
-                                ).sum(axis=-1).tolist()
-                        with open(
-                            f"/tmp/dsv4_cmp_diag_pid{_cios.getpid()}.log", "a"
-                        ) as _cf:
-                            _cf.write(
-                                f"layer={self.layer_idx} B={pooled.shape[0]} "
-                                f"offset={_off_l} pooled_blocks={pooled.shape[1]} "
-                                f"local_mask={_lm_shape} pooled_valid={_pm_valid}\n"
-                            )
-                    except Exception as _ce:
-                        try:
-                            import os as _cios2
-                            with open(
-                                f"/tmp/dsv4_cmp_diag_pid{_cios2.getpid()}.log", "a"
-                            ) as _cf2:
-                                _cf2.write(f"CMP_DIAG_ERR: {_ce}\n")
-                        except Exception:
-                            pass
                 mask = _extend_mask(mask, pooled_mask, kv.shape[2])
                 kv = finalize(kv)
 
@@ -2332,44 +2284,6 @@ class SparseCompressedAttention(nn.Module):
                     topk = finalize(
                         self.indexer(x, q_residual, self.rope, idx_cache, offset)
                     )
-            # Indexer-offset diagnostic (EXO_DSV4_BATCH_POOL_DIAG=1). Dumps,
-            # for layer_idx 0 and decode steps (L==1), the per-stream offset,
-            # pooled block count, and the min/max selected top-k block index.
-            # Used to resolve why c>=2 spec misses the long-range needle that
-            # c=1 finds — is the offset wrong, or the block selection?
-            if (
-                _topk_os.environ.get("EXO_DSV4_BATCH_POOL_DIAG") == "1"
-                and L == 1
-                and pooled.shape[1] > 0
-                and getattr(SparseCompressedAttention, "_idx_diag_n", 0) < 40
-            ):
-                # Layer 0 is a DeltaNet layer, not sparse, so a layer_idx==0
-                # gate never matched. Log the first 40 sparse-layer decode
-                # calls per process (class-level counter) so we capture this
-                # layer across the first several decode steps.
-                SparseCompressedAttention._idx_diag_n = (
-                    getattr(SparseCompressedAttention, "_idx_diag_n", 0) + 1
-                )
-                try:
-                    import os as _ios
-                    _off_l = (
-                        offset.tolist() if hasattr(offset, "tolist") else offset
-                    )
-                    _tk = topk
-                    _tkmin = int(_tk.min()) if _tk.size > 0 else -1
-                    _tkmax = int(_tk.max()) if _tk.size > 0 else -1
-                    _B = _tk.shape[0]
-                    with open(
-                        f"/tmp/dsv4_idx_diag_pid{_ios.getpid()}.log", "a"
-                    ) as _idf:
-                        _idf.write(
-                            f"layer={self.layer_idx} B={_B} offset={_off_l} "
-                            f"pooled_blocks={pooled.shape[1]} "
-                            f"topk_k={_tk.shape[-1]} topk_min={_tkmin} "
-                            f"topk_max={_tkmax}\n"
-                        )
-                except Exception:
-                    pass
             sinks = self.attn_sink.astype(q.dtype)
 
             with span("attn.sdpa"):
