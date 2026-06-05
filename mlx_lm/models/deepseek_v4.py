@@ -2284,6 +2284,36 @@ class SparseCompressedAttention(nn.Module):
                     topk = finalize(
                         self.indexer(x, q_residual, self.rope, idx_cache, offset)
                     )
+            # Indexer-offset diagnostic (EXO_DSV4_BATCH_POOL_DIAG=1). Dumps,
+            # for layer_idx 0 and decode steps (L==1), the per-stream offset,
+            # pooled block count, and the min/max selected top-k block index.
+            # Used to resolve why c>=2 spec misses the long-range needle that
+            # c=1 finds — is the offset wrong, or the block selection?
+            if (
+                _topk_os.environ.get("EXO_DSV4_BATCH_POOL_DIAG") == "1"
+                and self.layer_idx == 0
+                and L == 1
+                and pooled.shape[1] > 0
+            ):
+                try:
+                    import os as _ios
+                    _off_l = (
+                        offset.tolist() if hasattr(offset, "tolist") else offset
+                    )
+                    _tk = topk
+                    _tkmin = int(_tk.min()) if _tk.size > 0 else -1
+                    _tkmax = int(_tk.max()) if _tk.size > 0 else -1
+                    _B = _tk.shape[0]
+                    with open(
+                        f"/tmp/dsv4_idx_diag_pid{_ios.getpid()}.log", "a"
+                    ) as _idf:
+                        _idf.write(
+                            f"B={_B} offset={_off_l} pooled_blocks={pooled.shape[1]} "
+                            f"topk_k={_tk.shape[-1]} topk_min={_tkmin} "
+                            f"topk_max={_tkmax}\n"
+                        )
+                except Exception:
+                    pass
             sinks = self.attn_sink.astype(q.dtype)
 
             with span("attn.sdpa"):
