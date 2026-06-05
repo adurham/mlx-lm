@@ -1682,6 +1682,71 @@ class BatchPoolingCache(_BaseCache):
             self._processed[i] -= n
         return n
 
+    def save_meta(self):
+        """Snapshot full mutable pool state for speculative rollback.
+
+        The c>=2 batched speculative verify processes [y_n, draft_0_n, ...,
+        draft_{gamma-1}_n] per stream in one prompt-mode pass at shape
+        (N, gamma+1). This call mutates the cache (advances per-stream
+        ``_pool_lengths`` on flush, advances ``_processed`` and ``remainder``
+        per stream, rewrites ``buf_kv``/``buf_gate`` via in-place slice
+        assigns). ``trim()`` can only shrink ``remainder``/``_processed`` —
+        it CANNOT un-flush a pooled entry once it has been written into
+        ``pooled`` at a stream's ``_pool_lengths[i]`` slot. So the spec
+        orchestrator snapshots here BEFORE verify, and on per-stream
+        rejection (n_accepted_per[i] < gamma) calls ``restore_meta`` to
+        rewind to the pre-verify state, trims everything to its committed
+        prefix, then re-pools each stream's committed tokens via a per-
+        stream-aware commit-forward (``prepare(lengths=[acc+1 per stream])``).
+
+        Mirrors the scalar ``PoolingCache.save_meta`` discipline. The buffer
+        slices are materialized (copied) because ``accumulate_windows``
+        slice-assigns into ``buf_kv``/``buf_gate`` in place during verify;
+        a view-based snapshot would alias the post-verify state.
+        """
+        buf_kv = None
+        buf_gate = None
+        if (
+            self.buf_kv is not None
+            and self.buf_gate is not None
+            and any(r > 0 for r in self.remainder)
+        ):
+            # Materialize the full buf shape — per-stream remainders differ,
+            # so we copy the whole buf and restore_meta will slice per-stream.
+            buf_kv = mx.array(self.buf_kv)
+            buf_gate = mx.array(self.buf_gate)
+        return (
+            list(self._pool_lengths),
+            list(self.remainder),
+            list(self._processed),
+            buf_kv,
+            buf_gate,
+        )
+
+    def restore_meta(self, snap):
+        """Rewind to a ``save_meta`` snapshot (speculative rollback).
+
+        Per-stream ``_pool_lengths`` is rewound so any pooled entries
+        flushed from rejected drafts during verify become invisible (their
+        storage slots in ``self.pooled`` are overwritten by the subsequent
+        commit-forward). ``remainder`` and ``_processed`` are restored per
+        stream. ``buf_kv``/``buf_gate`` contents are restored from the
+        materialized snapshot so a future flush cannot pack a rejected
+        token into a pooled window.
+        """
+        pool_lengths, remainder, processed, buf_kv, buf_gate = snap
+        self._pool_lengths = list(pool_lengths)
+        self.remainder = list(remainder)
+        self._processed = list(processed)
+        if (
+            buf_kv is not None
+            and buf_gate is not None
+            and self.buf_kv is not None
+            and self.buf_gate is not None
+        ):
+            self.buf_kv[:] = buf_kv
+            self.buf_gate[:] = buf_gate
+
     def size(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
 
