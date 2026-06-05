@@ -2478,6 +2478,86 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
       isn't re-implemented; convert to this class only AFTER prefill.
     """
 
+    def _bootstrap_per_stream_ring(self) -> None:
+        """Convert inherited base-``BatchRotatingKVCache`` ring state into
+        this class's linear-compacted per-stream model.
+
+        Called once, immediately after the class-pointer swap (see
+        ``_upgrade_cache_to_per_stream``). The base class stores at most
+        ``max_size`` keys in a physical ring; after a long prefill that ring
+        is FULL and its logical ``offset`` (e.g. 52569) is far larger than
+        the physical buffer width (``max_size``, e.g. 128).
+
+        The per-stream code treats the buffer as linear: stream b writes at
+        physical index ``offset[b]`` and reads ``[0, offset[b])``. If we keep
+        the inherited absolute ``offset`` (52569) against a 128-wide buffer,
+        the first write scatters at index 52569 — far outside the real data
+        — and the mask uses the wrong slot↔position mapping, scrambling all
+        prefilled context (the c>=2 100K BOS-spam bug).
+
+        Conversion (caller has already run ``_temporal_order`` so the buffer
+        is un-rotated, oldest-first):
+
+          * ``valid = min(_offset, max_size)`` — number of real tokens the
+            ring actually holds (the sliding window).
+          * Slice the buffer down to exactly those ``valid`` tokens.
+          * Rebase every stream's logical ``offset`` to ``valid`` (all
+            streams are uniform at swap time — no divergence has happened
+            yet) and zero ``left_padding``. Mask positions are relative, so
+            rebasing preserves correct windowed attention.
+
+        After this, the linear-write + per-stream-mask + ``trim_per_stream``
+        compaction model is internally consistent and bounded (compaction
+        keeps the buffer near ``2*max_size`` thereafter).
+        """
+        max_size = self.max_size
+        abs_off = int(self._offset)
+        valid = min(abs_off, max_size)
+        B = self.offset.shape[0]
+        if self.keys is not None:
+            B = self.keys.shape[0]
+            # Buffer is temporal-ordered (oldest-first). Pad/realign so the
+            # physical buffer is exactly `max_size` wide with the `valid`
+            # real tokens occupying the LAST `valid` slots — i.e. logical
+            # position p lives at physical slot `p % max_size`. This is the
+            # ring layout the rewritten update_and_fetch / make_mask expect.
+            self.keys = mx.contiguous(self.keys[..., :valid, :])
+            self.values = mx.contiguous(self.values[..., :valid, :])
+            Hk = self.keys.shape[1]
+            Dk = self.keys.shape[3]
+            Dv = self.values.shape[3]
+            # The most recent token is at logical position abs_off-1, which
+            # must sit at physical slot (abs_off-1) % max_size. Build a full
+            # max_size ring and place the `valid` temporal tokens so the ring
+            # head lands correctly.
+            ring_k = mx.zeros((B, Hk, max_size, Dk), dtype=self.keys.dtype)
+            ring_v = mx.zeros((B, Hk, max_size, Dv), dtype=self.values.dtype)
+            # Temporal token j (0..valid-1) maps to logical pos
+            # (abs_off - valid + j) → physical slot ((abs_off - valid + j) %
+            # max_size). Since valid<=max_size and they're contiguous, this
+            # is a single rolled placement.
+            start_slot = (abs_off - valid) % max_size
+            if start_slot + valid <= max_size:
+                ring_k[..., start_slot : start_slot + valid, :] = self.keys
+                ring_v[..., start_slot : start_slot + valid, :] = self.values
+            else:
+                first = max_size - start_slot
+                ring_k[..., start_slot:, :] = self.keys[..., :first, :]
+                ring_v[..., start_slot:, :] = self.values[..., :first, :]
+                ring_k[..., : valid - first, :] = self.keys[..., first:, :]
+                ring_v[..., : valid - first, :] = self.values[..., first:, :]
+            self.keys = ring_k
+            self.values = ring_v
+        # Keep absolute offsets — RoPE (LocalAttention reads cache.offset)
+        # needs the true position, NOT a rebased small value.
+        self.offset = mx.full((B,), abs_off, dtype=mx.int32)
+        self.left_padding = mx.zeros((B,), dtype=mx.int32)
+        self._idx = abs_off % max_size  # ring write head
+        self._offset = abs_off
+        self._per_stream_max = abs_off
+        self._offsets_py = [abs_off] * B
+        self.rotated = abs_off >= max_size
+
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Unified per-stream physical write. Same code handles L=1
         decode and L>1 verify — replaces base class's
@@ -2496,10 +2576,11 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
 
         B, n_kv_heads, S, k_head_dim = keys.shape
         v_head_dim = values.shape[3]
+        max_size = self.max_size
 
         # Lazy re-init when batch size changes (e.g. when an MTP
         # predictor cache constructed for B=1 sees its first B=2
-        # write at c=2 entry).
+        # write at c=2 entry). The fresh buffer is a full max_size ring.
         if self.left_padding is None or self.left_padding.shape[0] != B:
             self.left_padding = mx.zeros((B,), dtype=mx.int32)
             self.offset = mx.zeros((B,), dtype=mx.int32)
@@ -2510,73 +2591,52 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
             self._per_stream_max = 0  # cached max(self.offset) as Python int
             self._offsets_py = [0] * B  # parallel Python-int per-stream offsets
 
-        # Lazy bootstrap of _per_stream_max + _offsets_py from base
-        # class state if we just got class-swapped (no __init__ ran on
-        # the subclass). Streams haven't diverged yet at swap time —
-        # _offset equals max(offset) and all streams share that value.
         if not hasattr(self, "_per_stream_max"):
             self._per_stream_max = int(self._offset)
         if not hasattr(self, "_offsets_py"):
             self._offsets_py = [self._per_stream_max] * B
 
-        # In steady state (uniform writes per layer per step), every
-        # update advances all streams by S. Cached max also advances
-        # by S — no .item() sync needed in the hot path.
-        max_after = self._per_stream_max + S
-
+        # Fixed-size RING buffer (width == max_size). Stream b's token at
+        # logical position p lives at physical slot ``p % max_size``. This
+        # replaces the old linear-growing buffer which (a) needed an
+        # offset-wide buffer — impossible at 100K — and (b) broke entirely
+        # when class-swapped onto a base ring after a long prefill (the
+        # c>=2 100K BOS-spam bug). All streams share one physical ring; they
+        # differ only in per-stream logical ``offset[b]`` (RoPE position),
+        # which stays ABSOLUTE so LocalAttention's RoPE is correct.
         cur_buf = 0 if self.keys is None else self.keys.shape[2]
-        if max_after > cur_buf:
-            target = ((max_after + self.step - 1) // self.step) * self.step
-            grow_by = target - cur_buf
-            if grow_by > 0:
-                new_k = mx.zeros((B, n_kv_heads, grow_by, k_head_dim), keys.dtype)
-                new_v = mx.zeros((B, n_kv_heads, grow_by, v_head_dim), values.dtype)
-                if self.keys is not None:
-                    self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                    self.values = mx.concatenate([self.values, new_v], axis=2)
-                else:
-                    self.keys, self.values = new_k, new_v
+        if cur_buf < max_size:
+            grow_by = max_size - cur_buf
+            new_k = mx.zeros((B, n_kv_heads, grow_by, k_head_dim), keys.dtype)
+            new_v = mx.zeros((B, n_kv_heads, grow_by, v_head_dim), values.dtype)
+            if self.keys is not None:
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
 
-        # Per-stream physical writes via vectorized scatter
-        # (``put_along_axis``). Replaces a Python ``for b in range(B)``
-        # slice-assign loop that issued B mx ops per call (43 layers ×
-        # B writes per cycle = 86+ extra ops at B=2). The vectorized
-        # path issues one scatter per ``keys`` tensor and one per
-        # ``values``.
-        #
-        # ``offsets_arr`` is the per-stream write base. The S-axis
-        # positions are ``offsets_arr[b] + 0 .. offsets_arr[b] + S - 1``;
-        # broadcast to source-tensor shape and feed to put_along_axis
-        # along axis=2.
-        offsets_arr = self.offset  # (B,) mx.int32, current write base per stream
+        # Per-stream physical writes via vectorized scatter, modular into
+        # the ring. Write position for stream b, sub-token j is
+        # ``(offset[b] + j) % max_size``.
+        offsets_arr = self.offset  # (B,) mx.int32, per-stream logical write base
         pos_offset = mx.arange(S, dtype=offsets_arr.dtype)[None, None, :, None]
-        # k_indices broadcasts to (B, n_kv_heads, S, k_head_dim).
-        k_target_shape = (B, n_kv_heads, S, k_head_dim)
-        v_target_shape = (B, n_kv_heads, S, v_head_dim)
-        k_indices = mx.broadcast_to(
-            offsets_arr[:, None, None, None] + pos_offset, k_target_shape
-        )
-        v_indices = mx.broadcast_to(
-            offsets_arr[:, None, None, None] + pos_offset, v_target_shape
-        )
+        ring_pos = (offsets_arr[:, None, None, None] + pos_offset) % max_size
+        k_indices = mx.broadcast_to(ring_pos, (B, n_kv_heads, S, k_head_dim))
+        v_indices = mx.broadcast_to(ring_pos, (B, n_kv_heads, S, v_head_dim))
         self.keys = mx.put_along_axis(self.keys, k_indices, keys, axis=2)
         self.values = mx.put_along_axis(self.values, v_indices, values, axis=2)
 
-        # All streams advance uniformly by S on a write. Maintain the
-        # Python parallel state in lockstep so trim_per_stream can do
-        # its arithmetic in Python without syncing.
+        # All streams advance uniformly by S on a write.
         self.offset = self.offset + S
-        self._per_stream_max = max_after
-        self._offset = max_after
-        self._idx = max_after
+        self._per_stream_max = self._per_stream_max + S
+        self._offset = self._per_stream_max
+        self._idx = self._per_stream_max % max_size
         self._offsets_py = [o + S for o in self._offsets_py]
 
         self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
 
-        return (
-            self.keys[..., : self._offset, :],
-            self.values[..., : self._offset, :],
-        )
+        # Return the FULL ring; make_mask gates which slots are valid.
+        return self.keys, self.values
 
     def make_mask(
         self,
@@ -2584,40 +2644,67 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         window_size: Optional[int] = None,
         return_array: bool = False,
     ):
-        # Use the cached per-stream max so we don't sync per call.
-        # `_per_stream_max` stays consistent with what
-        # `update_and_fetch` uses for `max_after` because both update
-        # together (per-stream writes advance all streams by S, plus
-        # `trim_per_stream` re-syncs after spec rollback).
-        physical = getattr(self, "_per_stream_max", self._offset)
-        # Per-stream right-padding: stream b's allowed positions are
-        # [left_padding[b], offset[b] + N).
-        right_pad = physical - self.offset
+        """Per-stream sliding-window mask over the fixed-size ring.
 
-        return create_causal_mask(
-            N,
-            offset=physical,
-            window_size=window_size or self.max_size,
-            right_padding=right_pad,
-            left_padding=self.left_padding,
-        )
+        The KV buffer is ``max_size`` wide; physical slot ``s`` holds the
+        key whose logical position satisfies ``pos % max_size == s``. For a
+        query at logical position ``q = offset[b] + i`` (row ``i`` of this
+        forward), slot ``s`` is attendable iff the logical position ``p``
+        stored there is BOTH causal (``p <= q``) and inside the sliding
+        window (``p > q - window``). We reconstruct each slot's stored
+        logical position per stream from its own offset, then apply the
+        causal + window predicate. This is the per-stream, ring-correct
+        analogue of the base class's roll-based mask.
+        """
+        window = window_size or self.max_size
+        max_size = self.max_size
+        offset = self.offset  # (B,) absolute per-stream logical write base
+
+        # IMPORTANT ordering: the attention mask is built at the model level
+        # BEFORE the per-layer update_and_fetch writes this forward's N new
+        # tokens. But the mask is APPLIED to the post-write ring (SDPA runs
+        # after the write). After writing, stream b's ring holds logical
+        # positions [offset[b] + N - max_size, offset[b] + N), with slot s
+        # holding the unique position p in that half-open range with
+        # p % max_size == s. So reconstruct stored_pos against the POST-write
+        # high-water mark (offset[b] + N).
+        hi = offset[:, None] + N  # (B, 1) exclusive upper bound after write
+        slots = mx.arange(max_size, dtype=offset.dtype)[None, :]  # (1, max_size)
+        base = hi - max_size  # (B, 1) lowest retained position
+        # p(s) is the unique value in [base, base+max_size) ≡ s (mod max_size).
+        stored_pos = base + ((slots - base) % max_size)  # (B, max_size)
+        valid_slot = stored_pos >= 0  # slots holding no real token yet
+
+        # Query logical positions: (B, N) = offset[b] + i, i in [0, N).
+        qpos = offset[:, None] + mx.arange(N, dtype=offset.dtype)[None, :]  # (B, N)
+
+        # Broadcast to (B, N, max_size): query i vs slot s.
+        q = qpos[:, :, None]  # (B, N, 1)
+        p = stored_pos[:, None, :]  # (B, 1, max_size)
+        causal = p <= q
+        in_window = p > (q - window)
+        mask = causal & in_window & valid_slot[:, None, :]  # (B, N, max_size)
+
+        # SDPA expects (B, 1, N, max_size).
+        return mask[:, None, :, :]
 
     def trim_per_stream(self, n_per_stream) -> None:
-        """Decrement per-stream offsets and compact the buffer if it
-        has grown past ``2 × max_size``. Called once per spec cycle
-        (after verify), not once per layer/step.
+        """Roll back per-stream LOGICAL offsets after a speculative cycle
+        rejects drafts. Called once per spec cycle (after verify), not per
+        layer/step.
 
-        Accepts either a Python int sequence (preferred — zero sync)
-        or an ``mx.array`` (falls back to ``.tolist()`` once per call,
-        which costs N_caches syncs/cycle when called from a 43-layer
-        model). Caller should hand in the Python list since the
-        rollback amounts are computed from per-stream Python ints.
+        With the fixed-size RING buffer there is nothing physical to trim:
+        the buffer is always ``max_size`` wide and rejected-draft slots are
+        simply overwritten by the next write at the same ring position. We
+        only decrement each stream's logical ``offset[b]`` (and the Python
+        parallel state) so the NEXT forward's RoPE position and ``make_mask``
+        window reflect the rolled-back position. The stale physical KV left
+        at rejected ring slots is excluded from attention by ``make_mask``
+        (its reconstructed ``stored_pos`` falls outside the post-rollback
+        causal window) and is overwritten on the next write.
 
-        Compaction drops physical positions ``[0, min(offset) - max_size)``,
-        which sit before every stream's sliding-window mask and are
-        therefore safe to discard. Without it the buffer grows linearly
-        with generation length and SDPA scans the full history per
-        step, defeating the sliding-window mask's window_size hint.
+        Accepts a Python int sequence (preferred — zero sync) or an
+        ``mx.array`` (``.tolist()`` once).
         """
         if isinstance(n_per_stream, mx.array):
             rollback = n_per_stream.tolist()
@@ -2626,30 +2713,16 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
             rollback = list(n_per_stream)
             n_per_stream_arr = mx.array(rollback, dtype=mx.int32)
 
-        # Update the GPU-side offset lazily — no sync.
+        # GPU-side per-stream offset rollback (no sync).
         self.offset = mx.maximum(
             mx.zeros_like(self.offset), self.offset - n_per_stream_arr
         )
-        # Update the Python-int parallel state in lockstep — pure
-        # Python arithmetic, no sync. Subsequent ``update_and_fetch``
-        # / ``make_mask`` calls read ``_per_stream_max`` and don't
-        # need to look at ``self.offset``.
+        # Python parallel state in lockstep.
         new_offsets = [max(0, o - r) for o, r in zip(self._offsets_py, rollback)]
         self._offsets_py = new_offsets
         self._per_stream_max = max(new_offsets)
         self._offset = self._per_stream_max
-
-        if self.keys is not None and self.keys.shape[2] > 2 * self.max_size:
-            min_off = min(new_offsets)
-            delta = min_off - self.max_size
-            if delta > 0:
-                self.keys = self.keys[:, :, delta:, :]
-                self.values = self.values[:, :, delta:, :]
-                self.offset = self.offset - delta
-                self._offsets_py = [o - delta for o in self._offsets_py]
-                self._per_stream_max -= delta
-                self._offset = self._per_stream_max
-                self._idx = self._per_stream_max
+        self._idx = self._per_stream_max % self.max_size
 
 
 class TokenBuffer:
