@@ -1682,6 +1682,49 @@ class BatchPoolingCache(_BaseCache):
             self._processed[i] -= n
         return n
 
+    def save_meta(self):
+        """Snapshot mutable pooling state for speculative rollback.
+
+        The c>=2 spec verify pushes gamma+1 draft tokens per stream through
+        accumulate_windows + update_and_fetch, which mutate buf_kv/buf_gate/
+        remainder/_processed and (on a window flush) pooled/_pool_lengths.
+        Rejected drafts must NOT leave their compressed summaries baked into
+        the long-range pool, or the sparse indexer retrieves contaminated
+        blocks → coherent-but-wrong output (e.g. needle miss at 100K) even
+        after the local rotating cache is rolled back per-stream.
+
+        buf_kv/buf_gate are materialized (copied) because accumulate_windows
+        slice-assigns into them in place. pooled is NOT copied: restore_meta
+        only rewinds _pool_lengths, and the next real flush overwrites the
+        rejected pooled slots via the slice-assign at update_and_fetch.
+        """
+        buf_kv = None if self.buf_kv is None else mx.array(self.buf_kv)
+        buf_gate = None if self.buf_gate is None else mx.array(self.buf_gate)
+        return (
+            list(self._pool_lengths),
+            list(self.remainder),
+            list(self._processed),
+            buf_kv,
+            buf_gate,
+        )
+
+    def restore_meta(self, snap):
+        """Rewind to a save_meta snapshot (speculative rollback).
+
+        Restores per-stream _pool_lengths/remainder/_processed and the
+        materialized buf_kv/buf_gate. pooled storage is left as-is — its
+        valid region is bounded by _pool_lengths (now rewound), so any
+        rejected-draft pooled entries beyond the rewound lengths become
+        invisible and are overwritten by the next genuine window flush.
+        """
+        pool_lengths, remainder, processed, buf_kv, buf_gate = snap
+        self._pool_lengths = list(pool_lengths)
+        self.remainder = list(remainder)
+        self._processed = list(processed)
+        if buf_kv is not None and self.buf_kv is not None:
+            self.buf_kv = buf_kv
+            self.buf_gate = buf_gate
+
     def size(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
 
