@@ -2521,6 +2521,12 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
       isn't re-implemented; convert to this class only AFTER prefill.
     """
 
+    # Extra physical ring slots beyond max_size. Must be >= the largest
+    # speculative verify length S (gamma+1). 8 covers gamma up to 7. The
+    # wide ring lets an L>1 verify's query rows each see a full max_size
+    # window without a new token clobbering a still-needed committed key.
+    _RING_SLACK: int = 8
+
     def _bootstrap_per_stream_ring(self) -> None:
         """Convert inherited base-``BatchRotatingKVCache`` ring state into
         this class's linear-compacted per-stream model.
@@ -2554,37 +2560,32 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         keeps the buffer near ``2*max_size`` thereafter).
         """
         max_size = self.max_size
+        ring_width = max_size + self._RING_SLACK
         abs_off = int(self._offset)
         valid = min(abs_off, max_size)
         B = self.offset.shape[0]
         if self.keys is not None:
             B = self.keys.shape[0]
-            # Buffer is temporal-ordered (oldest-first). Pad/realign so the
-            # physical buffer is exactly `max_size` wide with the `valid`
-            # real tokens occupying the LAST `valid` slots — i.e. logical
-            # position p lives at physical slot `p % max_size`. This is the
-            # ring layout the rewritten update_and_fetch / make_mask expect.
+            # Buffer is temporal-ordered (oldest-first). Lay the `valid` real
+            # tokens into a WIDE ring (max_size + slack) so logical position p
+            # lives at physical slot `p % ring_width`. The wide ring is what
+            # update_and_fetch / make_mask use (slack absorbs the L>1 verify's
+            # extra query rows without clobbering committed keys).
             self.keys = mx.contiguous(self.keys[..., :valid, :])
             self.values = mx.contiguous(self.values[..., :valid, :])
             Hk = self.keys.shape[1]
             Dk = self.keys.shape[3]
             Dv = self.values.shape[3]
-            # The most recent token is at logical position abs_off-1, which
-            # must sit at physical slot (abs_off-1) % max_size. Build a full
-            # max_size ring and place the `valid` temporal tokens so the ring
-            # head lands correctly.
-            ring_k = mx.zeros((B, Hk, max_size, Dk), dtype=self.keys.dtype)
-            ring_v = mx.zeros((B, Hk, max_size, Dv), dtype=self.values.dtype)
-            # Temporal token j (0..valid-1) maps to logical pos
-            # (abs_off - valid + j) → physical slot ((abs_off - valid + j) %
-            # max_size). Since valid<=max_size and they're contiguous, this
-            # is a single rolled placement.
-            start_slot = (abs_off - valid) % max_size
-            if start_slot + valid <= max_size:
+            ring_k = mx.zeros((B, Hk, ring_width, Dk), dtype=self.keys.dtype)
+            ring_v = mx.zeros((B, Hk, ring_width, Dv), dtype=self.values.dtype)
+            # Temporal token j (0..valid-1) → logical pos (abs_off - valid + j)
+            # → physical slot ((abs_off - valid + j) % ring_width).
+            start_slot = (abs_off - valid) % ring_width
+            if start_slot + valid <= ring_width:
                 ring_k[..., start_slot : start_slot + valid, :] = self.keys
                 ring_v[..., start_slot : start_slot + valid, :] = self.values
             else:
-                first = max_size - start_slot
+                first = ring_width - start_slot
                 ring_k[..., start_slot:, :] = self.keys[..., :first, :]
                 ring_v[..., start_slot:, :] = self.values[..., :first, :]
                 ring_k[..., : valid - first, :] = self.keys[..., first:, :]
@@ -2595,7 +2596,7 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         # needs the true position, NOT a rebased small value.
         self.offset = mx.full((B,), abs_off, dtype=mx.int32)
         self.left_padding = mx.zeros((B,), dtype=mx.int32)
-        self._idx = abs_off % max_size  # ring write head
+        self._idx = abs_off % ring_width  # ring write head
         self._offset = abs_off
         self._per_stream_max = abs_off
         self._offsets_py = [abs_off] * B
@@ -2639,67 +2640,49 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         if not hasattr(self, "_offsets_py"):
             self._offsets_py = [self._per_stream_max] * B
 
-        # Buffer layout. Physical width = max_size + (S-1). The last max_size
-        # committed tokens live in the RING region [0, max_size) addressed by
-        # ``pos % max_size``; the S new tokens of THIS forward are written to a
-        # NON-wrapping APPENDIX [max_size, max_size+S) so that, during an L=S>1
-        # verify, no committed in-window key is overwritten before the later
-        # query rows of the same forward attend to it.
-        #
-        # WHY: the prior fixed max_size ring wrote new verify tokens at
-        # (offset+j) % max_size, clobbering in-window committed keys that
-        # EARLIER query rows in the same (B,S) forward still needed → corrupted
-        # window → wrong verify logits → c>=2 needle miss (even local-window).
-        # Mirrors base BatchRotatingKVCache growing to max_size + S - 1 for L>1.
-        # S==1 decode keeps a pure max_size ring (appendix empty: the single
-        # new token wraps into the ring). S>1 verify uses an S-slot appendix.
-        appendix = 0 if S == 1 else S
-        want_buf = max_size + appendix
+        # WIDE RING buffer. Physical width = max_size + RING_SLACK (a small
+        # fixed slack >= the largest verify S, default 8). All writes — both
+        # L==1 decode and L>1 verify — are MODULAR over the WIDE ring at
+        # ``pos % ring_width``. Attention window stays max_size (enforced by
+        # make_mask), but the buffer physically retains the last
+        # ``max_size + RING_SLACK`` positions so an L=S>1 verify's multiple
+        # query rows each see their FULL max_size window without any new
+        # token overwriting a committed key still needed by an earlier row
+        # (the old max_size-only ring clobbered them → c>=2 needle miss once
+        # the ring had rotated). Committed verify tokens persist in the wide
+        # ring for future decodes — no appendix, no dual-write, no carry-
+        # forward gap.
+        ring_width = max_size + self._RING_SLACK
         cur_buf = 0 if self.keys is None else self.keys.shape[2]
         if self.keys is None:
-            self.keys = mx.zeros((B, n_kv_heads, want_buf, k_head_dim), keys.dtype)
-            self.values = mx.zeros((B, n_kv_heads, want_buf, v_head_dim), values.dtype)
-        elif cur_buf < want_buf:
-            grow_by = want_buf - cur_buf
-            new_k = mx.zeros((B, n_kv_heads, grow_by, k_head_dim), keys.dtype)
-            new_v = mx.zeros((B, n_kv_heads, grow_by, v_head_dim), values.dtype)
-            self.keys = mx.concatenate([self.keys, new_k], axis=2)
-            self.values = mx.concatenate([self.values, new_v], axis=2)
-        elif cur_buf > want_buf:
-            # Shrink back after a prior L>1 forward (decode is S==1).
-            self.keys = self.keys[..., :want_buf, :]
-            self.values = self.values[..., :want_buf, :]
+            self.keys = mx.zeros((B, n_kv_heads, ring_width, k_head_dim), keys.dtype)
+            self.values = mx.zeros((B, n_kv_heads, ring_width, v_head_dim), values.dtype)
+        elif cur_buf != ring_width:
+            # Re-shape to the canonical wide-ring width (e.g. after a swap-in
+            # bootstrap left a max_size-only buffer).
+            if cur_buf < ring_width:
+                grow_by = ring_width - cur_buf
+                new_k = mx.zeros((B, n_kv_heads, grow_by, k_head_dim), keys.dtype)
+                new_v = mx.zeros((B, n_kv_heads, grow_by, v_head_dim), values.dtype)
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys = self.keys[..., :ring_width, :]
+                self.values = self.values[..., :ring_width, :]
 
         offsets_arr = self.offset  # (B,) mx.int32, per-stream logical write base
-        # Always write the new tokens into the RING at their modular slots
-        # (offset+j) % max_size. For S==1 this is the only write. For S>1 the
-        # modular write may clobber a committed key that an EARLIER query row
-        # of THIS forward still needs — so we ALSO write the new tokens to a
-        # non-wrapping appendix [max_size, max_size+S) which make_mask routes
-        # this forward's reads to. The ring copies persist for FUTURE decodes
-        # (after the appendix is dropped); the appendix copies serve only the
-        # current verify forward. Writing both keeps both consistent.
         pos_offset_axis = mx.arange(S, dtype=offsets_arr.dtype)[None, None, :, None]
-        ring_phys = (offsets_arr[:, None, None, None] + pos_offset_axis) % max_size
+        ring_phys = (offsets_arr[:, None, None, None] + pos_offset_axis) % ring_width
         rk_idx = mx.broadcast_to(ring_phys, (B, n_kv_heads, S, k_head_dim))
         rv_idx = mx.broadcast_to(ring_phys, (B, n_kv_heads, S, v_head_dim))
         self.keys = mx.put_along_axis(self.keys, rk_idx, keys, axis=2)
         self.values = mx.put_along_axis(self.values, rv_idx, values, axis=2)
-        if S > 1:
-            app_phys = mx.broadcast_to(
-                (max_size + mx.arange(S, dtype=offsets_arr.dtype))[None, None, :, None],
-                (B, 1, S, 1),
-            )
-            ak_idx = mx.broadcast_to(app_phys, (B, n_kv_heads, S, k_head_dim))
-            av_idx = mx.broadcast_to(app_phys, (B, n_kv_heads, S, v_head_dim))
-            self.keys = mx.put_along_axis(self.keys, ak_idx, keys, axis=2)
-            self.values = mx.put_along_axis(self.values, av_idx, values, axis=2)
 
         # All streams advance uniformly by S on a write.
         self.offset = self.offset + S
         self._per_stream_max = self._per_stream_max + S
         self._offset = self._per_stream_max
-        self._idx = self._per_stream_max % max_size
+        self._idx = self._per_stream_max % ring_width
         self._offsets_py = [o + S for o in self._offsets_py]
 
         self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
@@ -2726,55 +2709,33 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         analogue of the base class's roll-based mask.
         """
         window = window_size or self.max_size
-        max_size = self.max_size
+        ring_width = self.max_size + self._RING_SLACK
         offset = self.offset  # (B,) absolute per-stream logical write base (pre-write)
 
-        # Buffer width matches update_and_fetch: ring [0,max_size) + appendix
-        # [max_size, max_size+N-1) for the N=S new tokens of THIS forward.
-        # The mask is built (model level) BEFORE the write but APPLIED after,
-        # so reconstruct each physical slot's stored logical position for the
-        # POST-write buffer:
-        #   ring slot s in [0,max_size): holds the committed token whose
-        #     logical pos p ≡ s (mod max_size) in [offset[b]-max_size, offset[b]).
-        #     (committed tokens are NOT overwritten by this forward — the new
-        #      tokens go to the appendix — so the retained window is the
-        #      pre-write last-max_size committed positions.)
-        #   appendix slot max_size+j (j in [0,N)): holds THIS forward's new
-        #     token at logical pos offset[b] + j.
-        # appendix slot count matches update_and_fetch: 0 for N==1 decode,
-        # N for N>1 verify.
-        appendix = 0 if N == 1 else N
-        ring_slots = mx.arange(max_size, dtype=offset.dtype)[None, :]  # (1,max_size)
-        if appendix > 0:
-            # Verify: ring holds the PRE-write committed window
-            # [offset-max_size, offset); the N new tokens live in the appendix.
-            ring_base = offset[:, None] - max_size
-            ring_pos = ring_base + ((ring_slots - ring_base) % max_size)
-            app_pos = offset[:, None] + mx.arange(
-                appendix, dtype=offset.dtype
-            )[None, :]  # (B, N) logical pos of appendix slots = the N new tokens
-            stored_pos = mx.concatenate([ring_pos, app_pos], axis=1)  # (B, max_size+N)
-        else:
-            # Decode (N==1): the new token was written into the ring at slot
-            # offset%max_size, so the POST-write ring holds
-            # [offset-max_size+1, offset]. Reconstruct against the post-write
-            # high-water mark (offset+1) so the new token at `offset` counts.
-            hi = offset[:, None] + 1
-            ring_base = hi - max_size  # offset - max_size + 1
-            ring_pos = ring_base + ((ring_slots - ring_base) % max_size)
-            stored_pos = ring_pos  # (B, max_size)
-        valid_slot = stored_pos >= 0
+        # Mask built BEFORE the per-layer update_and_fetch writes this
+        # forward's N new tokens, APPLIED after (SDPA post-write). Reconstruct
+        # each slot's POST-write stored logical position: the buffer holds
+        # positions [hi-ring_width, hi) where hi = offset+N, slot s holding the
+        # unique p in that range with p % ring_width == s. The wide ring
+        # (max_size + RING_SLACK) guarantees every committed in-window key for
+        # every query row survives — the N new tokens occupy only the extra
+        # slack slots, never overwriting a still-needed committed key.
+        hi = offset[:, None] + N  # (B,1) exclusive upper bound after the write
+        slots = mx.arange(ring_width, dtype=offset.dtype)[None, :]  # (1, ring_width)
+        base = hi - ring_width  # (B,1) lowest retained position
+        stored_pos = base + ((slots - base) % ring_width)  # (B, ring_width)
+        valid_slot = stored_pos >= 0  # slots holding no real token yet
 
         # Query logical positions: (B, N) = offset[b] + i, i in [0, N).
         qpos = offset[:, None] + mx.arange(N, dtype=offset.dtype)[None, :]  # (B, N)
 
         q = qpos[:, :, None]  # (B, N, 1)
-        p = stored_pos[:, None, :]  # (B, 1, W)
+        p = stored_pos[:, None, :]  # (B, 1, ring_width)
         causal = p <= q
         in_window = p > (q - window)
-        mask = causal & in_window & valid_slot[:, None, :]  # (B, N, W)
+        mask = causal & in_window & valid_slot[:, None, :]  # (B, N, ring_width)
 
-        # SDPA expects (B, 1, N, W).
+        # SDPA expects (B, 1, N, ring_width).
         return mask[:, None, :, :]
 
     def trim_per_stream(self, n_per_stream) -> None:
