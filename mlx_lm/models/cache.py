@@ -2639,35 +2639,61 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         if not hasattr(self, "_offsets_py"):
             self._offsets_py = [self._per_stream_max] * B
 
-        # Fixed-size RING buffer (width == max_size). Stream b's token at
-        # logical position p lives at physical slot ``p % max_size``. This
-        # replaces the old linear-growing buffer which (a) needed an
-        # offset-wide buffer — impossible at 100K — and (b) broke entirely
-        # when class-swapped onto a base ring after a long prefill (the
-        # c>=2 100K BOS-spam bug). All streams share one physical ring; they
-        # differ only in per-stream logical ``offset[b]`` (RoPE position),
-        # which stays ABSOLUTE so LocalAttention's RoPE is correct.
+        # Buffer layout. Physical width = max_size + (S-1). The last max_size
+        # committed tokens live in the RING region [0, max_size) addressed by
+        # ``pos % max_size``; the S new tokens of THIS forward are written to a
+        # NON-wrapping APPENDIX [max_size, max_size+S) so that, during an L=S>1
+        # verify, no committed in-window key is overwritten before the later
+        # query rows of the same forward attend to it.
+        #
+        # WHY: the prior fixed max_size ring wrote new verify tokens at
+        # (offset+j) % max_size, clobbering in-window committed keys that
+        # EARLIER query rows in the same (B,S) forward still needed → corrupted
+        # window → wrong verify logits → c>=2 needle miss (even local-window).
+        # Mirrors base BatchRotatingKVCache growing to max_size + S - 1 for L>1.
+        # S==1 decode keeps a pure max_size ring (appendix empty: the single
+        # new token wraps into the ring). S>1 verify uses an S-slot appendix.
+        appendix = 0 if S == 1 else S
+        want_buf = max_size + appendix
         cur_buf = 0 if self.keys is None else self.keys.shape[2]
-        if cur_buf < max_size:
-            grow_by = max_size - cur_buf
+        if self.keys is None:
+            self.keys = mx.zeros((B, n_kv_heads, want_buf, k_head_dim), keys.dtype)
+            self.values = mx.zeros((B, n_kv_heads, want_buf, v_head_dim), values.dtype)
+        elif cur_buf < want_buf:
+            grow_by = want_buf - cur_buf
             new_k = mx.zeros((B, n_kv_heads, grow_by, k_head_dim), keys.dtype)
             new_v = mx.zeros((B, n_kv_heads, grow_by, v_head_dim), values.dtype)
-            if self.keys is not None:
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                self.values = mx.concatenate([self.values, new_v], axis=2)
-            else:
-                self.keys, self.values = new_k, new_v
+            self.keys = mx.concatenate([self.keys, new_k], axis=2)
+            self.values = mx.concatenate([self.values, new_v], axis=2)
+        elif cur_buf > want_buf:
+            # Shrink back after a prior L>1 forward (decode is S==1).
+            self.keys = self.keys[..., :want_buf, :]
+            self.values = self.values[..., :want_buf, :]
 
-        # Per-stream physical writes via vectorized scatter, modular into
-        # the ring. Write position for stream b, sub-token j is
-        # ``(offset[b] + j) % max_size``.
         offsets_arr = self.offset  # (B,) mx.int32, per-stream logical write base
-        pos_offset = mx.arange(S, dtype=offsets_arr.dtype)[None, None, :, None]
-        ring_pos = (offsets_arr[:, None, None, None] + pos_offset) % max_size
-        k_indices = mx.broadcast_to(ring_pos, (B, n_kv_heads, S, k_head_dim))
-        v_indices = mx.broadcast_to(ring_pos, (B, n_kv_heads, S, v_head_dim))
-        self.keys = mx.put_along_axis(self.keys, k_indices, keys, axis=2)
-        self.values = mx.put_along_axis(self.values, v_indices, values, axis=2)
+        # Always write the new tokens into the RING at their modular slots
+        # (offset+j) % max_size. For S==1 this is the only write. For S>1 the
+        # modular write may clobber a committed key that an EARLIER query row
+        # of THIS forward still needs — so we ALSO write the new tokens to a
+        # non-wrapping appendix [max_size, max_size+S) which make_mask routes
+        # this forward's reads to. The ring copies persist for FUTURE decodes
+        # (after the appendix is dropped); the appendix copies serve only the
+        # current verify forward. Writing both keeps both consistent.
+        pos_offset_axis = mx.arange(S, dtype=offsets_arr.dtype)[None, None, :, None]
+        ring_phys = (offsets_arr[:, None, None, None] + pos_offset_axis) % max_size
+        rk_idx = mx.broadcast_to(ring_phys, (B, n_kv_heads, S, k_head_dim))
+        rv_idx = mx.broadcast_to(ring_phys, (B, n_kv_heads, S, v_head_dim))
+        self.keys = mx.put_along_axis(self.keys, rk_idx, keys, axis=2)
+        self.values = mx.put_along_axis(self.values, rv_idx, values, axis=2)
+        if S > 1:
+            app_phys = mx.broadcast_to(
+                (max_size + mx.arange(S, dtype=offsets_arr.dtype))[None, None, :, None],
+                (B, 1, S, 1),
+            )
+            ak_idx = mx.broadcast_to(app_phys, (B, n_kv_heads, S, k_head_dim))
+            av_idx = mx.broadcast_to(app_phys, (B, n_kv_heads, S, v_head_dim))
+            self.keys = mx.put_along_axis(self.keys, ak_idx, keys, axis=2)
+            self.values = mx.put_along_axis(self.values, av_idx, values, axis=2)
 
         # All streams advance uniformly by S on a write.
         self.offset = self.offset + S
@@ -2678,7 +2704,7 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
 
         self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
 
-        # Return the FULL ring; make_mask gates which slots are valid.
+        # Return the full buffer; make_mask gates which slots are valid.
         return self.keys, self.values
 
     def make_mask(
@@ -2701,34 +2727,54 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         """
         window = window_size or self.max_size
         max_size = self.max_size
-        offset = self.offset  # (B,) absolute per-stream logical write base
+        offset = self.offset  # (B,) absolute per-stream logical write base (pre-write)
 
-        # IMPORTANT ordering: the attention mask is built at the model level
-        # BEFORE the per-layer update_and_fetch writes this forward's N new
-        # tokens. But the mask is APPLIED to the post-write ring (SDPA runs
-        # after the write). After writing, stream b's ring holds logical
-        # positions [offset[b] + N - max_size, offset[b] + N), with slot s
-        # holding the unique position p in that half-open range with
-        # p % max_size == s. So reconstruct stored_pos against the POST-write
-        # high-water mark (offset[b] + N).
-        hi = offset[:, None] + N  # (B, 1) exclusive upper bound after write
-        slots = mx.arange(max_size, dtype=offset.dtype)[None, :]  # (1, max_size)
-        base = hi - max_size  # (B, 1) lowest retained position
-        # p(s) is the unique value in [base, base+max_size) ≡ s (mod max_size).
-        stored_pos = base + ((slots - base) % max_size)  # (B, max_size)
-        valid_slot = stored_pos >= 0  # slots holding no real token yet
+        # Buffer width matches update_and_fetch: ring [0,max_size) + appendix
+        # [max_size, max_size+N-1) for the N=S new tokens of THIS forward.
+        # The mask is built (model level) BEFORE the write but APPLIED after,
+        # so reconstruct each physical slot's stored logical position for the
+        # POST-write buffer:
+        #   ring slot s in [0,max_size): holds the committed token whose
+        #     logical pos p ≡ s (mod max_size) in [offset[b]-max_size, offset[b]).
+        #     (committed tokens are NOT overwritten by this forward — the new
+        #      tokens go to the appendix — so the retained window is the
+        #      pre-write last-max_size committed positions.)
+        #   appendix slot max_size+j (j in [0,N)): holds THIS forward's new
+        #     token at logical pos offset[b] + j.
+        # appendix slot count matches update_and_fetch: 0 for N==1 decode,
+        # N for N>1 verify.
+        appendix = 0 if N == 1 else N
+        ring_slots = mx.arange(max_size, dtype=offset.dtype)[None, :]  # (1,max_size)
+        if appendix > 0:
+            # Verify: ring holds the PRE-write committed window
+            # [offset-max_size, offset); the N new tokens live in the appendix.
+            ring_base = offset[:, None] - max_size
+            ring_pos = ring_base + ((ring_slots - ring_base) % max_size)
+            app_pos = offset[:, None] + mx.arange(
+                appendix, dtype=offset.dtype
+            )[None, :]  # (B, N) logical pos of appendix slots = the N new tokens
+            stored_pos = mx.concatenate([ring_pos, app_pos], axis=1)  # (B, max_size+N)
+        else:
+            # Decode (N==1): the new token was written into the ring at slot
+            # offset%max_size, so the POST-write ring holds
+            # [offset-max_size+1, offset]. Reconstruct against the post-write
+            # high-water mark (offset+1) so the new token at `offset` counts.
+            hi = offset[:, None] + 1
+            ring_base = hi - max_size  # offset - max_size + 1
+            ring_pos = ring_base + ((ring_slots - ring_base) % max_size)
+            stored_pos = ring_pos  # (B, max_size)
+        valid_slot = stored_pos >= 0
 
         # Query logical positions: (B, N) = offset[b] + i, i in [0, N).
         qpos = offset[:, None] + mx.arange(N, dtype=offset.dtype)[None, :]  # (B, N)
 
-        # Broadcast to (B, N, max_size): query i vs slot s.
         q = qpos[:, :, None]  # (B, N, 1)
-        p = stored_pos[:, None, :]  # (B, 1, max_size)
+        p = stored_pos[:, None, :]  # (B, 1, W)
         causal = p <= q
         in_window = p > (q - window)
-        mask = causal & in_window & valid_slot[:, None, :]  # (B, N, max_size)
+        mask = causal & in_window & valid_slot[:, None, :]  # (B, N, W)
 
-        # SDPA expects (B, 1, N, max_size).
+        # SDPA expects (B, 1, N, W).
         return mask[:, None, :, :]
 
     def trim_per_stream(self, n_per_stream) -> None:
