@@ -2133,10 +2133,10 @@ class CompressedAttention(nn.Module):
                     # for layer_idx 0-of-sparse only, first few calls.
                     if (
                         _topk_os.environ.get("EXO_DSV4_VERIFY_DIAG") == "1"
-                        and 1 < L <= 4
+                        and L <= 4
                         and B > 1
                         and pooled.shape[1] > 0
-                        and getattr(CompressedAttention, "_vdiag_n", 0) < 8
+                        and getattr(CompressedAttention, "_vdiag_n", 0) < 16
                     ):
                         CompressedAttention._vdiag_n = (
                             getattr(CompressedAttention, "_vdiag_n", 0) + 1
