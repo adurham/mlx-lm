@@ -1098,6 +1098,14 @@ class CacheList(_BaseCache):
         return obj
 
 
+# Max query length L at which a PoolingCache/BatchPoolingCache make_mask call
+# is treated as a DECODE-time speculative VERIFY (all valid pooled blocks
+# causal) rather than a PREFILL chunk (per-query causal over pooled blocks).
+# gamma+1 verify is tiny (<=~8); prefill chunks are EXO_PREFILL_STEP_SIZE
+# (128/4096). 16 cleanly separates them. See BatchPoolingCache.make_mask.
+_POOL_VERIFY_MAX_L = 16
+
+
 class PoolingCache(_BaseCache):
     """Cache for pooled (compressed) KV tokens with a remainder buffer.
 
@@ -1335,6 +1343,14 @@ class PoolingCache(_BaseCache):
         is visible to every query (common during decode).
         """
         if self.pooled is None or L == 1:
+            return None
+
+        # Tiny L == decode-time speculative VERIFY: all query tokens sit at the
+        # generation frontier, after every pooled block, so all are causal.
+        # Only large-L prefill chunks need per-query causal masking. (Mirrors
+        # BatchPoolingCache.make_mask; guards against a windowed/stale offset
+        # over-restricting the pooled causal cutoff.) See _POOL_VERIFY_MAX_L.
+        if L <= _POOL_VERIFY_MAX_L:
             return None
 
         pool_idx = mx.arange(self.pooled.shape[1])
@@ -1646,7 +1662,25 @@ class BatchPoolingCache(_BaseCache):
                 return None
             return valid
 
-        # Prompt so we need to combine with causal
+        # L>1. Two callers reach here:
+        #   (a) PREFILL chunk: the L query tokens (L == prefill_step_size, e.g.
+        #       128/4096) span absolute positions [offset, offset+L) within the
+        #       growing context; `offset` is the large correct chunk start, so
+        #       pooled blocks must be causal-masked per query position.
+        #   (b) SPECULATIVE VERIFY at decode: L == gamma+1 (tiny, <= ~8) query
+        #       tokens all sit at the GENERATION FRONTIER, strictly AFTER every
+        #       pooled block, so ALL `valid` pooled blocks are causal (same as
+        #       the L==1 decode case). CRUCIALLY the per-stream local sliding-
+        #       window cache passes its WINDOWED offset (e.g. 131) here, not the
+        #       absolute token position — feeding that into the causal cutoff
+        #       (query_pos//ratio) wrongly leaves only ~1 pooled block visible
+        #       → the long-range needle is masked out → c>=2 spec needle miss.
+        # The verify's tiny L is the reliable discriminator (prefill chunks are
+        # >> gamma+1). For the verify, every valid pooled block precedes the
+        # frontier queries, so return the length-only `valid` mask.
+        if L <= _POOL_VERIFY_MAX_L:
+            return valid
+
         if isinstance(offset, mx.array):
             query_pos = offset[:, None] + mx.arange(1, L + 1)
         else:
