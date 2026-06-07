@@ -1057,22 +1057,32 @@ def _sparse_pooled_attention(
             sinks=sinks,
         )
 
-    # L_q>1 fallback (e.g. MTP-on verify pass): use inner kernel as before
-    idx = topk[:, None, :, :, None]
-    pooled_gathered = mx.take_along_axis(
-        mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
-        mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
-        axis=3,
-    )
-    sinks_expanded = sinks[None, :, None, None] if sinks is not None else None
-    return _sparse_pooled_attention_inner(
-        q * scale,
-        local_kv,
-        pooled_gathered,
-        local_mask,
-        pooled_mask,
-        sinks_expanded,
-    )
+    # L_q>1 (MTP-on speculative VERIFY): each query position has its OWN
+    # top-k-gathered pooled K/V, so a single fused SDPA can't express it.
+    # The legacy fallback (_sparse_pooled_attention_inner, hand-rolled
+    # split-softmax) accumulates in bf16 and is ~3x LESS accurate than the
+    # fused fp32 SDPA (max abs diff vs fp32 ref 0.012 vs 0.004 — see the
+    # L_q==1 docstring above). Across the 21 sparse layers that ~0.012/token
+    # error compounds into a ~0.6-logit shift at the verify, enough to flip
+    # near-tie final tokens (e.g. EOS vs the real next token) → c>=2 spec
+    # drops/over-stops the last token vs the bit-correct non-spec batched
+    # decode. Fix: run each of the L (== gamma+1, tiny) query positions
+    # through the SAME accurate fused L_q==1 path and stack — every verify
+    # query now gets fp32-accurate attention, matching the decode path.
+    outs = []
+    for li in range(L):
+        out_l = _sparse_pooled_attention(
+            q[:, :, li : li + 1, :],
+            local_kv,
+            pooled,
+            topk[:, li : li + 1, :],
+            None if local_mask is None else local_mask[:, :, li : li + 1, :],
+            None if pooled_mask is None else pooled_mask[:, :, li : li + 1, :],
+            scale,
+            sinks,
+        )
+        outs.append(out_l)
+    return mx.concatenate(outs, axis=2)
 
 
 class MoEGate(nn.Module):
