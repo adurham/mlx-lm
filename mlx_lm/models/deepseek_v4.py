@@ -2127,6 +2127,43 @@ class CompressedAttention(nn.Module):
                 if "compressed_attn" in _get_nop_targets():
                     out = mx.zeros(q.shape, dtype=q.dtype)
                 else:
+                    # DIAG (EXO_DSV4_VERIFY_DIAG=1): at the L>1 B>1 verify, dump
+                    # per-query attention-mass on the POOLED region vs LOCAL to
+                    # localize the c>=2 verify retrieval bug. Recomputes scores
+                    # for layer_idx 0-of-sparse only, first few calls.
+                    if (
+                        _topk_os.environ.get("EXO_DSV4_VERIFY_DIAG") == "1"
+                        and L > 1
+                        and pooled.shape[1] > 0
+                        and getattr(CompressedAttention, "_vdiag_n", 0) < 6
+                    ):
+                        CompressedAttention._vdiag_n = (
+                            getattr(CompressedAttention, "_vdiag_n", 0) + 1
+                        )
+                        try:
+                            import os as _vos
+                            local_w = kv.shape[2] - pooled.shape[1]
+                            sc = (q.astype(mx.float32) @ kv.astype(mx.float32).swapaxes(-1, -2)) * self.scale
+                            if mask is not None:
+                                mb = mask
+                                if mb.ndim == 4:
+                                    sc = mx.where(mb, sc, mx.array(-1e9, mx.float32))
+                            w = mx.softmax(sc, axis=-1)  # (B,H,L,kv)
+                            pool_mass = w[..., local_w:].sum(axis=-1).mean(axis=1)  # (B,L)
+                            loc_mass = w[..., :local_w].sum(axis=-1).mean(axis=1)
+                            with open(f"/tmp/dsv4_verify_diag_pid{_vos.getpid()}.log", "a") as _vf:
+                                _vf.write(
+                                    f"layer={self.layer_idx} B={B} L={L} local_w={local_w} "
+                                    f"pooled={pooled.shape[1]} "
+                                    f"pool_mass={pool_mass.tolist()} loc_mass={loc_mass.tolist()}\n"
+                                )
+                        except Exception as _ve:
+                            try:
+                                import os as _vos2
+                                with open(f"/tmp/dsv4_verify_diag_pid{_vos2.getpid()}.log", "a") as _vf2:
+                                    _vf2.write(f"VDIAG_ERR: {_ve}\n")
+                            except Exception:
+                                pass
                     out = finalize(
                         scaled_dot_product_attention(
                             q,
