@@ -2144,19 +2144,23 @@ class CompressedAttention(nn.Module):
                         try:
                             import os as _vos
                             local_w = kv.shape[2] - pooled.shape[1]
-                            sc = (q.astype(mx.float32) @ kv.astype(mx.float32).swapaxes(-1, -2)) * self.scale
-                            if mask is not None:
-                                mb = mask
-                                if mb.ndim == 4:
-                                    sc = mx.where(mb, sc, mx.array(-1e9, mx.float32))
-                            w = mx.softmax(sc, axis=-1)  # (B,H,L,kv)
-                            pool_mass = w[..., local_w:].sum(axis=-1).mean(axis=1)  # (B,L)
+                            sc_raw = (q.astype(mx.float32) @ kv.astype(mx.float32).swapaxes(-1, -2)) * self.scale
+                            # Raw (pre-mask) max scores: local vs pooled region.
+                            raw_loc_max = sc_raw[..., :local_w].max(axis=-1).mean(axis=1)  # (B,L)
+                            raw_pool_max = sc_raw[..., local_w:].max(axis=-1).mean(axis=1)
+                            sc = sc_raw
+                            if mask is not None and mask.ndim == 4:
+                                sc = mx.where(mask, sc, mx.array(-1e9, mx.float32))
+                            w = mx.softmax(sc, axis=-1)
+                            pool_mass = w[..., local_w:].sum(axis=-1).mean(axis=1)
                             loc_mass = w[..., :local_w].sum(axis=-1).mean(axis=1)
                             with open(f"/tmp/dsv4_verify_diag_pid{_vos.getpid()}.log", "a") as _vf:
                                 _vf.write(
                                     f"layer={self.layer_idx} B={B} L={L} local_w={local_w} "
                                     f"pooled={pooled.shape[1]} "
-                                    f"pool_mass={pool_mass.tolist()} loc_mass={loc_mass.tolist()}\n"
+                                    f"pool_mass={pool_mass.tolist()} "
+                                    f"raw_loc_max={raw_loc_max.tolist()} "
+                                    f"raw_pool_max={raw_pool_max.tolist()}\n"
                                 )
                         except Exception as _ve:
                             try:
