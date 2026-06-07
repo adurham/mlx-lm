@@ -2171,7 +2171,11 @@ class CompressedAttention(nn.Module):
                                     f"raw_loc_max={raw_loc_max.tolist()} "
                                     f"raw_pool_max={raw_pool_max.tolist()} "
                                     f"raw_pool_mean={raw_pool_mean.tolist()} "
-                                    f"unmasked_pool={unmasked_pool.tolist()}\n"
+                                    f"unmasked_pool={unmasked_pool.tolist()} "
+                                    f"offset={offset.tolist() if hasattr(offset,'tolist') else offset} "
+                                    f"pmask_sum={(pooled_mask.astype(mx.int32).sum().item() if pooled_mask is not None else -1)} "
+                                    f"pmask_shape={tuple(pooled_mask.shape) if pooled_mask is not None else None} "
+                                    f"pool_lengths={getattr(pool_cache,'_pool_lengths',None)}\n"
                                 )
                         except Exception as _ve:
                             try:
