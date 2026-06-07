@@ -2127,63 +2127,6 @@ class CompressedAttention(nn.Module):
                 if "compressed_attn" in _get_nop_targets():
                     out = mx.zeros(q.shape, dtype=q.dtype)
                 else:
-                    # DIAG (EXO_DSV4_VERIFY_DIAG=1): at the L>1 B>1 verify, dump
-                    # per-query attention-mass on the POOLED region vs LOCAL to
-                    # localize the c>=2 verify retrieval bug. Recomputes scores
-                    # for layer_idx 0-of-sparse only, first few calls.
-                    if (
-                        _topk_os.environ.get("EXO_DSV4_VERIFY_DIAG") == "1"
-                        and 1 < L <= 4
-                        and B > 1
-                        and pooled.shape[1] > 0
-                        and getattr(CompressedAttention, "_vdiag_n", 0) < 40
-                    ):
-                        CompressedAttention._vdiag_n = (
-                            getattr(CompressedAttention, "_vdiag_n", 0) + 1
-                        )
-                        try:
-                            import os as _vos
-                            local_w = kv.shape[2] - pooled.shape[1]
-                            sc_raw = (q.astype(mx.float32) @ kv.astype(mx.float32).swapaxes(-1, -2)) * self.scale
-                            # Raw (pre-mask) max scores: local vs pooled region.
-                            raw_loc_max = sc_raw[..., :local_w].max(axis=-1).mean(axis=1)  # (B,L)
-                            raw_pool_max = sc_raw[..., local_w:].max(axis=-1).mean(axis=1)
-                            # mean pooled raw score (not just max) — distinguishes
-                            # "few high + many low" from "all low".
-                            raw_pool_mean = sc_raw[..., local_w:].mean(axis=-1).mean(axis=1)
-                            # count unmasked pooled entries per query (B,L)
-                            if mask is not None and mask.ndim == 4:
-                                m_pool = mask[..., local_w:]  # (B,1or H,L,P)
-                                unmasked_pool = m_pool.astype(mx.int32).sum(axis=-1)
-                                unmasked_pool = unmasked_pool.reshape(B, -1)[:, :L]
-                            else:
-                                unmasked_pool = mx.full((B, L), pooled.shape[1], dtype=mx.int32)
-                            sc = sc_raw
-                            if mask is not None and mask.ndim == 4:
-                                sc = mx.where(mask, sc, mx.array(-1e9, mx.float32))
-                            w = mx.softmax(sc, axis=-1)
-                            pool_mass = w[..., local_w:].sum(axis=-1).mean(axis=1)
-                            with open(f"/tmp/dsv4_verify_diag_pid{_vos.getpid()}.log", "a") as _vf:
-                                _vf.write(
-                                    f"layer={self.layer_idx} B={B} L={L} local_w={local_w} "
-                                    f"pooled={pooled.shape[1]} "
-                                    f"pool_mass={pool_mass.tolist()} "
-                                    f"raw_loc_max={raw_loc_max.tolist()} "
-                                    f"raw_pool_max={raw_pool_max.tolist()} "
-                                    f"raw_pool_mean={raw_pool_mean.tolist()} "
-                                    f"unmasked_pool={unmasked_pool.tolist()} "
-                                    f"offset={offset.tolist() if hasattr(offset,'tolist') else offset} "
-                                    f"pmask_sum={(pooled_mask.astype(mx.int32).sum().item() if pooled_mask is not None else -1)} "
-                                    f"pmask_shape={tuple(pooled_mask.shape) if pooled_mask is not None else None} "
-                                    f"pool_lengths={getattr(pool_cache,'_pool_lengths',None)}\n"
-                                )
-                        except Exception as _ve:
-                            try:
-                                import os as _vos2
-                                with open(f"/tmp/dsv4_verify_diag_pid{_vos2.getpid()}.log", "a") as _vf2:
-                                    _vf2.write(f"VDIAG_ERR: {_ve}\n")
-                            except Exception:
-                                pass
                     out = finalize(
                         scaled_dot_product_attention(
                             q,

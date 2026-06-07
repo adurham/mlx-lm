@@ -1677,8 +1677,12 @@ class BatchPoolingCache(_BaseCache):
         #       → the long-range needle is masked out → c>=2 spec needle miss.
         # The verify's tiny L is the reliable discriminator (prefill chunks are
         # >> gamma+1). For the verify, every valid pooled block precedes the
-        # frontier queries, so return the length-only `valid` mask.
+        # frontier queries — identical to the L==1 decode case, so mirror it
+        # exactly (None when fully valid, else the length-only mask) to keep
+        # the verify's SDPA numerics bit-identical to the working decode path.
         if L <= _POOL_VERIFY_MAX_L:
+            if all(pl == P for pl in self._pool_lengths):
+                return None
             return valid
 
         if isinstance(offset, mx.array):
