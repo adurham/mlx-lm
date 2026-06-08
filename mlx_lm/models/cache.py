@@ -885,15 +885,19 @@ class ArraysCache(_BaseCache):
             if b is None:
                 b = mx.zeros((b_batch,) + shape[1:], dtype=dtype)
 
-            if os.environ.get("EXO_ARRAYSCACHE_DIAG") == "1" and a.ndim != b.ndim:
-                import sys as _sys
-                print(
-                    f"[ARRAYSCACHE_DIAG] ndim mismatch in extend.cat: "
-                    f"a.shape={a.shape} b.shape={b.shape} "
-                    f"a_batch={a_batch} b_batch={b_batch}",
-                    file=_sys.stderr,
-                    flush=True,
-                )
+            # Normalize rank before concat. Observed 2026-06-07 with the Qwen
+            # MTP batched-spec path: one stream's cache entry can be stored
+            # WITHOUT the leading batch dim (e.g. a=(16,128,128)) while the
+            # other has it (b=(1,16,128,128)), so concatenate on axis 0 fails
+            # with "arrays with dimensions 3 and 4". When the ranks differ by
+            # one and the lower-rank array matches the higher-rank's trailing
+            # dims, it is simply missing a batch axis of size 1 — add it so the
+            # batch concat is well-defined. (Both sides are per-stream here.)
+            if a.ndim != b.ndim:
+                if a.ndim == b.ndim - 1 and tuple(a.shape) == tuple(b.shape[1:]):
+                    a = a[None]
+                elif b.ndim == a.ndim - 1 and tuple(b.shape) == tuple(a.shape[1:]):
+                    b = b[None]
             return mx.concatenate([a, b])
 
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
