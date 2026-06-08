@@ -644,11 +644,22 @@ class RotatingKVCache(_BaseCache):
         # keep growing the cache
         B, n_kv_heads, S, k_head_dim = keys.shape
         prev = self.offset
-        if self.keys is None or (
-            prev >= self.keys.shape[2] and self.keys.shape[2] < self.max_size
+        # `new_size` must be clamped to >= 0. When this cache is used for the
+        # MTP speculative draft, spec rollback (trim of rejected drafts) can
+        # leave `offset` (prev) at or beyond `max_size` while the physical
+        # buffer is still shorter than max_size — making `max_size - prev`
+        # NEGATIVE and `mx.zeros((..., neg, ...))` raise "Negative dimensions
+        # not allowed", crashing the DSv4 runner on long generations. Only
+        # grow when there is genuine headroom (prev < max_size); otherwise the
+        # buffer is already in steady-state rotation and the trim/rotate path
+        # below handles placement. (2026-06-07)
+        grow_room = self.max_size - prev
+        if grow_room > 0 and (
+            self.keys is None
+            or (prev >= self.keys.shape[2] and self.keys.shape[2] < self.max_size)
         ):
             v_head_dim = values.shape[3]
-            new_size = min(self.step, self.max_size - prev)
+            new_size = min(self.step, grow_room)
             k_shape = (B, n_kv_heads, new_size, k_head_dim)
             v_shape = (B, n_kv_heads, new_size, v_head_dim)
             new_k = mx.zeros(k_shape, keys.dtype)
@@ -659,6 +670,18 @@ class RotatingKVCache(_BaseCache):
             else:
                 self.keys, self.values = new_k, new_v
             self._idx = prev
+        elif self.keys is None:
+            # Degenerate: no headroom yet no buffer (prev >= max_size on a
+            # fresh cache). Allocate a full max_size buffer so the rotate/
+            # assign path has somewhere to write.
+            v_head_dim = values.shape[3]
+            self.keys = mx.zeros(
+                (B, n_kv_heads, self.max_size, k_head_dim), keys.dtype
+            )
+            self.values = mx.zeros(
+                (B, n_kv_heads, self.max_size, v_head_dim), values.dtype
+            )
+            self._idx = min(prev, self.max_size)
 
         # Trim if needed
         trim_size = self.keys.shape[2] - self.max_size
