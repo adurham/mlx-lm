@@ -885,6 +885,15 @@ class ArraysCache(_BaseCache):
             if b is None:
                 b = mx.zeros((b_batch,) + shape[1:], dtype=dtype)
 
+            if os.environ.get("EXO_ARRAYSCACHE_DIAG") == "1" and a.ndim != b.ndim:
+                import sys as _sys
+                print(
+                    f"[ARRAYSCACHE_DIAG] ndim mismatch in extend.cat: "
+                    f"a.shape={a.shape} b.shape={b.shape} "
+                    f"a_batch={a_batch} b_batch={b_batch}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
             return mx.concatenate([a, b])
 
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
