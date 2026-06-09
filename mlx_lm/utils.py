@@ -408,8 +408,29 @@ def load_model(
                 # Merge per-key overrides only (skip top-level
                 # group_size/bits/mode — those stay from the loaded
                 # config so we don't regress non-DSv4 logic).
+                #
+                # make_quantization_config() hardcodes the upstream FP
+                # packing (mxfp4 experts / mxfp8 attention+shared+MTP).
+                # That is correct ONLY for the mxfp-format checkpoints
+                # (e.g. the older mlx-community DSv4 quant that bundled an
+                # MTP shard). The canonical mlx-community/DeepSeek-V4-Flash
+                # repo ships UNIFORM affine 8-bit (group_size=64, bf16
+                # scales). Forcing mode=mxfp8 onto an affine layer makes
+                # mx.quantized_matmul demand uint8 scales and crash with
+                # "Scale type must be uint8 but received type bfloat16".
+                # So only apply an mxfp* override when the checkpoint's
+                # ACTUAL stored scales for that layer are uint8 (the mxfp4/
+                # mxfp8 packing). Affine layers keep bf16/fp16/fp32 scales
+                # and are already covered by the top-level affine config.
+                def _is_mxfp_override(key, override):
+                    if override.get("mode") not in ("mxfp4", "mxfp8"):
+                        return True  # non-mxfp override, apply unconditionally
+                    scales = weights.get(f"{key}.scales")
+                    # Only keep the mxfp override if the on-disk scales are
+                    # uint8 (true mxfp packing). bf16/fp16/fp32 -> affine.
+                    return scales is not None and scales.dtype == mx.uint8
                 for k, v in dsv4_cfg.items():
-                    if isinstance(v, dict):
+                    if isinstance(v, dict) and _is_mxfp_override(k, v):
                         config["quantization"].setdefault(k, v)
             except Exception:
                 # Best-effort — never block loading on this.
