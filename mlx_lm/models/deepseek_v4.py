@@ -1079,6 +1079,16 @@ def _sparse_pooled_attention(
     # 4096) keep the batched inner kernel (looping hundreds of fused SDPAs
     # would be catastrophically slow, and prefill accuracy isn't tie-critical).
     if L <= _SPARSE_VERIFY_MAX_L:
+        # _DSV4_PREFILL_MASK_FIX: a small PREFILL remainder chunk (1<L<=16)
+        # reaches this branch with a 2-D (L,S) causal mask, but the per-
+        # position slicing below assumes a 4-D mask (verify tree mask).
+        # Normalize 2-D masks to 4-D so prefill chunks no longer crash with
+        # 'Too many indices for array with 2 dimensions'. Verify passes
+        # already supply 4-D/None masks and are unaffected.
+        if local_mask is not None and local_mask.ndim == 2:
+            local_mask = local_mask[None, None]
+        if pooled_mask is not None and pooled_mask.ndim == 2:
+            pooled_mask = pooled_mask[None, None]
         outs = []
         for li in range(L):
             out_l = _sparse_pooled_attention(
