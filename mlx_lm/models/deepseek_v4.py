@@ -1826,10 +1826,16 @@ def _indexer_score(
     # See bench/indexer_score_microbench.py and bench/indexer_fused_microbench.py.
     pf = pooled[:, None]
     scores = q @ pf.swapaxes(-1, -2)               # (B, H, L, P)
-    scores = mx.maximum(scores, 0)                  # (B, H, L, P), ReLU
+    # NOTE (2026-06-09): removed `scores = mx.maximum(scores, 0)` ReLU and
+    # apply sigmoid to the per-head index weights, to match the oracle-validated
+    # mlx-lm PR #1189 indexer scoring (q@ck *scale; hw=sigmoid(weights_proj);
+    # scores*hw). The #1192 base this fork descends from used a ReLU + raw
+    # weights_proj, which selects the wrong compressed-pool tokens -> garbage
+    # output. The folded scale*n_heads_inv_sqrt is a positive constant and does
+    # not affect the argpartition top-k ordering.
     # Fold scale*n_heads_inv_sqrt into the per-head weights (cheap (B,L,H))
     # instead of multiplying the larger (B,H,L,P) scores tensor by scale.
-    w = (weights_x * (scale * n_heads_inv_sqrt))[..., None]   # (B, L, H, 1)
+    w = (mx.sigmoid(weights_x) * (scale * n_heads_inv_sqrt))[..., None]   # (B, L, H, 1)
     # H reduce via a batched matmul: (B,L,P,H) @ (B,L,H,1) -> (B,L,P,1)
     scores_blph = scores.transpose(0, 2, 3, 1)      # (B, L, P, H)
     return (scores_blph @ w).squeeze(-1)            # (B, L, P)
@@ -2805,8 +2811,21 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             with span("model.recv"):
                 h = finalize(mx.distributed.recv_like(h, (pipeline_rank + 1)))
 
-        for layer, layer_cache in zip(self.pipeline_layers, cache):
+        _actprobe = os.environ.get("EXO_DSV4_ACT_PROBE") == "1"
+        if _actprobe:
+            import sys as _ap_sys
+            def _ap_std(t):
+                v = t.astype(mx.float32)
+                return float(mx.sqrt(mx.mean(v * v)).item())
+            mx.eval(h)
+            _ap_sys.stderr.write(f"[ACTPROBE] embed rms={_ap_std(h):.4f}\n")
+        for _ap_i, (layer, layer_cache) in enumerate(zip(self.pipeline_layers, cache)):
             h = layer(h, mask, layer_cache, inputs)
+            if _actprobe:
+                mx.eval(h)
+                _r = _ap_std(h)
+                _ap_sys.stderr.write(f"[ACTPROBE] layer={_ap_i:2d} rms={_r:.4f}\n")
+                _ap_sys.stderr.flush()
 
         if not _nop_pipeline and pipeline_rank != 0:
             with span("model.send"):
@@ -2822,7 +2841,16 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 h = finalize(mx.distributed.all_gather(h)[: h.shape[0]])
 
         with span("model.final_norm"):
-            out = finalize(self.norm(self.hc_head(h)))
+            if _actprobe:
+                _hc = self.hc_head(h)
+                mx.eval(_hc)
+                _ap_sys.stderr.write(f"[ACTPROBE] hc_head rms={_ap_std(_hc):.4f} shape={tuple(_hc.shape)}\n")
+                _normed = self.norm(_hc)
+                mx.eval(_normed)
+                _ap_sys.stderr.write(f"[ACTPROBE] post_norm rms={_ap_std(_normed):.4f}\n")
+                out = finalize(_normed)
+            else:
+                out = finalize(self.norm(self.hc_head(h)))
         if _bp:
             _bp_t_end = _BUILD_PROBE_PERF()
             _BUILD_PROBE_ACC["final_norm"] += (_bp_t_end - _bp_t_post_mask)
@@ -2889,7 +2917,17 @@ class Model(nn.Module):
                 B = h.shape[0]
                 L = h.shape[1]
                 return finalize(mx.zeros((B, L, self.args.vocab_size), dtype=mx.bfloat16))
-            return finalize(self.lm_head(h))
+            _logits = self.lm_head(h)
+            if os.environ.get("EXO_DSV4_ACT_PROBE") == "1":
+                import sys as _lp_sys
+                mx.eval(_logits)
+                _row = _logits[0, -1].astype(mx.float32)
+                _top = mx.argsort(_row)[-5:]
+                _ids = [int(x) for x in _top.tolist()][::-1]
+                _vals = [round(float(_row[i]), 3) for i in _ids]
+                _lp_sys.stderr.write(f"[ACTPROBE] logits top5_ids={_ids} top5={_vals} rms={float(mx.sqrt(mx.mean(_row*_row)).item()):.3f}\n")
+                _lp_sys.stderr.flush()
+            return finalize(_logits)
 
     @property
     def layers(self):
@@ -2966,6 +3004,18 @@ class Model(nn.Module):
                     pass
             new_weights[k] = v
         weights = new_weights
+
+        # Checkpoint names per-layer Hyper-Connection modules hc_attn /
+        # hc_ffn, but this model defines them as attn_hc / ffn_hc. Without
+        # this rename the HC weights silently fail to load (strict=False)
+        # and stay at mx.zeros init, so each layer hyper-connection runs
+        # with zero mix weights -> healthy-magnitude but semantically
+        # scrambled residual stream -> confident-garbage output.
+        renamed = {}
+        for k, v in weights.items():
+            nk = k.replace(".hc_attn.", ".attn_hc.").replace(".hc_ffn.", ".ffn_hc.")
+            renamed[nk] = v
+        weights = renamed
 
         new_weights = {}
         for k, v in weights.items():

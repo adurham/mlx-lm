@@ -2,6 +2,7 @@
 
 from typing import Tuple
 
+import os
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -239,6 +240,10 @@ class HyperConnection(nn.Module):
             self.training
             or mx.default_device() != mx.gpu
             or not mx.metal.is_available()
+            # Diagnostic/escape knob (2026-06-09): force the pure-MLX Sinkhorn
+            # path instead of the custom fused Metal kernel. Used to isolate
+            # whether the fused HC kernel corrupts the DSv4 forward.
+            or os.environ.get("EXO_HC_USE_OPS") == "1"
         )
         hc_func = _hc_ops if use_ops else _hc_kernel
 
