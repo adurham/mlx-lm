@@ -896,6 +896,20 @@ def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int
         mask = mask[None, None]
     B, H, L, S = mask.shape
 
+    # The incoming mask is the model-level windowed/causal mask, sized for the
+    # full sequence. This attention runs against a rotating sliding-window
+    # local cache plus an optional pooled tail, so the local portion of the
+    # mask must be exactly ``N - pooled_width`` columns. When the sequence has
+    # grown past the window the model mask is WIDER than that (S > local_len),
+    # which made ``N - S`` go negative and crash mx.ones/broadcast with
+    # "[full] Negative dimensions not allowed". Sliding-window attention keeps
+    # the most-recent keys, so clamp the mask to its trailing local columns.
+    pooled_width = pool_mask.shape[-1] if pool_mask is not None else 0
+    local_len = N - pooled_width
+    if local_len >= 0 and S > local_len:
+        mask = mask[..., -local_len:] if local_len > 0 else mask[..., :0]
+        S = local_len
+
     if pool_mask is None:
         pool_mask = mx.ones((B, H, L, N - S), dtype=mx.bool_)
     elif pool_mask.ndim == 2:
