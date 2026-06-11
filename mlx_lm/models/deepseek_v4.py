@@ -863,6 +863,31 @@ def _rope_dispatch(
     return rope(x, offset, inverse=inverse) if inverse else rope(x, offset)
 
 
+def _clamp_mask_to_kv(mask: Optional[mx.array], kv_len: int):
+    """Clamp an attention mask's trailing KV dimension to ``kv_len``.
+
+    LocalAttention runs against a RotatingKVCache capped at
+    ``sliding_window``, so once the sequence grows past the window the actual
+    KV length is ``sliding_window`` — but the model-level / speculative
+    tree mask is sized for the full (compressed) cache and carries a larger
+    KV width (e.g. mask S=134 vs local KV=128). Passing that oversized mask
+    straight to SDPA raises
+    ``[broadcast_shapes] Shapes (L, S) and (B, H, L, kv_len) cannot be
+    broadcast``. Sliding-window attention attends to the most-recent KV
+    positions, so the correct slice is the trailing ``kv_len`` columns.
+
+    String ("causal") and ``None`` masks are returned unchanged — the kernel
+    sizes those itself. Array masks already matching ``kv_len`` (or smaller)
+    pass through untouched.
+    """
+    if mask is None or isinstance(mask, str):
+        return mask
+    s = mask.shape[-1]
+    if s <= kv_len:
+        return mask
+    return mask[..., -kv_len:]
+
+
 def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int):
     if mask is None:
         return None
@@ -2024,6 +2049,14 @@ class LocalAttention(nn.Module):
                 with span("attn.kv_cache"):
                     kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
                     kv = finalize(kv)
+
+            # The model-level / speculative tree mask is sized for the full
+            # (compressed) cache; this attention runs against a rotating
+            # sliding-window cache whose KV length is capped at
+            # ``sliding_window``. Clamp the mask's trailing KV dimension to the
+            # actual KV length so SDPA can broadcast it (otherwise e.g. a
+            # mask S=134 vs local KV=128 raises [broadcast_shapes]).
+            mask = _clamp_mask_to_kv(mask, kv.shape[2])
 
             with span("attn.sdpa"):
                 out = finalize(
