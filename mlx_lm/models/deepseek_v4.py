@@ -1080,6 +1080,17 @@ def _sparse_pooled_attention(
 
             lm = local_mask if local_mask is not None else _full((B, H, L, sw))
             pm = pooled_mask if pooled_mask is not None else _full((B, H, L, k))
+            # The local mask is sliced from the model-level windowed mask and
+            # can be wider than the rotating local cache once the sequence
+            # crosses the sliding-window boundary (e.g. decode mask local-width
+            # 129 vs local_kv sw=128) → [broadcast_shapes] crash at the SDPA
+            # below. Same root cause as the LocalAttention / _extend_mask
+            # clamps: sliding-window attention keeps the most-recent keys, so
+            # clamp the local mask's trailing columns to match local_kv (sw).
+            # ``lm`` is always a real array here (local_mask or _full(...)), so
+            # slice directly rather than via the Optional-typed helper.
+            if lm.shape[-1] > sw:
+                lm = lm[..., -sw:] if sw > 0 else lm[..., :0]
             # Broadcast head axis if needed
             if lm.shape[1] == 1 and H > 1:
                 lm = mx.broadcast_to(lm, (B, H, L, sw))
@@ -1151,6 +1162,14 @@ def _sparse_pooled_attention(
         axis=3,
     )
     sinks_expanded = sinks[None, :, None, None] if sinks is not None else None
+    # local_scores below are (B, H, L, sliding_window); the local mask sliced
+    # from the model-level windowed mask can be wider than local_kv once the
+    # sequence crosses the window boundary, so clamp its trailing columns to
+    # the local cache width (same root cause / fix as the decode + extend
+    # paths). Sliding-window attention keeps the most-recent keys.
+    sw_pref = local_kv.shape[2]
+    if local_mask is not None and local_mask.shape[-1] > sw_pref:
+        local_mask = local_mask[..., -sw_pref:] if sw_pref > 0 else local_mask[..., :0]
     return _sparse_pooled_attention_inner(
         q * scale,
         local_kv,
