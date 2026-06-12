@@ -107,6 +107,12 @@ _ATTN_SUB_ACC: Dict[str, float] = {
     "sdpa": 0.0, "out_proj": 0.0, "n": 0,
 }
 
+# FFN sub-attribution (same gate): expert compute vs the cross-rank all_sum
+# (RDMA reduction). Quantifies how much of the ~50%-of-prefill MoE bucket is
+# communication — i.e. the upside ceiling of switching to Pipeline sharding
+# (which eliminates the per-layer all_sum).
+_FFN_SUB_ACC: Dict[str, float] = {"experts": 0.0, "all_sum": 0.0, "n": 0}
+
 
 def _section_time_dump() -> None:
     """Emit accumulated per-section GPU wall time (attn vs ffn) and reset."""
@@ -145,12 +151,25 @@ def _section_time_dump() -> None:
             lines.append(
                 f"[SECTION-TIME pid={os.getpid()}]   attn-sub (n={int(sn)}): {frag}"
             )
+    fsub = _FFN_SUB_ACC
+    if fsub["n"]:
+        e_ms = fsub["experts"] * 1000.0
+        a_ms = fsub["all_sum"] * 1000.0
+        ft = e_ms + a_ms
+        if ft > 0:
+            lines.append(
+                f"[SECTION-TIME pid={os.getpid()}]   ffn-sub (n={int(fsub['n'])}): "
+                f"experts={e_ms:.1f}ms ({100.0 * e_ms / ft:.1f}%)  "
+                f"all_sum={a_ms:.1f}ms ({100.0 * a_ms / ft:.1f}%)"
+            )
     _bp_sys.stderr.write("\n".join(lines) + "\n")
     _bp_sys.stderr.flush()
     for k in ("attn", "ffn", "other", "layer_count"):
         _SECTION_TIME_ACC[k] = 0.0
     for k in ("compressor", "proj_qkv", "qk_prep", "indexer", "sdpa", "out_proj", "n"):
         _ATTN_SUB_ACC[k] = 0.0
+    for k in ("experts", "all_sum", "n"):
+        _FFN_SUB_ACC[k] = 0.0
 
 
 def _install_section_time_sigdump() -> None:
@@ -1513,9 +1532,26 @@ class DeepseekV4MoE(nn.Module):
         # Fast path: pre-compiled local trace + Python-level allreduce
         # with the fence eval. Mirrors the span-path semantics.
         if self._compiled_forward is not None:
+            _ffnsub = _SECTION_TIME_ENABLED
+            _ff_t = 0.0
+            if _ffnsub:
+                mx.synchronize()
+                _ff_t = _BUILD_PROBE_PERF()
             y = self._compiled_forward(x, input_ids)
+            if _ffnsub:
+                mx.eval(y)
+                mx.synchronize()
+                _ff_exp = _BUILD_PROBE_PERF()
+                _FFN_SUB_ACC["experts"] += (_ff_exp - _ff_t)
+                _ff_t = _ff_exp
             if self.sharding_group is not None:
                 y = mx.distributed.all_sum(y, group=self.sharding_group)
+                if _ffnsub:
+                    mx.eval(y)
+                    mx.synchronize()
+                    _ff_as = _BUILD_PROBE_PERF()
+                    _FFN_SUB_ACC["all_sum"] += (_ff_as - _ff_t)
+                    _FFN_SUB_ACC["n"] += 1
                 # Cross-rank lockstep fence — see install_compiled_forward
                 # docstring. Without this, JACCL ack barriers serialize
                 # on the slowest rank at long c=2 context.
