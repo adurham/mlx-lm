@@ -2458,6 +2458,9 @@ class SparseCompressedAttention(nn.Module):
                 else:
                     pooled = finalize(self.compressor(x, comp_cache, offset))
             if _stsub:
+                # Explicit eval — finalize() is a no-op unless EXO_PROFILER is
+                # set, so we must force materialization ourselves to time GPU.
+                mx.eval(pooled)
                 mx.synchronize()
                 _t_comp = _BUILD_PROBE_PERF()
                 _ATTN_SUB_ACC["compressor"] += (_t_comp - _sub_t)
@@ -2493,6 +2496,7 @@ class SparseCompressedAttention(nn.Module):
                 if pmask is not None:
                     pmask = finalize(pmask)
             if _stsub:
+                mx.eval(q, kv)
                 mx.synchronize()
                 _t_pre_idx = _BUILD_PROBE_PERF()
                 # proj_qkv + rope_in + kv_cache + mask since the compressor
@@ -2516,6 +2520,7 @@ class SparseCompressedAttention(nn.Module):
                         self.indexer(x, q_residual, self.rope, idx_cache, offset)
                     )
             if _stsub:
+                mx.eval(topk)
                 mx.synchronize()
                 _t_idx = _BUILD_PROBE_PERF()
                 # The indexer block alone (pre-indexer fence above isolated it).
@@ -2599,6 +2604,7 @@ class SparseCompressedAttention(nn.Module):
                         )
                 out = finalize(out)
             if _stsub:
+                mx.eval(out)
                 mx.synchronize()
                 _t_sdpa = _BUILD_PROBE_PERF()
                 _ATTN_SUB_ACC["sdpa"] += (_t_sdpa - _sub_t)
@@ -2615,6 +2621,7 @@ class SparseCompressedAttention(nn.Module):
                 out = self.wo_b(out)
                 out = finalize(out)
             if _stsub:
+                mx.eval(out)
                 mx.synchronize()
                 _t_oproj = _BUILD_PROBE_PERF()
                 # rope_out + o_proj fold into "rest"
