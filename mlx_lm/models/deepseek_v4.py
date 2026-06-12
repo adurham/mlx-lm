@@ -3063,6 +3063,17 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                             f"[OP_PROBE pid={os.getpid()}] steps={sc} {_op_line}\n"
                         )
                 _bp_sys.stderr.flush()
+        # Section-time probe: dump from the inference thread itself every
+        # _SECTION_TIME_LOG_EVERY forward passes. This is the reliable dump
+        # path — SIGUSR2 only wires if the module imported on the main thread,
+        # which is not guaranteed for runner subprocesses. Default 1 = dump
+        # after every forward (one prefill forward already accumulates all
+        # layers, so a single prefill yields a complete attribution).
+        if _SECTION_TIME_ENABLED and _SECTION_TIME_ACC["layer_count"]:
+            global _SECTION_TIME_CYCLES
+            _SECTION_TIME_CYCLES += 1
+            if _SECTION_TIME_CYCLES % max(1, _SECTION_TIME_LOG_EVERY) == 0:
+                _section_time_dump()
         return out
 
 
