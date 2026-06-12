@@ -3220,6 +3220,19 @@ class Model(nn.Module):
                 B = h.shape[0]
                 L = h.shape[1]
                 return finalize(mx.zeros((B, L, self.args.vocab_size), dtype=mx.bfloat16))
+            # OPT-2 (env-gated EXO_DSV4_LMHEAD_LASTROW=1): during PREFILL the
+            # caller (mlx_lm stream_generate prefill loop) DISCARDS this output —
+            # it keeps only the KV cache — and the decode _step only ever reads
+            # logits[:, -1, :]. So projecting all L rows through lm_head
+            # (L × vocab_size ≈ 128 × 129K) is wasted work every prefill chunk.
+            # When L > 1, project only the last row. This is exact for both
+            # consumers: prefill discards anyway, decode wants the last row.
+            # DSv4 MTP runs its OWN lm_head on hidden states it manages and does
+            # NOT route multi-row logits through here, so it is unaffected.
+            # L == 1 (decode) is unchanged. Gated for clean A/B.
+            if (h.shape[1] > 1
+                    and os.environ.get("EXO_DSV4_LMHEAD_LASTROW", "0") == "1"):
+                h = h[:, -1:, :]
             _logits = self.lm_head(h)
             if os.environ.get("EXO_DSV4_ACT_PROBE") == "1":
                 import sys as _lp_sys
