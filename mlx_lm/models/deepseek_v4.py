@@ -97,6 +97,15 @@ _SECTION_TIME_ACC: Dict[str, float] = {
 }
 _SECTION_TIME_CYCLES: int = 0
 
+# Sub-section attn attribution (same gate). When on, SparseCompressedAttention
+# accumulates true GPU wall (mx.synchronize boundaries) for the three big attn
+# blocks — compressor / indexer / sdpa — plus the remaining projections/rope.
+# This answers "within attn's ~44% of prefill, what dominates?" — i.e. is the
+# sparse indexer (the suspected cubic-ish blowup) the hot spot worth rewriting.
+_ATTN_SUB_ACC: Dict[str, float] = {
+    "compressor": 0.0, "indexer": 0.0, "sdpa": 0.0, "rest": 0.0, "n": 0,
+}
+
 
 def _section_time_dump() -> None:
     """Emit accumulated per-section GPU wall time (attn vs ffn) and reset."""
@@ -120,10 +129,29 @@ def _section_time_dump() -> None:
         f"[SECTION-TIME pid={os.getpid()}]   other = {other_ms:9.1f}ms "
         f"({100.0 * other_ms / total_ms:5.1f}%)  avg/layer={other_ms / n:6.3f}ms",
     ]
+    # Attn sub-breakdown: within the attn bucket, where does the time go?
+    sub = _ATTN_SUB_ACC
+    sn = sub["n"]
+    if sn:
+        c_ms = sub["compressor"] * 1000.0
+        i_ms = sub["indexer"] * 1000.0
+        s_ms = sub["sdpa"] * 1000.0
+        r_ms = sub["rest"] * 1000.0
+        sub_total = c_ms + i_ms + s_ms + r_ms
+        if sub_total > 0:
+            lines.append(
+                f"[SECTION-TIME pid={os.getpid()}]   attn-sub (n={int(sn)}): "
+                f"compressor={c_ms:.1f}ms ({100.0 * c_ms / sub_total:.1f}%)  "
+                f"indexer={i_ms:.1f}ms ({100.0 * i_ms / sub_total:.1f}%)  "
+                f"sdpa={s_ms:.1f}ms ({100.0 * s_ms / sub_total:.1f}%)  "
+                f"rest={r_ms:.1f}ms ({100.0 * r_ms / sub_total:.1f}%)"
+            )
     _bp_sys.stderr.write("\n".join(lines) + "\n")
     _bp_sys.stderr.flush()
     for k in ("attn", "ffn", "other", "layer_count"):
         _SECTION_TIME_ACC[k] = 0.0
+    for k in ("compressor", "indexer", "sdpa", "rest", "n"):
+        _ATTN_SUB_ACC[k] = 0.0
 
 
 def _install_section_time_sigdump() -> None:
@@ -2408,6 +2436,11 @@ class SparseCompressedAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         with span("attn"):
+            _stsub = _SECTION_TIME_ENABLED
+            _sub_t = 0.0
+            if _stsub:
+                mx.synchronize()
+                _sub_t = _BUILD_PROBE_PERF()
             B, L, _ = x.shape
             local_cache = cache[0] if cache is not None else None
             comp_cache = cache[1] if cache is not None else None
@@ -2424,6 +2457,11 @@ class SparseCompressedAttention(nn.Module):
                     pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
                 else:
                     pooled = finalize(self.compressor(x, comp_cache, offset))
+            if _stsub:
+                mx.synchronize()
+                _t_comp = _BUILD_PROBE_PERF()
+                _ATTN_SUB_ACC["compressor"] += (_t_comp - _sub_t)
+                _sub_t = _t_comp
 
             # Sub-span attribution for the 2026-05-25 "16% unaccounted attn
             # wall" investigation — see LocalAttention.__call__ for the same
@@ -2454,6 +2492,12 @@ class SparseCompressedAttention(nn.Module):
                 pmask = _dispatch_pmask(comp_cache, L, offset)
                 if pmask is not None:
                     pmask = finalize(pmask)
+            if _stsub:
+                mx.synchronize()
+                _t_pre_idx = _BUILD_PROBE_PERF()
+                # proj_qkv + rope_in + kv_cache + mask since the compressor
+                _ATTN_SUB_ACC["rest"] += (_t_pre_idx - _sub_t)
+                _sub_t = _t_pre_idx
             with span("attn.indexer"):
                 if "indexer" in _get_nop_targets():
                     # Indexer returns argsort(-scores)[..., :k] over scores shaped
@@ -2471,6 +2515,12 @@ class SparseCompressedAttention(nn.Module):
                     topk = finalize(
                         self.indexer(x, q_residual, self.rope, idx_cache, offset)
                     )
+            if _stsub:
+                mx.synchronize()
+                _t_idx = _BUILD_PROBE_PERF()
+                # The indexer block alone (pre-indexer fence above isolated it).
+                _ATTN_SUB_ACC["indexer"] += (_t_idx - _sub_t)
+                _sub_t = _t_idx
             sinks = self.attn_sink.astype(q.dtype)
 
             with span("attn.sdpa"):
@@ -2548,6 +2598,11 @@ class SparseCompressedAttention(nn.Module):
                             sinks,
                         )
                 out = finalize(out)
+            if _stsub:
+                mx.synchronize()
+                _t_sdpa = _BUILD_PROBE_PERF()
+                _ATTN_SUB_ACC["sdpa"] += (_t_sdpa - _sub_t)
+                _sub_t = _t_sdpa
 
             with span("attn.rope_out"):
                 out = _rope_dispatch(self.rope, out, offset, inverse=True)
@@ -2559,6 +2614,13 @@ class SparseCompressedAttention(nn.Module):
                 out = _o_pre_b(out)
                 out = self.wo_b(out)
                 out = finalize(out)
+            if _stsub:
+                mx.synchronize()
+                _t_oproj = _BUILD_PROBE_PERF()
+                # rope_out + o_proj fold into "rest"
+                _ATTN_SUB_ACC["rest"] += (_t_oproj - _sub_t)
+                _sub_t = _t_oproj
+                _ATTN_SUB_ACC["n"] += 1
 
             if self.sharding_group is not None:
                 with span("attn.all_sum"):
