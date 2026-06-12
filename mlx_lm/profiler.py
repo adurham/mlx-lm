@@ -200,17 +200,35 @@ class SpanProfilerHook:
     Wall-time accuracy requires forcing MLX evaluation at span boundaries:
     ``finalize`` calls ``mx.eval`` so the ``perf_counter`` delta reflects
     real kernel time rather than graph-build time.
+
+    By default spans only bracket graph-build time, so lazy compute piles onto
+    the next forced eval / collective (e.g. a TP ``all_sum`` absorbs ~100% of
+    wall time). Set ``EXO_PROFILER_SYNC_SPANS=1`` to ``mx.synchronize()`` at
+    BOTH span boundaries: each span then measures its OWN real kernel time, at
+    the cost of serializing the pipeline (so absolute throughput drops, but the
+    per-span SHARE is now accurate). Use sync mode for attribution, default mode
+    for low-overhead production tracing.
     """
 
     def __init__(self) -> None:
         self.stats: SpanStats = SpanStats()
+        self._sync = os.environ.get("EXO_PROFILER_SYNC_SPANS", "").strip() in (
+            "1",
+            "true",
+            "yes",
+        )
 
     @contextmanager
     def span(self, name: str) -> Generator[None, None, None]:
+        if self._sync:
+            # Drain all prior GPU work so the timer captures only THIS span.
+            mx.synchronize()
         start = time.perf_counter_ns()
         try:
             yield
         finally:
+            if self._sync:
+                mx.synchronize()
             self.stats.record(name, time.perf_counter_ns() - start)
 
     def finalize(self, x: mx.array) -> mx.array:
