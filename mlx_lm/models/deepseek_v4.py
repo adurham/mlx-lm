@@ -107,6 +107,20 @@ _ATTN_SUB_ACC: Dict[str, float] = {
     "sdpa": 0.0, "out_proj": 0.0, "n": 0,
 }
 
+# OPT-3: sequence-split attention (env-gated EXO_DSV4_SEQ_SPLIT=1). Attention is
+# replicated across both TP ranks today — both compute the full ~46% redundantly.
+# In prefill (L>1) we keep compressor / kv-cache / indexer FULL on both ranks
+# (so every cache + pool stays bit-identical, zero coherence risk), then slice
+# the QUERY side (q, topk, mask, pmask) to this rank's contiguous row band, run
+# sdpa + o_proj on L/N rows, and all_gather the output halves back to full L.
+# Halves the two largest attn sub-blocks (sdpa ~31%, out_proj ~23%) at the cost
+# of one all_gather/layer. Decode (L==1) and MTP verify (tiny L) skip it via the
+# length gate, so decode is untouched by construction. Quality is exact: the
+# gather reconstructs the identical full-sequence attention output.
+_SEQ_SPLIT_ENABLED = bool(os.environ.get("EXO_DSV4_SEQ_SPLIT"))
+_SEQ_SPLIT_MIN_L = int(os.environ.get("EXO_DSV4_SEQ_SPLIT_MIN_L", "16"))
+
+
 # FFN sub-attribution (same gate): expert compute vs the cross-rank all_sum
 # (RDMA reduction). Quantifies how much of the ~50%-of-prefill MoE bucket is
 # communication — i.e. the upside ceiling of switching to Pipeline sharding
@@ -2580,6 +2594,34 @@ class SparseCompressedAttention(nn.Module):
                 _sub_t = _t_idx
             sinks = self.attn_sink.astype(q.dtype)
 
+            # OPT-3 sequence-split: slice the query side to this rank's row band.
+            # compressor/kv-cache/indexer above ran FULL (caches coherent); from
+            # here sdpa + o_proj process only L/N rows, gathered back after o_proj.
+            _sg = self.sharding_group
+            _seq = (
+                _sg is not None
+                and _SEQ_SPLIT_ENABLED
+                and L >= _SEQ_SPLIT_MIN_L
+                and L % _sg.size() == 0
+            )
+            _seq_lo = 0
+            if _seq and _sg is not None:
+                _N = _sg.size()
+                _r = _sg.rank()
+                _band = L // _N
+                _seq_lo = _r * _band
+                _seq_hi = _seq_lo + _band
+                q = q[:, :, _seq_lo:_seq_hi, :]
+                if topk is not None:
+                    topk = topk[:, _seq_lo:_seq_hi, :]
+                if mask is not None and not isinstance(mask, str):
+                    mask = mask[..., _seq_lo:_seq_hi, :]
+                if pmask is not None:
+                    if pmask.ndim == 2:
+                        pmask = pmask[_seq_lo:_seq_hi, :]
+                    else:
+                        pmask = pmask[..., _seq_lo:_seq_hi, :]
+
             with span("attn.sdpa"):
                 # Local attention
                 if pooled.shape[1] == 0:
@@ -2681,7 +2723,17 @@ class SparseCompressedAttention(nn.Module):
                 _sub_t = _t_oproj
                 _ATTN_SUB_ACC["n"] += 1
 
-            if self.sharding_group is not None:
+            if _seq and _sg is not None:
+                # Reconstruct the full sequence from per-rank row bands. out is
+                # (B, band, hidden); all_gather concatenates along axis 0 across
+                # ranks → (N, band, hidden), ordered by rank == row-band order →
+                # reshape to (B, L, hidden). Bit-exact vs the unsharded output.
+                with span("attn.all_gather"):
+                    _B = out.shape[0]
+                    _H = out.shape[-1]
+                    _g = mx.distributed.all_gather(out, group=_sg)
+                    out = finalize(_g.reshape(_B, L, _H))
+            elif self.sharding_group is not None:
                 with span("attn.all_sum"):
                     out = finalize(
                         mx.distributed.all_sum(out, group=self.sharding_group)
