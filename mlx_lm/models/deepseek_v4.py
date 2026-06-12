@@ -78,6 +78,74 @@ _ALLSUM_PROBE_ACC: Dict[int, List[float]] = {}    # layer_idx -> list[ms]
 _ALLSUM_PROBE_CYCLES: int = 0
 
 
+# ── GPU-time section probe (env-gated EXO_DSV4_SECTION_TIME=1) ──────────────
+# The MLX_BUILD_PROBE above only times CPU graph-BUILD wall (no mx.synchronize),
+# and the SpanProfilerHook collapses everything onto the un-compiled all_sum
+# collective — neither can attribute real prefill GPU time to attention vs MoE.
+# This probe wraps the two REAL compute calls in DeepseekV4Block.__call__'s
+# fast path (self.attn / self.ffn) with mx.synchronize() boundaries, so each
+# section's accumulated time is true device kernel time, not lazy-build time.
+#
+# Cost when off: one bool read per layer. When on: 4 mx.synchronize() per layer
+# (serializes the pipeline, so absolute throughput drops ~10-20% — but the
+# per-section SHARE is accurate, which is the point). Dumps on SIGUSR2 or via
+# DeepseekV4Model.__call__ every _SECTION_TIME_LOG_EVERY forward passes.
+_SECTION_TIME_ENABLED = bool(os.environ.get("EXO_DSV4_SECTION_TIME"))
+_SECTION_TIME_LOG_EVERY = int(os.environ.get("EXO_DSV4_SECTION_TIME_LOG_EVERY", "0"))
+_SECTION_TIME_ACC: Dict[str, float] = {
+    "attn": 0.0, "ffn": 0.0, "other": 0.0, "layer_count": 0,
+}
+_SECTION_TIME_CYCLES: int = 0
+
+
+def _section_time_dump() -> None:
+    """Emit accumulated per-section GPU wall time (attn vs ffn) and reset."""
+    acc = _SECTION_TIME_ACC
+    n = acc["layer_count"]
+    if not n:
+        return
+    attn_ms = acc["attn"] * 1000.0
+    ffn_ms = acc["ffn"] * 1000.0
+    other_ms = acc["other"] * 1000.0
+    total_ms = attn_ms + ffn_ms + other_ms
+    if total_ms <= 0:
+        return
+    lines = [
+        f"[SECTION-TIME pid={os.getpid()}] layer_invocations={int(n)} "
+        f"total={total_ms:.1f}ms",
+        f"[SECTION-TIME pid={os.getpid()}]   attn  = {attn_ms:9.1f}ms "
+        f"({100.0 * attn_ms / total_ms:5.1f}%)  avg/layer={attn_ms / n:6.3f}ms",
+        f"[SECTION-TIME pid={os.getpid()}]   ffn   = {ffn_ms:9.1f}ms "
+        f"({100.0 * ffn_ms / total_ms:5.1f}%)  avg/layer={ffn_ms / n:6.3f}ms",
+        f"[SECTION-TIME pid={os.getpid()}]   other = {other_ms:9.1f}ms "
+        f"({100.0 * other_ms / total_ms:5.1f}%)  avg/layer={other_ms / n:6.3f}ms",
+    ]
+    _bp_sys.stderr.write("\n".join(lines) + "\n")
+    _bp_sys.stderr.flush()
+    for k in ("attn", "ffn", "other", "layer_count"):
+        _SECTION_TIME_ACC[k] = 0.0
+
+
+def _install_section_time_sigdump() -> None:
+    """Wire SIGUSR2 + atexit to dump the section-time probe."""
+    if not _SECTION_TIME_ENABLED:
+        return
+    import atexit as _st_atexit
+    import signal as _st_signal
+    try:
+        _st_signal.signal(_st_signal.SIGUSR2, lambda *_a: _section_time_dump())
+    except (ValueError, OSError):
+        pass  # not on main thread
+    _st_atexit.register(_section_time_dump)
+    _bp_sys.stderr.write(
+        f"[SECTION-TIME pid={os.getpid()}] enabled; dump on SIGUSR2 or exit.\n"
+    )
+    _bp_sys.stderr.flush()
+
+
+_install_section_time_sigdump()
+
+
 def _allsum_probe_dump() -> None:
     """Format and emit per-layer p50/p99/max from _ALLSUM_PROBE_ACC, then reset."""
     import statistics as _ap_stats
@@ -2614,23 +2682,42 @@ class DeepseekV4Block(nn.Module):
             # Times each of the 6 calls and accumulates into a process-global
             # dict. The probe is no-op when the env var is unset.
             _bp = _BUILD_PROBE_ENABLED
+            _st = _SECTION_TIME_ENABLED
+            _st0 = _st1 = _st2 = _st3 = 0.0
             if _bp:
                 _bt0 = _BUILD_PROBE_PERF()
+            # GPU-time section probe: mx.synchronize() boundaries so each
+            # perf_counter delta is real device kernel time, not lazy build.
+            if _st:
+                mx.synchronize()
+                _st0 = _BUILD_PROBE_PERF()
             normed, residual, post, comb = self._compiled_attn_pre(h)
             if _bp:
                 _bt1 = _BUILD_PROBE_PERF()
             x = self.attn(normed, mask=mask, cache=cache)
             if _bp:
                 _bt2 = _BUILD_PROBE_PERF()
+            if _st:
+                mx.eval(x)
+                mx.synchronize()
+                _st1 = _BUILD_PROBE_PERF()
             h = self._compiled_post_attn(x, residual, post, comb)
             if _bp:
                 _bt3 = _BUILD_PROBE_PERF()
             normed, residual, post, comb = self._compiled_ffn_pre(h)
             if _bp:
                 _bt4 = _BUILD_PROBE_PERF()
+            if _st:
+                mx.eval(normed)
+                mx.synchronize()
+                _st2 = _BUILD_PROBE_PERF()
             x = self.ffn(normed, input_ids)
             if _bp:
                 _bt5 = _BUILD_PROBE_PERF()
+            if _st:
+                mx.eval(x)
+                mx.synchronize()
+                _st3 = _BUILD_PROBE_PERF()
             out = self._compiled_post_ffn(x, residual, post, comb)
             if _bp:
                 _bt6 = _BUILD_PROBE_PERF()
@@ -2641,6 +2728,14 @@ class DeepseekV4Block(nn.Module):
                 _BUILD_PROBE_ACC["ffn"] += (_bt5 - _bt4)
                 _BUILD_PROBE_ACC["post_ffn"] += (_bt6 - _bt5)
                 _BUILD_PROBE_ACC["layer_count"] += 1
+            if _st:
+                # _st0..1 spans attn_pre + attn; _st1..2 spans post_attn +
+                # ffn_pre ("other"); _st2..3 spans ffn. Attribute the small
+                # pre/post compiled chunks to "other".
+                _SECTION_TIME_ACC["attn"] += (_st1 - _st0)
+                _SECTION_TIME_ACC["other"] += (_st2 - _st1)
+                _SECTION_TIME_ACC["ffn"] += (_st3 - _st2)
+                _SECTION_TIME_ACC["layer_count"] += 1
             return out
 
         residual = h
