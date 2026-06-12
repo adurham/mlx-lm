@@ -2705,11 +2705,18 @@ class SparseCompressedAttention(nn.Module):
                 _sub_t = _t_sdpa
 
             with span("attn.rope_out"):
-                out = _rope_dispatch(self.rope, out, offset, inverse=True)
+                # seq-split: this rank's band sits at sequence positions
+                # [offset+_seq_lo : ...], so the inverse RoPE offset must shift
+                # by _seq_lo (mx.fast.rope increments per row from `offset`).
+                _rope_off = (offset + _seq_lo) if _seq else offset
+                out = _rope_dispatch(self.rope, out, _rope_off, inverse=True)
                 out = finalize(out)
 
             with span("attn.o_proj"):
-                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+                # seq-split: out has only this rank's row band, so the o_proj
+                # reshape must use the band length, not the full L.
+                _o_len = out.shape[2] if _seq else L
+                out = _o_pre_a(out, B, self.o_groups, _o_len, self.head_dim)
                 out = self.wo_a(out)
                 out = _o_pre_b(out)
                 out = self.wo_b(out)
