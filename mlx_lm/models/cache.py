@@ -2528,7 +2528,13 @@ class BatchRotatingKVCache(_BaseCache):
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
         for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
-            if c.keys is None:
+            if c.keys is None or l == 0:
+                # Empty stream: destination slice [p : p + 0] is zero-width and
+                # the pre-zeroed buffer already holds the correct padding. Must
+                # skip explicitly — the RHS [..., -l:, :] degenerates to
+                # [..., 0:, :] when l == 0 (Python -0 == 0), grabbing the ENTIRE
+                # rotating buffer and triggering a broadcast error against the
+                # zero-width destination.
                 continue
             keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)[..., -l:, :]
             values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)[..., -l:, :]
