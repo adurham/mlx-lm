@@ -2078,6 +2078,17 @@ class Indexer(nn.Module):
             fused = _fused_topk(scores, k)
             if fused is not None:
                 return fused
+        # OPT-1 (env-gated EXO_DSV4_PREFILL_ARGPARTITION=1): in PREFILL (L>1)
+        # the argsort below is a full O(P log P) sort over the pool just to take
+        # the top-k. argpartition is O(P) and the top-k SET is identical; the
+        # downstream take_along_axis → gathered-KV attention is order-invariant
+        # (softmax sums over all gathered positions), so unordered top-k is
+        # quality-equivalent. Decode (L==1) keeps argsort untouched (the
+        # ~5%-faster-on-Metal claim was measured at L=1), so decode is unaffected
+        # by construction. Gated for clean A/B against the section-time harness.
+        if (scores.shape[1] > 1
+                and _topk_os.environ.get("EXO_DSV4_PREFILL_ARGPARTITION", "0") == "1"):
+            return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
         # Fallback: 2026-05-13 argsort+slice. Bit-equivalent to argpartition
         # +slice for this shape and ~5% faster on Apple's Metal kernel.
         return mx.argsort(-scores, axis=-1)[..., :k]
