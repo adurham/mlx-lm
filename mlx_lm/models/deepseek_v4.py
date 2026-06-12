@@ -103,7 +103,8 @@ _SECTION_TIME_CYCLES: int = 0
 # This answers "within attn's ~44% of prefill, what dominates?" — i.e. is the
 # sparse indexer (the suspected cubic-ish blowup) the hot spot worth rewriting.
 _ATTN_SUB_ACC: Dict[str, float] = {
-    "compressor": 0.0, "indexer": 0.0, "sdpa": 0.0, "rest": 0.0, "n": 0,
+    "compressor": 0.0, "proj_qkv": 0.0, "qk_prep": 0.0, "indexer": 0.0,
+    "sdpa": 0.0, "out_proj": 0.0, "n": 0,
 }
 
 
@@ -133,24 +134,22 @@ def _section_time_dump() -> None:
     sub = _ATTN_SUB_ACC
     sn = sub["n"]
     if sn:
-        c_ms = sub["compressor"] * 1000.0
-        i_ms = sub["indexer"] * 1000.0
-        s_ms = sub["sdpa"] * 1000.0
-        r_ms = sub["rest"] * 1000.0
-        sub_total = c_ms + i_ms + s_ms + r_ms
+        parts = ("compressor", "proj_qkv", "qk_prep", "indexer", "sdpa", "out_proj")
+        ms = {k: sub[k] * 1000.0 for k in parts}
+        sub_total = sum(ms.values())
         if sub_total > 0:
+            frag = "  ".join(
+                f"{k}={ms[k]:.1f}ms ({100.0 * ms[k] / sub_total:.1f}%)"
+                for k in parts
+            )
             lines.append(
-                f"[SECTION-TIME pid={os.getpid()}]   attn-sub (n={int(sn)}): "
-                f"compressor={c_ms:.1f}ms ({100.0 * c_ms / sub_total:.1f}%)  "
-                f"indexer={i_ms:.1f}ms ({100.0 * i_ms / sub_total:.1f}%)  "
-                f"sdpa={s_ms:.1f}ms ({100.0 * s_ms / sub_total:.1f}%)  "
-                f"rest={r_ms:.1f}ms ({100.0 * r_ms / sub_total:.1f}%)"
+                f"[SECTION-TIME pid={os.getpid()}]   attn-sub (n={int(sn)}): {frag}"
             )
     _bp_sys.stderr.write("\n".join(lines) + "\n")
     _bp_sys.stderr.flush()
     for k in ("attn", "ffn", "other", "layer_count"):
         _SECTION_TIME_ACC[k] = 0.0
-    for k in ("compressor", "indexer", "sdpa", "rest", "n"):
+    for k in ("compressor", "proj_qkv", "qk_prep", "indexer", "sdpa", "out_proj", "n"):
         _ATTN_SUB_ACC[k] = 0.0
 
 
@@ -2481,6 +2480,12 @@ class SparseCompressedAttention(nn.Module):
                 kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
                 q = finalize(q)
                 kv = finalize(kv)
+            if _stsub:
+                mx.eval(q, kv)
+                mx.synchronize()
+                _t_proj = _BUILD_PROBE_PERF()
+                _ATTN_SUB_ACC["proj_qkv"] += (_t_proj - _sub_t)
+                _sub_t = _t_proj
             with span("attn.rope_in"):
                 q = _rope_dispatch(self.rope, q, offset)
                 kv = _rope_dispatch(self.rope, kv, offset)
@@ -2499,8 +2504,8 @@ class SparseCompressedAttention(nn.Module):
                 mx.eval(q, kv)
                 mx.synchronize()
                 _t_pre_idx = _BUILD_PROBE_PERF()
-                # proj_qkv + rope_in + kv_cache + mask since the compressor
-                _ATTN_SUB_ACC["rest"] += (_t_pre_idx - _sub_t)
+                # rope_in + kv_cache + mask (q/k prep before the indexer)
+                _ATTN_SUB_ACC["qk_prep"] += (_t_pre_idx - _sub_t)
                 _sub_t = _t_pre_idx
             with span("attn.indexer"):
                 if "indexer" in _get_nop_targets():
@@ -2624,8 +2629,8 @@ class SparseCompressedAttention(nn.Module):
                 mx.eval(out)
                 mx.synchronize()
                 _t_oproj = _BUILD_PROBE_PERF()
-                # rope_out + o_proj fold into "rest"
-                _ATTN_SUB_ACC["rest"] += (_t_oproj - _sub_t)
+                # rope_out + o_proj
+                _ATTN_SUB_ACC["out_proj"] += (_t_oproj - _sub_t)
                 _sub_t = _t_oproj
                 _ATTN_SUB_ACC["n"] += 1
 
