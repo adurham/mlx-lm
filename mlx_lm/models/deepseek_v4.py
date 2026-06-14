@@ -2401,6 +2401,28 @@ class CompressedAttention(nn.Module):
                 mask = _extend_mask(mask, pooled_mask, kv.shape[2])
                 kv = finalize(kv)
 
+            # OPT-3b sequence-split (CompressedAttention): same pattern as the
+            # sparse class. compressor + kv-cache above ran FULL on both ranks
+            # (kv now holds full local+pooled, coherent); slice the query side
+            # to this rank's row band, run sdpa + o_proj on L/N rows, gather
+            # back after o_proj. kv is full-width so each band attends correctly.
+            _sg = self.sharding_group
+            _seq = (
+                _sg is not None
+                and _SEQ_SPLIT_ENABLED
+                and L >= _SEQ_SPLIT_MIN_L
+                and L % _sg.size() == 0
+            )
+            _seq_lo = 0
+            if _seq and _sg is not None:
+                _N = _sg.size()
+                _band = L // _N
+                _seq_lo = _sg.rank() * _band
+                _seq_hi = _seq_lo + _band
+                q = q[:, :, _seq_lo:_seq_hi, :]
+                if mask is not None and not isinstance(mask, str):
+                    mask = mask[..., _seq_lo:_seq_hi, :]
+
             with span("attn.sdpa"):
                 if "compressed_attn" in _get_nop_targets():
                     out = mx.zeros(q.shape, dtype=q.dtype)
@@ -2417,17 +2439,31 @@ class CompressedAttention(nn.Module):
                         )
                     )
             with span("attn.rope_out"):
-                out = _rope_dispatch(self.rope, out, offset, inverse=True)
+                # seq-split: band sits at positions offset+_seq_lo (rope increments
+                # per row from offset) — shift the inverse-rope offset to match.
+                _rope_off = (offset + _seq_lo) if _seq else offset
+                out = _rope_dispatch(self.rope, out, _rope_off, inverse=True)
                 out = finalize(out)
 
             with span("attn.o_proj"):
-                out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+                # seq-split: out has only the band rows; reshape with band length.
+                _o_len = out.shape[2] if _seq else L
+                out = _o_pre_a(out, B, self.o_groups, _o_len, self.head_dim)
                 out = self.wo_a(out)
                 out = _o_pre_b(out)
                 out = self.wo_b(out)
                 out = finalize(out)
 
-            if self.sharding_group is not None:
+            if _seq and _sg is not None:
+                # Reconstruct full sequence from per-rank bands: all_gather on
+                # axis 0 → (N, band, H), rank order == row order → (B, L, H).
+                with span("attn.all_gather"):
+                    _B = out.shape[0]
+                    _H = out.shape[-1]
+                    out = finalize(
+                        mx.distributed.all_gather(out, group=_sg).reshape(_B, L, _H)
+                    )
+            elif self.sharding_group is not None:
                 with span("attn.all_sum"):
                     out = finalize(
                         mx.distributed.all_sum(out, group=self.sharding_group)
