@@ -2091,15 +2091,38 @@ class Indexer(nn.Module):
         position_rope: DeepseekV4RoPE,
         pool_cache: Optional[PoolingCache],
         offset: Union[int, mx.array],
+        seq_band: Optional[Tuple[int, int]] = None,
     ):
-        B, L, _ = x.shape
+        B, L_full, _ = x.shape
+        # OPT-3 seq-split v2: the compressor MUST see full x (it builds the pool
+        # and mutates pool_cache — coherence across ranks). But the score GEMM,
+        # q-projection, weights_proj, pmask and topk are per-query-row, so when a
+        # row band is given we run those on the band only (eliminating the
+        # full-L work this rank would otherwise duplicate). rope offset shifts by
+        # the band lo so each banded row keeps its true sequence position.
         pooled = self.compressor(x, pool_cache, offset)
         if pooled.shape[1] == 0:
             return None
 
+        # Build the full row-causal pmask first (row index == query position),
+        # then slice to the band so the kept rows carry their correct masking.
+        pmask = _dispatch_pmask(pool_cache, L_full, offset)
+
+        if seq_band is not None:
+            lo, hi = seq_band
+            x = x[:, lo:hi, :]
+            q_residual = q_residual[:, lo:hi, :]
+            L = hi - lo
+            q_off = offset + lo
+            if pmask is not None:
+                pmask = pmask[lo:hi, :] if pmask.ndim == 2 else pmask[..., lo:hi, :]
+        else:
+            L = L_full
+            q_off = offset
+
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
         q = q.transpose(0, 2, 1, 3)
-        q = _rope_dispatch(position_rope, q, offset)
+        q = _rope_dispatch(position_rope, q, q_off)
 
         scores = _indexer_score(
             q,
@@ -2108,10 +2131,6 @@ class Indexer(nn.Module):
             self.scale,
             self.n_heads**-0.5,
         )
-        # Tree-aware pmask dispatch: same-depth tree siblings need IDENTICAL
-        # pmask rows, but make_mask is row-causal-by-row-index. See
-        # ``_tree_pmask`` for the fix; linear path is bit-exact.
-        pmask = _dispatch_pmask(pool_cache, L, offset)
         if pmask is not None:
             scores = mx.where(
                 pmask if pmask.ndim == 3 else pmask[None],
@@ -2555,6 +2574,27 @@ class SparseCompressedAttention(nn.Module):
             offset = local_cache.offset if local_cache is not None else 0
             offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
+            # OPT-3 seq-split v2: compute this rank's contiguous query row band
+            # ONCE, up front. The kv side (wkv/kv_norm/kv-cache) and compressor
+            # /pool stay FULL on every rank (coherence); the q side (wq_b main q,
+            # indexer score, sdpa, o_proj) runs on the band [_seq_lo:_seq_hi].
+            # Outputs are all_gathered back to full L after o_proj.
+            _sg = self.sharding_group
+            _seq = (
+                _sg is not None
+                and _SEQ_SPLIT_ENABLED
+                and L >= _SEQ_SPLIT_MIN_L
+                and L % _sg.size() == 0
+            )
+            _seq_lo = 0
+            _seq_hi = L
+            _seq_band = None
+            if _seq and _sg is not None:
+                _band = L // _sg.size()
+                _seq_lo = _sg.rank() * _band
+                _seq_hi = _seq_lo + _band
+                _seq_band = (_seq_lo, _seq_hi)
+
             # W4 path-1 (2026-05-24): issue compressor first; see
             # CompressedAttention.__call__ for rationale.
             with span("attn.compressor"):
@@ -2580,9 +2620,14 @@ class SparseCompressedAttention(nn.Module):
             with span("attn.proj_qkv"):
                 q_lora, kv_pre = self._project_qa_kv(x)
                 q_residual = self.q_norm(q_lora)
+                # seq-split v2: the main-q projection wq_b is per-row → run it on
+                # the band only. q_residual is kept FULL for the indexer call
+                # below (the indexer does its own banded slice internally).
+                _q_res_band = q_residual[:, _seq_lo:_seq_hi, :] if _seq_band is not None else q_residual
+                _Lq = (_seq_hi - _seq_lo) if _seq_band is not None else L
                 q = _q_finalize(
-                    self.wq_b(q_residual),
-                    B, L, self.n_heads, self.head_dim,
+                    self.wq_b(_q_res_band),
+                    B, _Lq, self.n_heads, self.head_dim,
                     self.config.rms_norm_eps,
                 )
                 kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
@@ -2595,7 +2640,9 @@ class SparseCompressedAttention(nn.Module):
                 _ATTN_SUB_ACC["proj_qkv"] += (_t_proj - _sub_t)
                 _sub_t = _t_proj
             with span("attn.rope_in"):
-                q = _rope_dispatch(self.rope, q, offset)
+                # q rows sit at positions offset+_seq_lo (band); kv is full.
+                _q_rope_off = (offset + _seq_lo) if _seq_band is not None else offset
+                q = _rope_dispatch(self.rope, q, _q_rope_off)
                 kv = _rope_dispatch(self.rope, kv, offset)
                 q = finalize(q)
                 kv = finalize(kv)
@@ -2604,8 +2651,12 @@ class SparseCompressedAttention(nn.Module):
                     kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
                     kv = finalize(kv)
             with span("attn.mask"):
-                # Tree-aware pmask dispatch: see _tree_pmask docstring.
+                # Tree-aware pmask dispatch: see _tree_pmask docstring. Built for
+                # full L (row index == query position), then sliced to the band so
+                # the kept rows carry their correct masking under seq-split v2.
                 pmask = _dispatch_pmask(comp_cache, L, offset)
+                if pmask is not None and _seq_band is not None:
+                    pmask = pmask[_seq_lo:_seq_hi, :] if pmask.ndim == 2 else pmask[..., _seq_lo:_seq_hi, :]
                 if pmask is not None:
                     pmask = finalize(pmask)
             if _stsub:
@@ -2620,6 +2671,7 @@ class SparseCompressedAttention(nn.Module):
                     # Indexer returns argsort(-scores)[..., :k] over scores shaped
                     # (B, L, P) so output is (B, L, k). Return deterministic
                     # in-range indices [0, k) so downstream sparse_sdpa doesn't OOB.
+                    # q is already banded here, so _L = band length.
                     _topk = self.indexer.index_topk
                     _pool_len = pooled.shape[1] if pooled.shape[1] > 0 else _topk
                     _take = min(_topk, _pool_len)
@@ -2629,8 +2681,11 @@ class SparseCompressedAttention(nn.Module):
                         (_B, _L, _take),
                     )
                 else:
+                    # seq-split v2: pass the band so the indexer's compressor/pool
+                    # run FULL (coherent) but its score GEMM + topk run banded.
                     topk = finalize(
-                        self.indexer(x, q_residual, self.rope, idx_cache, offset)
+                        self.indexer(x, q_residual, self.rope, idx_cache, offset,
+                                     seq_band=_seq_band)
                     )
             if _stsub:
                 mx.eval(topk)
@@ -2641,33 +2696,12 @@ class SparseCompressedAttention(nn.Module):
                 _sub_t = _t_idx
             sinks = self.attn_sink.astype(q.dtype)
 
-            # OPT-3 sequence-split: slice the query side to this rank's row band.
-            # compressor/kv-cache/indexer above ran FULL (caches coherent); from
-            # here sdpa + o_proj process only L/N rows, gathered back after o_proj.
-            _sg = self.sharding_group
-            _seq = (
-                _sg is not None
-                and _SEQ_SPLIT_ENABLED
-                and L >= _SEQ_SPLIT_MIN_L
-                and L % _sg.size() == 0
-            )
-            _seq_lo = 0
-            if _seq and _sg is not None:
-                _N = _sg.size()
-                _r = _sg.rank()
-                _band = L // _N
-                _seq_lo = _r * _band
-                _seq_hi = _seq_lo + _band
-                q = q[:, :, _seq_lo:_seq_hi, :]
-                if topk is not None:
-                    topk = topk[:, _seq_lo:_seq_hi, :]
-                if mask is not None and not isinstance(mask, str):
-                    mask = mask[..., _seq_lo:_seq_hi, :]
-                if pmask is not None:
-                    if pmask.ndim == 2:
-                        pmask = pmask[_seq_lo:_seq_hi, :]
-                    else:
-                        pmask = pmask[..., _seq_lo:_seq_hi, :]
+            # seq-split v2: q, topk, and pmask are ALREADY banded above (the
+            # q-projection, indexer score, and pmask all ran on the band). Only
+            # the attention `mask` is still full-L here, so slice it to the band
+            # rows to match q. kv/pooled stay full (each banded row attends them).
+            if _seq_band is not None and mask is not None and not isinstance(mask, str):
+                mask = mask[..., _seq_lo:_seq_hi, :]
 
             with span("attn.sdpa"):
                 # Local attention
