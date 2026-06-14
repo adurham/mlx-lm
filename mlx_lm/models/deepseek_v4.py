@@ -117,7 +117,10 @@ _ATTN_SUB_ACC: Dict[str, float] = {
 # of one all_gather/layer. Decode (L==1) and MTP verify (tiny L) skip it via the
 # length gate, so decode is untouched by construction. Quality is exact: the
 # gather reconstructs the identical full-sequence attention output.
-_SEQ_SPLIT_ENABLED = bool(os.environ.get("EXO_DSV4_SEQ_SPLIT"))
+# Default ON: validated +18-19% prefill (236 -> ~280 tok/s) at 20-25K ctx,
+# quality-exact, decode untouched (length-gated). Set EXO_DSV4_SEQ_SPLIT=0 to
+# disable (falls back to fully-replicated attention).
+_SEQ_SPLIT_ENABLED = os.environ.get("EXO_DSV4_SEQ_SPLIT", "1") == "1"
 _SEQ_SPLIT_MIN_L = int(os.environ.get("EXO_DSV4_SEQ_SPLIT_MIN_L", "16"))
 
 
