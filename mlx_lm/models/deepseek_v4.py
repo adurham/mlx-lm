@@ -123,6 +123,14 @@ _ATTN_SUB_ACC: Dict[str, float] = {
 _SEQ_SPLIT_ENABLED = os.environ.get("EXO_DSV4_SEQ_SPLIT", "1") == "1"
 _SEQ_SPLIT_MIN_L = int(os.environ.get("EXO_DSV4_SEQ_SPLIT_MIN_L", "16"))
 
+# OPT-4 two-level chunking: max query-row width for the sparse SDPA's gathered
+# (B,H,L_q,k,D) tensor. The rest of the layer (proj_qkv/indexer/o_proj/MoE) runs
+# at the full prefill super-chunk width for weight-bandwidth amortization, but
+# the sparse SDPA is tiled to this width so its gathered tensor never blows up.
+# This is what makes larger EXO_PREFILL_STEP_SIZE viable (raw chunk 256 was
+# catastrophic: 290->120 tok/s, all in this gathered tensor). 0 disables tiling.
+_SPARSE_SDPA_TILE = int(os.environ.get("EXO_DSV4_SPARSE_SDPA_TILE", "128"))
+
 
 # FFN sub-attribution (same gate): expert compute vs the cross-rank all_sum
 # (RDMA reduction). Quantifies how much of the ~50%-of-prefill MoE bucket is
@@ -2725,16 +2733,53 @@ class SparseCompressedAttention(nn.Module):
                                 topk,
                                 axis=2,
                             )[:, None]
-                        out = _sparse_pooled_attention(
-                            q,
-                            kv,
-                            pooled,
-                            topk,
-                            mask,
-                            sparse_mask,
-                            self.scale,
-                            sinks,
-                        )
+                        # OPT-4 two-level chunking: the sparse SDPA builds a
+                        # gathered (B,H,L_q,k,D) tensor — the term that blows up
+                        # ~cubically with chunk width and made bigger prefill
+                        # chunks catastrophic. proj_qkv / indexer / o_proj / MoE
+                        # all WANT a big batch (weight-bandwidth amortization),
+                        # but THIS step must stay narrow. So tile ONLY the sparse
+                        # SDPA over query-row sub-chunks of <= _SPARSE_SDPA_TILE,
+                        # keeping the gathered tensor small while the rest of the
+                        # layer runs at the full super-chunk width. Each sub-chunk
+                        # is per-query-row independent (own topk gather + shared
+                        # local window), so slicing q/topk/masks by row and
+                        # concatenating the outputs is bit-exact. No cache
+                        # mutation here (kv/pooled already built).
+                        _Lq = q.shape[2]
+                        _tile = _SPARSE_SDPA_TILE
+                        if _tile > 0 and _Lq > _tile:
+                            _parts = []
+                            for _s in range(0, _Lq, _tile):
+                                _e = min(_s + _tile, _Lq)
+                                _qm = mask
+                                if _qm is not None and not isinstance(_qm, str):
+                                    _qm = _qm[..., _s:_e, :]
+                                _sm = sparse_mask
+                                if _sm is not None:
+                                    _sm = _sm[:, :, _s:_e, :]
+                                _parts.append(_sparse_pooled_attention(
+                                    q[:, :, _s:_e, :],
+                                    kv,
+                                    pooled,
+                                    topk[:, _s:_e, :],
+                                    _qm,
+                                    _sm,
+                                    self.scale,
+                                    sinks,
+                                ))
+                            out = mx.concatenate(_parts, axis=2)
+                        else:
+                            out = _sparse_pooled_attention(
+                                q,
+                                kv,
+                                pooled,
+                                topk,
+                                mask,
+                                sparse_mask,
+                                self.scale,
+                                sinks,
+                            )
                 out = finalize(out)
             if _stsub:
                 mx.eval(out)
