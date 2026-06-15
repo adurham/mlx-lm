@@ -2536,8 +2536,23 @@ class BatchRotatingKVCache(_BaseCache):
                 # rotating buffer and triggering a broadcast error against the
                 # zero-width destination.
                 continue
-            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)[..., -l:, :]
-            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)[..., -l:, :]
+            # Defense-in-depth: a cache may report size() (logical length) >
+            # the rows physically present in its buffer (e.g. a malformed
+            # extract returning fewer rows than offset implies). Copying the
+            # logical `l` then broadcasts a short RHS into a long slot and
+            # crashes the whole runner ("[broadcast_shapes] ... cannot be
+            # broadcast"). Bound the copy to the rows actually available and
+            # keep them right-aligned (most-recent at the tail). For a well-
+            # formed cache (phys_rows >= l) this is byte-identical to the
+            # plain `[..., -l:, :]` copy. (2026-06-15)
+            tk = c._temporal_order(c.keys)
+            tv = c._temporal_order(c.values)
+            l_eff = min(l, tk.shape[2])
+            if l_eff <= 0:
+                continue
+            end = p + l
+            keys[i : i + 1, :, end - l_eff : end] = tk[..., -l_eff:, :]
+            values[i : i + 1, :, end - l_eff : end] = tv[..., -l_eff:, :]
 
         cache = cls(caches[0].max_size, padding)
         cache.keys = keys
@@ -2817,6 +2832,53 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
 
         # SDPA expects (B, 1, N, ring_width).
         return mask[:, None, :, :]
+
+    def extract(self, idx):
+        """Reconstruct stream ``idx`` from the wide modular ring into a
+        standalone temporally-ordered :class:`RotatingKVCache`.
+
+        This OVERRIDES :meth:`BatchRotatingKVCache.extract`, which is wrong
+        for this subclass: the base method slices the buffer with
+        ``self._idx`` (the *ring write head* = ``offset % ring_width``),
+        but in the per-stream layout that head is NOT a count of valid
+        rows. The base extract therefore returns a buffer with only
+        ``offset % ring_width`` physical rows while reporting
+        ``size() == min(offset, max_size)`` — an inconsistency that makes a
+        downstream :meth:`BatchRotatingKVCache.merge` try to broadcast e.g.
+        a 15-row tensor into a 128-row slot and crash the runner
+        ("[broadcast_shapes] Shapes (1,1,15,512) and (1,1,128,512) cannot be
+        broadcast"). (2026-06-15)
+
+        Correct reconstruction is the inverse of
+        :meth:`_bootstrap_per_stream_ring`: physical slot ``s`` holds the
+        key whose logical position ``p`` satisfies ``p % ring_width == s``.
+        Gather the most-recent ``valid = min(offset_b, max_size)`` positions
+        ``[offset_b - valid, offset_b)`` in temporal (oldest-first) order so
+        the returned cache has ``phys_rows == size() == valid`` and a true
+        absolute ``offset`` (RoPE-correct).
+        """
+        mx.eval(self.offset)
+        offset_b = int(self.offset[idx].item())
+        cache = RotatingKVCache(self.max_size)
+        valid = min(offset_b, self.max_size)
+        keys_arr, values_arr = self.keys, self.values
+        if keys_arr is None or values_arr is None or valid <= 0:
+            cache.offset = offset_b
+            cache._idx = 0
+            return cache
+        ring_width = self.max_size + self._RING_SLACK
+        positions = mx.arange(offset_b - valid, offset_b)
+        slots = (positions % ring_width).astype(mx.uint32)
+        k = mx.take(keys_arr[idx : idx + 1], slots, axis=2)
+        v = mx.take(values_arr[idx : idx + 1], slots, axis=2)
+        cache.keys = mx.contiguous(k)
+        cache.values = mx.contiguous(v)
+        # Buffer is already temporal (oldest-first): set _idx == phys rows so
+        # RotatingKVCache._temporal_order is a no-op, and offset stays
+        # absolute so size()==valid==phys_rows and RoPE positions are right.
+        cache._idx = cache.keys.shape[2]
+        cache.offset = offset_b
+        return cache
 
     def trim_per_stream(self, n_per_stream) -> None:
         """Roll back per-stream LOGICAL offsets after a speculative cycle

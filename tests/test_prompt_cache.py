@@ -768,6 +768,63 @@ class TestPromptCache(unittest.TestCase):
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
 
+    def test_per_stream_extract_then_merge_ragged(self):
+        """Regression: PerStreamBatchRotatingKVCache.extract must reconstruct a
+        consistent single-stream cache (phys_rows == size()) from the wide
+        modular ring, and a subsequent ragged-length merge must not broadcast-
+        crash.
+
+        Before the fix, the inherited BatchRotatingKVCache.extract sliced with
+        the ring write head (offset % ring_width) and returned far fewer rows
+        than size() reported, so merging extract(0) (size 128, ~few phys rows)
+        against a short snapshot crashed the DSv4 runner with
+        "[broadcast_shapes] Shapes (1,1,15,512) and (1,1,128,512) cannot be
+        broadcast". (2026-06-15)
+        """
+        from mlx_lm.models.cache import PerStreamBatchRotatingKVCache
+
+        max_size = 128
+        H, Dk = 2, 4
+        ring = max_size + PerStreamBatchRotatingKVCache._RING_SLACK
+
+        # Decode a B=2 per-stream cache well past the window so the ring wraps.
+        # Plant each row's logical position into channel 0 of K so we can
+        # verify the extracted KV is the correct temporal window.
+        n = 140
+        ps = PerStreamBatchRotatingKVCache(max_size=max_size, left_padding=[0, 0])
+        for pos in range(n):
+            k = mx.full((2, H, 1, Dk), float(pos))
+            v = mx.full((2, H, 1, Dk), float(pos) + 1000.0)
+            ps.update_and_fetch(k, v)
+        mx.eval(ps.keys, ps.values, ps.offset)
+        self.assertEqual(ps.keys.shape[2], ring)
+
+        ex = ps.extract(0)
+        mx.eval(ex.keys, ex.values)
+        # The whole point: physical rows match the reported logical size.
+        self.assertEqual(ex.keys.shape[2], ex.size())
+        valid = min(int(ex.offset), max_size)
+        self.assertEqual(ex.keys.shape[2], valid)
+        # And the rows are the most-recent `valid` positions, oldest-first.
+        expected = list(range(int(ex.offset) - valid, int(ex.offset)))
+        got = ex.keys[0, 0, :, 0].tolist()
+        for g, p in zip(got, expected):
+            self.assertAlmostEqual(g, float(p), places=3)
+
+        # The production crash: merge the long extracted stream with a short
+        # freshly-prefilled snapshot. Must not raise.
+        snap = RotatingKVCache(max_size=max_size)
+        snap.update_and_fetch(mx.zeros((1, H, 15, Dk)), mx.zeros((1, H, 15, Dk)))
+        mx.eval(snap.keys)
+        merged = BatchRotatingKVCache.merge([ex, snap])
+        mx.eval(merged.keys, merged.values)
+        self.assertEqual(merged.keys.shape, (2, H, valid, Dk))
+        self.assertEqual(merged.offset.tolist(), [int(ex.offset), 15])
+        # Stream 0's real tokens are right-aligned; verify the tail positions.
+        tail = merged.keys[0, 0, -valid:, 0].tolist()
+        for g, p in zip(tail, expected):
+            self.assertAlmostEqual(g, float(p), places=3)
+
 
 if __name__ == "__main__":
     unittest.main()
