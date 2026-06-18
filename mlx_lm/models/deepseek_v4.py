@@ -731,83 +731,10 @@ def _o_pre_b(out: mx.array) -> mx.array:
     return out.transpose(0, 2, 1, 3).flatten(-2)
 
 
-def _try_fuse_two_quantized_linears(
-    holder: nn.Module,
-    name_a: str,
-    name_b: str,
-    fused_prefix: str,
-) -> bool:
-    """Concatenate two same-input QuantizedLinears along the output axis.
-
-    Stores fused weights as ``f"_{fused_prefix}_w" / "_s" / "_b"`` on
-    ``holder`` along with ``f"_{fused_prefix}_n"`` (the size of the first
-    half) and ``_fused_group_size / _fused_bits / _fused_mode``. Frees
-    the original sub-linears by replacing them with empty modules.
-
-    Returns True on success, False if the projections aren't both
-    quantized or share incompatible modes/group_sizes/bits. Idempotent.
-    """
-    a: Any = getattr(holder, name_a)
-    b: Any = getattr(holder, name_b)
-    for proj_name, proj in ((name_a, a), (name_b, b)):
-        for attr in ("weight", "scales", "group_size", "bits", "mode"):
-            if not hasattr(proj, attr):
-                return False
-    if a.group_size != b.group_size or a.bits != b.bits or a.mode != b.mode:
-        return False
-
-    a_w = a["weight"]
-    b_w = b["weight"]
-    a_s = a["scales"]
-    b_s = b["scales"]
-    a_bias = a.get("biases") if hasattr(a, "get") else None
-    b_bias = b.get("biases") if hasattr(b, "get") else None
-
-    setattr(holder, f"_{fused_prefix}_w", mx.concatenate([a_w, b_w], axis=0))
-    setattr(holder, f"_{fused_prefix}_s", mx.concatenate([a_s, b_s], axis=0))
-    fused_b = (
-        mx.concatenate([a_bias, b_bias], axis=0)
-        if a_bias is not None and b_bias is not None
-        else None
-    )
-    setattr(holder, f"_{fused_prefix}_b", fused_b)
-    setattr(holder, f"_{fused_prefix}_n", int(a_w.shape[0]))
-    holder._fused_group_size = int(a.group_size)  # type: ignore[attr-defined]
-    holder._fused_bits = int(a.bits)  # type: ignore[attr-defined]
-    holder._fused_mode = a.mode  # type: ignore[attr-defined]
-
-    fused_w = getattr(holder, f"_{fused_prefix}_w")
-    fused_s = getattr(holder, f"_{fused_prefix}_s")
-    mx.eval(fused_w, fused_s)
-    if fused_b is not None:
-        mx.eval(fused_b)
-
-    setattr(holder, name_a, nn.Module())
-    setattr(holder, name_b, nn.Module())
-    return True
-
-
-def _fused_quantized_matmul(holder: nn.Module, fused_prefix: str, x: mx.array):
-    """Issue a single quantized_matmul against fused weights and split.
-
-    Returns ``(first_half, second_half)`` where ``first_half`` has
-    ``..._{fused_prefix}_n`` columns and ``second_half`` has the rest.
-    """
-    fused_w = getattr(holder, f"_{fused_prefix}_w")
-    fused_s = getattr(holder, f"_{fused_prefix}_s")
-    fused_b = getattr(holder, f"_{fused_prefix}_b")
-    n = getattr(holder, f"_{fused_prefix}_n")
-    out = mx.quantized_matmul(
-        x,
-        fused_w,
-        scales=fused_s,
-        biases=fused_b,
-        transpose=True,
-        group_size=holder._fused_group_size,  # type: ignore[attr-defined]
-        bits=holder._fused_bits,  # type: ignore[attr-defined]
-        mode=holder._fused_mode,  # type: ignore[attr-defined]
-    )
-    return out[..., :n], out[..., n:]
+# _try_fuse_two_quantized_linears / _fused_quantized_matmul REMOVED 2026-06-18:
+# helpers for the DSv4 wq_a+wkv / kv+gate fusions, which batch-mis-specialized
+# at BS>1 (concurrent MTP verify → repetition degeneration). All callers
+# removed. Redo batch-correctly later. See module/auto_parallel header.
 
 
 @mx.compile
@@ -1379,73 +1306,11 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.swiglu_limit = swiglu_limit
 
-    def fuse_gate_up_weights(self) -> None:
-        """Concatenate gate_proj + up_proj weights along the output axis.
-
-        Phase H: lets ``__call__`` issue a single quantized matmul instead
-        of two for the gate/up projections. Saves one Metal dispatch per
-        DSv4 layer per decode token (60 dispatches/cycle on DSv4-Flash).
-        Bit-equivalent: ``concat(x@G.T, x@U.T) == x @ concat(G, U).T``.
-
-        Idempotent. Requires both projections quantized with the same
-        group_size / bits / mode (true for DSv4: both mxfp8). Frees
-        gate_proj/up_proj weights after fusion to keep memory flat.
-        """
-        gp: Any = self.gate_proj
-        up: Any = self.up_proj
-        for proj_name, proj in (("gate_proj", gp), ("up_proj", up)):
-            for attr in ("weight", "scales", "group_size", "bits", "mode"):
-                if not hasattr(proj, attr):
-                    return  # not quantized — skip silently
-        if (
-            gp.group_size != up.group_size
-            or gp.bits != up.bits
-            or gp.mode != up.mode
-        ):
-            return
-
-        gp_w = gp["weight"]
-        up_w = up["weight"]
-        gp_s = gp["scales"]
-        up_s = up["scales"]
-        gp_b = gp.get("biases") if hasattr(gp, "get") else None
-        up_b = up.get("biases") if hasattr(up, "get") else None
-
-        self._fused_gu_w = mx.concatenate([gp_w, up_w], axis=0)
-        self._fused_gu_s = mx.concatenate([gp_s, up_s], axis=0)
-        self._fused_gu_b = (
-            mx.concatenate([gp_b, up_b], axis=0)
-            if gp_b is not None and up_b is not None
-            else None
-        )
-        self._fused_gu_n = int(gp_w.shape[0])
-        self._fused_group_size = int(gp.group_size)
-        self._fused_bits = int(gp.bits)
-        self._fused_mode = gp.mode
-        mx.eval(self._fused_gu_w, self._fused_gu_s)
-        if self._fused_gu_b is not None:
-            mx.eval(self._fused_gu_b)
-
-        # Free originals — gate_proj/up_proj are now dead weight.
-        self.gate_proj = nn.Module()
-        self.up_proj = nn.Module()
+    # fuse_gate_up_weights REMOVED 2026-06-18: the gate+up fusion path
+    # batch-mis-specialized at BS>1 (concurrent MTP verify → repetition
+    # degeneration). See module/auto_parallel header. Redo batch-correctly.
 
     def __call__(self, x: mx.array) -> mx.array:
-        if hasattr(self, "_fused_gu_w"):
-            gu = mx.quantized_matmul(
-                x,
-                self._fused_gu_w,
-                scales=self._fused_gu_s,
-                biases=self._fused_gu_b,
-                transpose=True,
-                group_size=self._fused_group_size,
-                bits=self._fused_bits,
-                mode=self._fused_mode,
-            )
-            n = self._fused_gu_n
-            x_gate = gu[..., :n]
-            x_up = gu[..., n:]
-            return self.down_proj(_limited_swiglu(x_gate, x_up, self.swiglu_limit))
         return self.down_proj(
             _limited_swiglu(self.gate_proj(x), self.up_proj(x), self.swiglu_limit)
         )
@@ -1483,58 +1348,16 @@ class DeepseekV4MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
         )
         self.sharding_group = None
-        self._compiled_forward: Optional[Any] = None
 
-    def install_compiled_forward(self) -> None:
-        """Phase H mx.compile: trace the FFN body once and reuse on every
-        subsequent decode step.
-
-        The compile boundary covers the **pure local compute** —
-        gate / switch_mlp / shared_experts / post_combine. The cross-rank
-        ``mx.distributed.all_sum`` is held outside compile so the
-        post-allreduce ``mx.eval`` fence (the same one in the span path)
-        can fire and force cross-rank lockstep. At c=2 long context
-        without the fence, JACCL ack barriers wait on the slowest rank
-        and per-stream throughput collapses (~7-8 tok/s vs ~17 with
-        fence). Idempotent. Call after weights are loaded and
-        ``sharding_group`` is set so the compile boundary closes over the
-        final weight identities.
-        """
-        if self._compiled_forward is not None:
-            return
-        self._compiled_forward = mx.compile(self._raw_local)
-
-    def _raw_local(self, x: mx.array, input_ids: mx.array) -> mx.array:
-        """Pure local compute portion of the MoE forward — no collective.
-
-        This is the part inside the ``mx.compile`` boundary. The
-        cross-rank ``all_sum`` happens outside (in ``__call__`` and in
-        ``DeepseekV4Block`` callers) so the post-allreduce eval fence can
-        fire without poisoning the compile cache.
-        """
-        if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
-        inds, scores = self.gate(x, input_ids)
-        y = self.switch_mlp(x, inds)
-        shared_out = self.shared_experts(x)
-        return _moe_post_combine(y, scores, shared_out)
-
-    def _raw_forward(self, x: mx.array, input_ids: mx.array) -> mx.array:
-        """Pure compute + cross-rank allreduce, eval-free.
-
-        Kept for callers (e.g. ``DeepseekV4Block._raw_ffn_section``) that
-        wrap the entire FFN in their own outer compile and provide the
-        cross-rank fence themselves.
-        """
-        y = self._raw_local(x, input_ids)
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-        return y
+    # install_compiled_forward / _raw_local / _raw_forward + the compiled
+    # fast-path in __call__ REMOVED 2026-06-18: the mx.compile FFN-body path
+    # batch-mis-specialized at BS>1 (concurrent MTP verify → repetition
+    # degeneration). The span path below is the sole, unfused forward. Redo
+    # batch-correctly later. See module/auto_parallel header + diagnosis doc.
 
     def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
         # 2026-05-18 allsum probe: declare _ALLSUM_PROBE_CYCLES as global so
-        # the per-branch increments at the two fence sites below are well-
-        # formed regardless of which branch runs first. Free when probe off.
+        # the per-branch increments at the fence site below are well-formed.
         global _ALLSUM_PROBE_CYCLES
         if "moe" in _get_nop_targets():
             return mx.zeros(x.shape, dtype=x.dtype)
@@ -1554,59 +1377,6 @@ class DeepseekV4MoE(nn.Module):
                     _route_hist_record(self.layer_idx, _ri)
             except Exception:
                 pass
-        # Fast path: pre-compiled local trace + Python-level allreduce
-        # with the fence eval. Mirrors the span-path semantics.
-        if self._compiled_forward is not None:
-            _ffnsub = _SECTION_TIME_ENABLED
-            _ff_t = 0.0
-            if _ffnsub:
-                mx.synchronize()
-                _ff_t = _BUILD_PROBE_PERF()
-            y = self._compiled_forward(x, input_ids)
-            if _ffnsub:
-                mx.eval(y)
-                mx.synchronize()
-                _ff_exp = _BUILD_PROBE_PERF()
-                _FFN_SUB_ACC["experts"] += (_ff_exp - _ff_t)
-                _ff_t = _ff_exp
-            if self.sharding_group is not None:
-                y = mx.distributed.all_sum(y, group=self.sharding_group)
-                if _ffnsub:
-                    mx.eval(y)
-                    mx.synchronize()
-                    _ff_as = _BUILD_PROBE_PERF()
-                    _FFN_SUB_ACC["all_sum"] += (_ff_as - _ff_t)
-                    _FFN_SUB_ACC["n"] += 1
-                # Cross-rank lockstep fence — see install_compiled_forward
-                # docstring. Without this, JACCL ack barriers serialize
-                # on the slowest rank at long c=2 context.
-                # Lever 6: with EXO_DSV4_FENCE_EVERY_N_LAYERS>=2, only fence
-                # every Nth layer (plus the final layer). Reduces sync
-                # points per cycle.
-                _is_last = self.layer_idx == self._num_total_layers - 1
-                _is_fence_idx = (self.layer_idx % self._fence_every_n) == (
-                    self._fence_every_n - 1
-                )
-                if _is_last or _is_fence_idx:
-                    if _ALLSUM_PROBE_ENABLED:
-                        import time as _ap_t
-                        _t0 = _ap_t.perf_counter()
-                        mx.eval(y)
-                        _ms = (_ap_t.perf_counter() - _t0) * 1000.0
-                        _ALLSUM_PROBE_ACC.setdefault(
-                            self.layer_idx, []
-                        ).append(_ms)
-                        if _is_last:
-                            _ALLSUM_PROBE_CYCLES += 1
-                            if (
-                                _ALLSUM_PROBE_CYCLES
-                                % _ALLSUM_PROBE_LOG_EVERY
-                                == 0
-                            ):
-                                _allsum_probe_dump()
-                    else:
-                        mx.eval(y)
-            return y
 
         with span("ffn"):
             if self.sharding_group is not None:
@@ -1689,66 +1459,10 @@ class Compressor(nn.Module):
             freq_scale=compress_ratio,
         )
 
-    def fuse_kv_gate_weights(self) -> None:
-        """Concatenate wkv + wgate weights along the output axis.
-
-        Phase H: lets ``__call__`` issue a single quantized matmul instead
-        of two for the kv/gate projections. Saves one Metal dispatch per
-        compressor per decode token. Compressors are NOT sharded, so this
-        runs as one local quantized_matmul per rank. Bit-equivalent.
-        """
-        wkv: Any = self.wkv
-        wgate: Any = self.wgate
-        for proj_name, proj in (("wkv", wkv), ("wgate", wgate)):
-            for attr in ("weight", "scales", "group_size", "bits", "mode"):
-                if not hasattr(proj, attr):
-                    return  # not quantized — skip
-        if (
-            wkv.group_size != wgate.group_size
-            or wkv.bits != wgate.bits
-            or wkv.mode != wgate.mode
-        ):
-            return
-
-        kv_w = wkv["weight"]
-        g_w = wgate["weight"]
-        kv_s = wkv["scales"]
-        g_s = wgate["scales"]
-        kv_b = wkv.get("biases") if hasattr(wkv, "get") else None
-        g_b = wgate.get("biases") if hasattr(wgate, "get") else None
-
-        self._fused_kg_w = mx.concatenate([kv_w, g_w], axis=0)
-        self._fused_kg_s = mx.concatenate([kv_s, g_s], axis=0)
-        self._fused_kg_b = (
-            mx.concatenate([kv_b, g_b], axis=0)
-            if kv_b is not None and g_b is not None
-            else None
-        )
-        self._fused_kg_n = int(kv_w.shape[0])
-        self._fused_group_size = int(wkv.group_size)
-        self._fused_bits = int(wkv.bits)
-        self._fused_mode = wkv.mode
-        mx.eval(self._fused_kg_w, self._fused_kg_s)
-        if self._fused_kg_b is not None:
-            mx.eval(self._fused_kg_b)
-
-        self.wkv = nn.Module()
-        self.wgate = nn.Module()
+    # fuse_kv_gate_weights REMOVED 2026-06-18 (BS>1 fusion degeneration;
+    # see module/auto_parallel header). _project_kv_gate keeps the unfused path.
 
     def _project_kv_gate(self, x: mx.array) -> Tuple[mx.array, mx.array]:
-        if hasattr(self, "_fused_kg_w"):
-            gu = mx.quantized_matmul(
-                x,
-                self._fused_kg_w,
-                scales=self._fused_kg_s,
-                biases=self._fused_kg_b,
-                transpose=True,
-                group_size=self._fused_group_size,
-                bits=self._fused_bits,
-                mode=self._fused_mode,
-            )
-            n = self._fused_kg_n
-            return gu[..., :n], gu[..., n:]
         return self.wkv(x), self.wgate(x)
 
     def __call__(
@@ -2217,21 +1931,10 @@ class LocalAttention(nn.Module):
 
         self.sharding_group = None
 
-    def fuse_qa_kv_weights(self) -> bool:
-        """Phase H: fuse wq_a + wkv weights into a single quantized matmul.
-
-        Both consume the same input ``x`` and are NOT sharded
-        (q_lora_rank/head_dim are per-rank duplicated). Concatenating
-        along the output axis collapses two ``mx.quantized_matmul``
-        dispatches into one per attention block per decode token. The
-        downstream q_norm/wq_b path consumes the q_lora half; kv_norm
-        the kv half — both unchanged. Bit-equivalent.
-        """
-        return _try_fuse_two_quantized_linears(self, "wq_a", "wkv", "fused_qkv")
+    # fuse_qa_kv_weights REMOVED 2026-06-18 (BS>1 fusion degeneration;
+    # see module/auto_parallel header). _project_qa_kv keeps the unfused path.
 
     def _project_qa_kv(self, x: mx.array) -> Tuple[mx.array, mx.array]:
-        if hasattr(self, "_fused_qkv_w"):
-            return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
 
     def __call__(
@@ -2354,15 +2057,10 @@ class CompressedAttention(nn.Module):
 
         self.sharding_group = None
 
-    def fuse_qa_kv_weights(self) -> bool:
-        """Phase H: fuse wq_a + wkv into a single quantized matmul.
-        See LocalAttention.fuse_qa_kv_weights for details. Bit-equivalent.
-        """
-        return _try_fuse_two_quantized_linears(self, "wq_a", "wkv", "fused_qkv")
+    # fuse_qa_kv_weights REMOVED 2026-06-18 (BS>1 fusion degeneration;
+    # see module/auto_parallel header). _project_qa_kv keeps the unfused path.
 
     def _project_qa_kv(self, x: mx.array) -> Tuple[mx.array, mx.array]:
-        if hasattr(self, "_fused_qkv_w"):
-            return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
 
     def __call__(
@@ -2544,15 +2242,10 @@ class SparseCompressedAttention(nn.Module):
 
         self.sharding_group = None
 
-    def fuse_qa_kv_weights(self) -> bool:
-        """Phase H: fuse wq_a + wkv into a single quantized matmul.
-        See LocalAttention.fuse_qa_kv_weights for details. Bit-equivalent.
-        """
-        return _try_fuse_two_quantized_linears(self, "wq_a", "wkv", "fused_qkv")
+    # fuse_qa_kv_weights REMOVED 2026-06-18 (BS>1 fusion degeneration;
+    # see module/auto_parallel header). _project_qa_kv keeps the unfused path.
 
     def _project_qa_kv(self, x: mx.array) -> Tuple[mx.array, mx.array]:
-        if hasattr(self, "_fused_qkv_w"):
-            return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
 
     def __call__(
@@ -2886,80 +2579,11 @@ class DeepseekV4Block(nn.Module):
         self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn_hc = HyperConnection(config)
         self.ffn_hc = HyperConnection(config)
-        self._compiled_attn_pre: Optional[Any] = None
-        self._compiled_post_attn: Optional[Any] = None
-        self._compiled_ffn_pre: Optional[Any] = None
-        self._compiled_post_ffn: Optional[Any] = None
-
-    def install_compiled_forward(self) -> None:
-        """Phase H+ mx.compile of the layer's pure subsections.
-
-        Splits the layer body around the cache-mutating attention call
-        AND around the FFN's cross-rank allreduce so the post-allreduce
-        eval fence (in DeepseekV4MoE.__call__) can fire:
-
-          * ``_raw_attn_pre``   — attn_hc + attn_norm
-          * ``[uncompiled]``    — attention proper (cache.update_and_fetch)
-          * ``_raw_post_attn``  — hc_expand back into the residual
-          * ``_raw_ffn_pre``    — ffn_hc + ffn_norm
-          * ``[ffn.__call__]``  — MoE body via its own compile + eval fence
-          * ``_raw_post_ffn``   — hc_expand back into the residual
-
-        Earlier (76016ec) we tried a single ``_raw_ffn_section`` compile
-        that called ``self.ffn._raw_forward`` directly, but that put the
-        all_sum inside the V4Block compile boundary and lost the
-        cross-rank eval fence — c=2 100K collapsed to ~7.7 tok/s vs
-        ~17 with the fence intact. Splitting the FFN restores the
-        fence at the cost of one extra compile-cache lookup per layer
-        (acceptable: each call is microseconds).
-
-        Idempotent — safe to call multiple times.
-        """
-        if self._compiled_attn_pre is not None:
-            return
-        self._compiled_attn_pre = mx.compile(self._raw_attn_pre)
-        self._compiled_post_attn = mx.compile(self._raw_post_attn)
-        self._compiled_ffn_pre = mx.compile(self._raw_ffn_pre)
-        self._compiled_post_ffn = mx.compile(self._raw_post_ffn)
-
-    def _raw_attn_pre(
-        self, h: mx.array
-    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
-        """HC + RMSNorm fused into one compiled trace.
-
-        Returns ``(normed, residual, post, comb)`` where ``residual``
-        is the original ``h`` (kept inside the trace so the post-attn
-        hc_expand can read it without a separate Python ref).
-        """
-        x, post, comb = self.attn_hc(h)
-        normed = self.attn_norm(x)
-        return normed, h, post, comb
-
-    def _raw_post_attn(
-        self,
-        attn_out: mx.array,
-        residual: mx.array,
-        post: mx.array,
-        comb: mx.array,
-    ) -> mx.array:
-        return hc_expand(attn_out, residual, post, comb)
-
-    def _raw_ffn_pre(
-        self, h: mx.array
-    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
-        """HC + RMSNorm fused into one compiled trace, FFN side."""
-        x, post, comb = self.ffn_hc(h)
-        normed = self.ffn_norm(x)
-        return normed, h, post, comb
-
-    def _raw_post_ffn(
-        self,
-        ffn_out: mx.array,
-        residual: mx.array,
-        post: mx.array,
-        comb: mx.array,
-    ) -> mx.array:
-        return hc_expand(ffn_out, residual, post, comb)
+    # install_compiled_forward + _raw_attn_pre/_raw_post_attn/_raw_ffn_pre/
+    # _raw_post_ffn + the compiled fast-path in __call__ REMOVED 2026-06-18:
+    # the V4Block-level mx.compile path batch-mis-specialized at BS>1
+    # (concurrent MTP verify → repetition degeneration). The span path below
+    # is the sole forward. Redo batch-correctly. See module/auto_parallel header.
 
     def __call__(
         self,
@@ -2970,71 +2594,6 @@ class DeepseekV4Block(nn.Module):
     ) -> mx.array:
         if "v4block" in _get_nop_targets():
             return h  # NOP: pass residual through unchanged
-        # Fast path — pre-traced compile graphs skip the per-step
-        # Python lazy-graph build for the layer's pure chunks. The
-        # FFN goes through ``self.ffn`` (MoE.__call__) so its post-allreduce
-        # mx.eval fence fires — required for cross-rank lockstep at
-        # c=2 long context.
-        if self._compiled_attn_pre is not None:
-            # Per-section CPU build-time probe (env-gated MLX_BUILD_PROBE=1).
-            # Times each of the 6 calls and accumulates into a process-global
-            # dict. The probe is no-op when the env var is unset.
-            _bp = _BUILD_PROBE_ENABLED
-            _st = _SECTION_TIME_ENABLED
-            _st0 = _st1 = _st2 = _st3 = 0.0
-            if _bp:
-                _bt0 = _BUILD_PROBE_PERF()
-            # GPU-time section probe: mx.synchronize() boundaries so each
-            # perf_counter delta is real device kernel time, not lazy build.
-            if _st:
-                mx.synchronize()
-                _st0 = _BUILD_PROBE_PERF()
-            normed, residual, post, comb = self._compiled_attn_pre(h)
-            if _bp:
-                _bt1 = _BUILD_PROBE_PERF()
-            x = self.attn(normed, mask=mask, cache=cache)
-            if _bp:
-                _bt2 = _BUILD_PROBE_PERF()
-            if _st:
-                mx.eval(x)
-                mx.synchronize()
-                _st1 = _BUILD_PROBE_PERF()
-            h = self._compiled_post_attn(x, residual, post, comb)
-            if _bp:
-                _bt3 = _BUILD_PROBE_PERF()
-            normed, residual, post, comb = self._compiled_ffn_pre(h)
-            if _bp:
-                _bt4 = _BUILD_PROBE_PERF()
-            if _st:
-                mx.eval(normed)
-                mx.synchronize()
-                _st2 = _BUILD_PROBE_PERF()
-            x = self.ffn(normed, input_ids)
-            if _bp:
-                _bt5 = _BUILD_PROBE_PERF()
-            if _st:
-                mx.eval(x)
-                mx.synchronize()
-                _st3 = _BUILD_PROBE_PERF()
-            out = self._compiled_post_ffn(x, residual, post, comb)
-            if _bp:
-                _bt6 = _BUILD_PROBE_PERF()
-                _BUILD_PROBE_ACC["attn_pre"] += (_bt1 - _bt0)
-                _BUILD_PROBE_ACC["attn"] += (_bt2 - _bt1)
-                _BUILD_PROBE_ACC["post_attn"] += (_bt3 - _bt2)
-                _BUILD_PROBE_ACC["ffn_pre"] += (_bt4 - _bt3)
-                _BUILD_PROBE_ACC["ffn"] += (_bt5 - _bt4)
-                _BUILD_PROBE_ACC["post_ffn"] += (_bt6 - _bt5)
-                _BUILD_PROBE_ACC["layer_count"] += 1
-            if _st:
-                # _st0..1 spans attn_pre + attn; _st1..2 spans post_attn +
-                # ffn_pre ("other"); _st2..3 spans ffn. Attribute the small
-                # pre/post compiled chunks to "other".
-                _SECTION_TIME_ACC["attn"] += (_st1 - _st0)
-                _SECTION_TIME_ACC["other"] += (_st2 - _st1)
-                _SECTION_TIME_ACC["ffn"] += (_st3 - _st2)
-                _SECTION_TIME_ACC["layer_count"] += 1
-            return out
 
         residual = h
         with span("layer.attn_hc"):
