@@ -131,6 +131,17 @@ _SEQ_SPLIT_MIN_L = int(os.environ.get("EXO_DSV4_SEQ_SPLIT_MIN_L", "16"))
 # catastrophic: 290->120 tok/s, all in this gathered tensor). 0 disables tiling.
 _SPARSE_SDPA_TILE = int(os.environ.get("EXO_DSV4_SPARSE_SDPA_TILE", "128"))
 
+# Tiled-P indexer score: when > 0 and the pooled length P exceeds this block
+# size, _indexer_score is computed in contiguous P-blocks and concatenated, so
+# the full (B, 64, L, P) pre-collapse scores tensor never materializes (only one
+# (B,64,L,p_block) transient at a time). Bounds the per-call peak allocation that
+# drives the high-context prefill stall spikes (profiler 2026-06-21: attn.indexer
+# max/avg ~4x, ~22ms spikes at 360K ctx, the dominant prefill-cliff cost). 0
+# (default) = OFF = full-P path, zero behaviour change. Bit-identical output;
+# see bench/indexer_score_microbench.py. Tune block size for the alloc/overhead
+# tradeoff (smaller = lower peak, more kernel launches).
+_INDEXER_PBLOCK = int(os.environ.get("EXO_DSV4_INDEXER_PBLOCK", "0"))
+
 
 # FFN sub-attribution (same gate): expert compute vs the cross-rank all_sum
 # (RDMA reduction). Quantifies how much of the ~50%-of-prefill MoE bucket is
@@ -1779,6 +1790,75 @@ def _indexer_score(
     return (scores_blph @ w).squeeze(-1)            # (B, L, P)
 
 
+@partial(mx.compile, shapeless=True)
+def _indexer_score_tile(
+    q: mx.array,
+    pooled_tile: mx.array,
+    w: mx.array,
+    n_heads_inv_sqrt: float,
+):
+    """One P-tile of the indexer score. Bit-identical to the corresponding
+    P-slice of ``_indexer_score``: same q @ pooled.T -> transpose -> @ w math,
+    restricted to a contiguous block of the pooled (P) axis. ``w`` is the
+    already-sigmoid'd, scale-folded per-head weight ``(B, L, H, 1)`` passed in
+    once by the caller (identical across tiles), so the only per-tile work is
+    the GEMM + collapse over this block.
+
+    ``shapeless=True`` so the single compiled kernel serves every tile width
+    (including the ragged final tile) without per-size recompilation — same
+    rationale as ``_indexer_score``.
+    """
+    pf = pooled_tile[:, None]                        # (B, 1, P_blk, D)
+    scores = q @ pf.swapaxes(-1, -2)                 # (B, H, L, P_blk)
+    scores_blph = scores.transpose(0, 2, 3, 1)       # (B, L, P_blk, H)
+    return (scores_blph @ w).squeeze(-1)             # (B, L, P_blk)
+
+
+def _indexer_score_tiled(
+    q: mx.array,
+    pooled: mx.array,
+    weights_x: mx.array,
+    scale: float,
+    n_heads_inv_sqrt: float,
+    p_block: int,
+):
+    """Tiled-P variant of ``_indexer_score``.
+
+    Processes the pooled (P) axis in contiguous blocks of ``p_block`` and
+    concatenates the collapsed ``(B, L, P_blk)`` results along P, so the full
+    pre-collapse ``(B, H=64, L, P)`` scores tensor (and its transpose) is never
+    materialized — only one ``(B, 64, L, p_block)`` transient exists at a time.
+    This bounds the per-call peak allocation that drives the high-context
+    prefill stall spikes (profiler: attn.indexer max/avg ~4x, ~22ms spikes at
+    360K ctx) while keeping the output mathematically identical to the
+    full-P path: concatenating per-block collapses of an op that is independent
+    across the P axis equals the full op. Bit-exactness is asserted in
+    bench/indexer_score_microbench.py.
+
+    Falls back to the full-P kernel when ``P <= p_block`` (single tile) so small
+    contexts (and decode, L==1, P small) pay zero overhead.
+    """
+    P = pooled.shape[1]
+    if P <= p_block:
+        return _indexer_score(q, pooled, weights_x, scale, n_heads_inv_sqrt)
+    # Per-head weight is identical across tiles; compute once (cheap (B,L,H,1)).
+    w = (mx.sigmoid(weights_x) * (scale * n_heads_inv_sqrt))[..., None]
+    out_tiles = []
+    for p0 in range(0, P, p_block):
+        pooled_tile = pooled[:, p0 : p0 + p_block]
+        tile = _indexer_score_tile(q, pooled_tile, w, n_heads_inv_sqrt)
+        # Force-materialize this tile's (B,L,p_block) collapse BEFORE building the
+        # next tile's graph. Without this, MLX's lazy evaluation keeps every
+        # tile's large (B,64,L,p_block) pre-collapse transient alive until the
+        # final concatenate evals — so peak memory equals the full-P path (no
+        # win). Evaluating per tile frees each transient first: measured peak
+        # 4.36GB (full-P) -> 0.46GB (block=16384) at P=250K, L=128. The collapsed
+        # tile kept across iterations is small ((B,L,p_block), no H axis).
+        mx.eval(tile)
+        out_tiles.append(tile)
+    return mx.concatenate(out_tiles, axis=-1)        # (B, L, P)
+
+
 class Indexer(nn.Module):
     def __init__(self, config: ModelArgs, compress_ratio: int):
         super().__init__()
@@ -1838,13 +1918,23 @@ class Indexer(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = _rope_dispatch(position_rope, q, q_off)
 
-        scores = _indexer_score(
-            q,
-            pooled,
-            self.weights_proj(x),
-            self.scale,
-            self.n_heads**-0.5,
-        )
+        if _INDEXER_PBLOCK > 0:
+            scores = _indexer_score_tiled(
+                q,
+                pooled,
+                self.weights_proj(x),
+                self.scale,
+                self.n_heads**-0.5,
+                _INDEXER_PBLOCK,
+            )
+        else:
+            scores = _indexer_score(
+                q,
+                pooled,
+                self.weights_proj(x),
+                self.scale,
+                self.n_heads**-0.5,
+            )
         if pmask is not None:
             scores = mx.where(
                 pmask if pmask.ndim == 3 else pmask[None],
