@@ -462,10 +462,10 @@ def generate_step(
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             if _adaptive:
-                _step = _step_high if prompt_processed_tokens >= _crossover else _step_low
+                _chunk = _step_high if prompt_processed_tokens >= _crossover else _step_low
             else:
-                _step = prefill_step_size
-            n_to_process = min(_step, remaining)
+                _chunk = prefill_step_size
+            n_to_process = min(_chunk, remaining)
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
