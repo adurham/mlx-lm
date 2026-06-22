@@ -1970,8 +1970,15 @@ class Indexer(nn.Module):
         # quality-equivalent. Decode (L==1) keeps argsort untouched (the
         # ~5%-faster-on-Metal claim was measured at L=1), so decode is unaffected
         # by construction. Gated for clean A/B against the section-time harness.
+        #
+        # P-threshold (2026-06-21): argpartition is SLOWER than argsort on Metal
+        # at small P (kernel launch overhead dominates the O(P log P)->O(P) win).
+        # Measured: at P=500 (2K context) argpartition drops throughput 295->163
+        # t/s. Only fire when P exceeds EXO_DSV4_ARGPARTITION_MIN_P (default 0 =
+        # always fire when env enabled; set e.g. 20000 to only fire past ~80K ctx).
         if (scores.shape[1] > 1
-                and _topk_os.environ.get("EXO_DSV4_PREFILL_ARGPARTITION", "0") == "1"):
+                and _topk_os.environ.get("EXO_DSV4_PREFILL_ARGPARTITION", "0") == "1"
+                and pooled.shape[1] >= int(_topk_os.environ.get("EXO_DSV4_ARGPARTITION_MIN_P", "0"))):
             return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
         # Fallback: 2026-05-13 argsort+slice. Bit-equivalent to argpartition
         # +slice for this shape and ~5% faster on Apple's Metal kernel.
