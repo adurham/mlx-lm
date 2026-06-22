@@ -443,9 +443,29 @@ def generate_step(
         )
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        # Context-adaptive prefill chunk sizing (EXO). The optimal chunk size
+        # depends on context: larger chunks (e.g. 256) amortize the per-chunk
+        # fixed overhead (43 layers x kernel launches x RDMA all_sum x eval x
+        # clear_cache ~390ms) at LOW context, but at HIGH context the indexer
+        # scores transient (B, H=64, L, P) scales with both chunk size L and
+        # pooled context P, so larger chunks hit memory bandwidth pressure.
+        # Measured on DSv4-Flash 2x M4 Max: 256-chunk is +39% at 100K but -30%
+        # at 380K vs 128-chunk. So start large and shrink past a crossover.
+        # EXO_PREFILL_STEP_SIZE_HIGH_CTX (default 128): chunk size at high ctx.
+        # EXO_PREFILL_STEP_SIZE_CROSSOVER (default 200000): context threshold.
+        # When the high-ctx env is unset, behavior is unchanged (fixed step).
+        import os as _os
+        _step_low = prefill_step_size
+        _step_high = int(_os.environ.get("EXO_PREFILL_STEP_SIZE_HIGH_CTX", "0"))
+        _crossover = int(_os.environ.get("EXO_PREFILL_STEP_SIZE_CROSSOVER", "0"))
+        _adaptive = _step_high > 0 and _crossover > 0 and _step_low > _step_high
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-            n_to_process = min(prefill_step_size, remaining)
+            if _adaptive:
+                _step = _step_high if prompt_processed_tokens >= _crossover else _step_low
+            else:
+                _step = prefill_step_size
+            n_to_process = min(_step, remaining)
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
