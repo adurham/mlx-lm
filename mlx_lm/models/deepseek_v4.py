@@ -1127,7 +1127,9 @@ def _sparse_pooled_attention(
         # pooled_gathered shape: (B, 1, 1, k, D) — squeeze the L axis at axis=2
         # OPT-5 (2026-06-22): direct gather from pooled instead of take_along_axis
         # on broadcast. Bit-exact, 5x faster, does not scale with P.
-        pooled_kv = pooled[:, topk, :]  # (B, 1, k, D)
+        # pooled[:, topk, :] gives (B, B, L, k, D) = (1,1,1,k,D) for B=1;
+        # squeeze the L axis to get (B, 1, k, D).
+        pooled_kv = pooled[:, topk, :].squeeze(2)
         # Concat along seq axis: local_kv (B, 1, sw, D) + pooled_kv (B, 1, k, D)
         combined_kv = mx.concatenate([local_kv, pooled_kv], axis=2)
 
@@ -1229,11 +1231,13 @@ def _sparse_pooled_attention(
     # Large L_q (prefill chunk): batched inner kernel.
     # OPT-5 (2026-06-22): direct gather from pooled instead of take_along_axis
     # on a broadcast source. The broadcast (B,1,L,P,D) materializes/iterates
-    # O(P) memory per call (~12.5GB at P=95000) even though only k entries are
-    # gathered per query. Direct indexing pooled[:, topk, :] touches only the
-    # k selected entries — 5x faster and does NOT scale with P. Bit-exact
-    # (max diff 0.0 verified). Removes the SDPA scaling cost at high context.
-    pooled_gathered = pooled[:, topk, :][:, None, :, :, :]
+    # O(P) memory per call (~12.5GB at P=95000, 380K context) even though only k
+    # entries are gathered per query. Direct indexing pooled[:, topk, :] touches
+    # only the k selected entries — 5x faster and does NOT scale with P.
+    # Bit-exact (max diff 0.0 verified). Removes the SDPA scaling cost at high
+    # context. For B=1, pooled[:, topk, :] gives (B, B, L, k, D) = (1,1,L,k,D)
+    # which is already the (B, 1, L, k, D) shape the inner kernel expects.
+    pooled_gathered = pooled[:, topk, :]
     sinks_expanded = sinks[None, :, None, None] if sinks is not None else None
     # local_scores below are (B, H, L, sliding_window); the local mask sliced
     # from the model-level windowed mask can be wider than local_kv once the
