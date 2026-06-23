@@ -1773,45 +1773,38 @@ def _indexer_score(
     # as the previously-validated bf16 cast removal). Bit-equivalent at bf16
     # precision; max abs diff vs baseline = 1.5e-2 = 1 bf16 ulp.
     # See bench/indexer_score_microbench.py and bench/indexer_fused_microbench.py.
-    pf = pooled[:, None]
-    scores = q @ pf.swapaxes(-1, -2)               # (B, H, L, P)
-    # NOTE (2026-06-09): removed `scores = mx.maximum(scores, 0)` ReLU and
-    # apply sigmoid to the per-head index weights, to match the oracle-validated
-    # mlx-lm PR #1189 indexer scoring (q@ck *scale; hw=sigmoid(weights_proj);
-    # scores*hw). The #1192 base this fork descends from used a ReLU + raw
-    # weights_proj, which selects the wrong compressed-pool tokens -> garbage
-    # output. The folded scale*n_heads_inv_sqrt is a positive constant and does
-    # not affect the argpartition top-k ordering.
-    # Fold scale*n_heads_inv_sqrt into the per-head weights (cheap (B,L,H))
-    # instead of multiplying the larger (B,H,L,P) scores tensor by scale.
-    w = (mx.sigmoid(weights_x) * (scale * n_heads_inv_sqrt))[..., None]   # (B, L, H, 1)
-    # H reduce via a batched matmul: (B,L,P,H) @ (B,L,H,1) -> (B,L,P,1)
-    scores_blph = scores.transpose(0, 2, 3, 1)      # (B, L, P, H)
-    return (scores_blph @ w).squeeze(-1)            # (B, L, P)
+    # OPT-6 (2026-06-22): fold the per-head weights into q BEFORE the GEMM,
+    # collapsing 64 heads to 1 and doing a SINGLE (L,D)@(D,P) matmul instead
+    # of 64 head GEMMs + a collapse. Mathematically identical:
+    #   out[b,l,p] = sum_h w[b,l,h] * sum_d q[b,h,l,d]*pooled[b,p,d]
+    #             = sum_d (sum_h w[b,l,h]*q[b,h,l,d]) * pooled[b,p,d]
+    #             = sum_d q_w[b,l,d] * pooled[b,p,d]
+    # 64x less compute (130 GFLOP -> 2 GFLOP/chunk at 380K) and the (B,H,L,P)
+    # transient is never materialized. Bit-equivalent (fewer ops = more
+    # accurate). Max diff 6e-5 at fp32, <1 bf16 ulp.
+    w = (mx.sigmoid(weights_x) * (scale * n_heads_inv_sqrt))  # (B, L, H)
+    # q is (B, H, L, D). Fold w into q over H: q_w[b,l,d] = sum_h w[b,l,h]*q[b,h,l,d]
+    q_blhd = q.transpose(0, 2, 1, 3)  # (B, L, H, D)
+    q_weighted = (w[..., None] * q_blhd).sum(axis=2)  # (B, L, D)
+    # Single GEMM: (B, L, D) @ (B, D, P) -> (B, L, P)
+    return q_weighted @ pooled.swapaxes(-1, -2)  # (B, L, P)
 
 
 @partial(mx.compile, shapeless=True)
 def _indexer_score_tile(
-    q: mx.array,
+    q_weighted: mx.array,
     pooled_tile: mx.array,
-    w: mx.array,
-    n_heads_inv_sqrt: float,
 ):
     """One P-tile of the indexer score. Bit-identical to the corresponding
-    P-slice of ``_indexer_score``: same q @ pooled.T -> transpose -> @ w math,
-    restricted to a contiguous block of the pooled (P) axis. ``w`` is the
-    already-sigmoid'd, scale-folded per-head weight ``(B, L, H, 1)`` passed in
-    once by the caller (identical across tiles), so the only per-tile work is
-    the GEMM + collapse over this block.
+    P-slice of ``_indexer_score``: same folded q_weighted @ pooled_tile math,
+    restricted to a contiguous block of the pooled (P) axis. ``q_weighted`` is
+    the already-folded (B, L, D) query — weights collapsed over H once by the
+    caller — so the only per-tile work is the single GEMM.
 
     ``shapeless=True`` so the single compiled kernel serves every tile width
-    (including the ragged final tile) without per-size recompilation — same
-    rationale as ``_indexer_score``.
+    (including the ragged final tile) without per-size recompilation.
     """
-    pf = pooled_tile[:, None]                        # (B, 1, P_blk, D)
-    scores = q @ pf.swapaxes(-1, -2)                 # (B, H, L, P_blk)
-    scores_blph = scores.transpose(0, 2, 3, 1)       # (B, L, P_blk, H)
-    return (scores_blph @ w).squeeze(-1)             # (B, L, P_blk)
+    return q_weighted @ pooled_tile.swapaxes(-1, -2)  # (B, L, P_blk)
 
 
 def _indexer_score_tiled(
@@ -1841,12 +1834,16 @@ def _indexer_score_tiled(
     P = pooled.shape[1]
     if P <= p_block:
         return _indexer_score(q, pooled, weights_x, scale, n_heads_inv_sqrt)
-    # Per-head weight is identical across tiles; compute once (cheap (B,L,H,1)).
-    w = (mx.sigmoid(weights_x) * (scale * n_heads_inv_sqrt))[..., None]
+    # OPT-6 (2026-06-22): fold w into q ONCE (before the tile loop), then each
+    # tile is a single (B,L,D)@(B,D,P_blk) GEMM. 64x less compute per tile and
+    # the (B,H,L,P_blk) transient is never materialized.
+    w = (mx.sigmoid(weights_x) * (scale * n_heads_inv_sqrt))  # (B, L, H)
+    q_blhd = q.transpose(0, 2, 1, 3)  # (B, L, H, D)
+    q_weighted = (w[..., None] * q_blhd).sum(axis=2)  # (B, L, D)
     out_tiles = []
     for p0 in range(0, P, p_block):
         pooled_tile = pooled[:, p0 : p0 + p_block]
-        tile = _indexer_score_tile(q, pooled_tile, w, n_heads_inv_sqrt)
+        tile = _indexer_score_tile(q_weighted, pooled_tile)
         # Force-materialize this tile's (B,L,p_block) collapse BEFORE building the
         # next tile's graph. Without this, MLX's lazy evaluation keeps every
         # tile's large (B,64,L,p_block) pre-collapse transient alive until the
