@@ -1124,12 +1124,18 @@ def _sparse_pooled_attention(
 
     # L_q=1 fast path: concat-and-fused-sdpa
     if L == 1:
-        # pooled_gathered shape: (B, 1, 1, k, D) — squeeze the L axis at axis=2
-        # OPT-5 (2026-06-22): direct gather from pooled instead of take_along_axis
-        # on broadcast. Bit-exact, 5x faster, does not scale with P.
-        # pooled[:, topk, :] gives (B, B, L, k, D) = (1,1,1,k,D) for B=1;
-        # squeeze the L axis to get (B, 1, k, D).
-        pooled_kv = pooled[:, topk, :].squeeze(2)
+        # L_q=1 fast path: concat-and-fused-sdpa
+        # NOTE: OPT-5 direct gather (pooled[:, topk, :]) was reverted — it only
+        # works for B=1 and crashes the MTP verify path (B=2) with a concatenate
+        # shape mismatch. The broadcast+take_along_axis is B-general.
+        idx = topk[:, None, :, :, None]  # (B, 1, L=1, k, 1)
+        pooled_gathered = mx.take_along_axis(
+            mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
+            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
+            axis=3,
+        )
+        # (B, 1, 1, k, D) -> (B, 1, k, D)
+        pooled_kv = pooled_gathered.squeeze(2)
         # Concat along seq axis: local_kv (B, 1, sw, D) + pooled_kv (B, 1, k, D)
         combined_kv = mx.concatenate([local_kv, pooled_kv], axis=2)
 
@@ -1229,15 +1235,16 @@ def _sparse_pooled_attention(
         return mx.concatenate(outs, axis=2)
 
     # Large L_q (prefill chunk): batched inner kernel.
-    # OPT-5 (2026-06-22): direct gather from pooled instead of take_along_axis
-    # on a broadcast source. The broadcast (B,1,L,P,D) materializes/iterates
-    # O(P) memory per call (~12.5GB at P=95000, 380K context) even though only k
-    # entries are gathered per query. Direct indexing pooled[:, topk, :] touches
-    # only the k selected entries — 5x faster and does NOT scale with P.
-    # Bit-exact (max diff 0.0 verified). Removes the SDPA scaling cost at high
-    # context. For B=1, pooled[:, topk, :] gives (B, B, L, k, D) = (1,1,L,k,D)
-    # which is already the (B, 1, L, k, D) shape the inner kernel expects.
-    pooled_gathered = pooled[:, topk, :]
+    # NOTE: OPT-5 direct gather (pooled[:, topk, :]) was reverted — it only
+    # works for B=1 and crashes the MTP verify path (B=2). The
+    # broadcast+take_along_axis is B-general. The SDPA scaling cost remains
+    # but is smaller than the indexer cost (which OPT-6 addresses).
+    idx = topk[:, None, :, :, None]
+    pooled_gathered = mx.take_along_axis(
+        mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
+        mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
+        axis=3,
+    )
     sinks_expanded = sinks[None, :, None, None] if sinks is not None else None
     # local_scores below are (B, H, L, sliding_window); the local mask sliced
     # from the model-level windowed mask can be wider than local_kv once the
