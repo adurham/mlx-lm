@@ -2044,9 +2044,6 @@ class BatchGenerator:
         Returns:
             List of GenerationBatch.Response objects
         """
-        import sys as _sys_ng, os as _os_ng
-        if _os_ng.environ.get("EXO_DSV4_MTP_C2_GATE_DEBUG") == "1":
-            _sys_ng.stderr.write(f"[NG] next_generated _next={type(self)._next.__qualname__}\n"); _sys_ng.stderr.flush()
         with mx.stream(self._stream):
             while True:
                 prompt_responses, generation_responses = self._next()
