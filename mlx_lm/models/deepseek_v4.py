@@ -1430,10 +1430,30 @@ class DeepseekV4MoE(nn.Module):
                     # that ordering window. Required for the re-sharded
                     # MTP MoE path (auto_parallel.py:935 Phase H Lever 1)
                     # to remain bit-equivalent across ranks at c=2 temp=0.
+                    #
+                    # OPT-7 (2026-06-24): gate the mx.eval on
+                    # _fence_every_n so it only fires every N layers,
+                    # letting async eval pipeline layers between fences.
+                    # At B=2 the all_sum payload doubles and the per-layer
+                    # mx.eval creates 43 sync barriers per chunk where the
+                    # GPU idles waiting for the collective. Fencing every
+                    # N layers (default 4) breaks the chain into ~11
+                    # segments, overlapping compute with comm. The
+                    # all_sum is still bit-deterministic; the fence just
+                    # bounds the graph-position drift window. For PREFILL
+                    # (no MTP) this is safe — the drift concern is for
+                    # c=2 gamma>=2 DECODE where fence=4 was selected for
+                    # stability (see start_cluster.sh comment). For
+                    # prefill-only chunks the gate is safe at any N.
+                    _should_fence = (
+                        (self.layer_idx + 1) % self._fence_every_n == 0
+                        or self.layer_idx == self._num_total_layers - 1
+                    )
                     if _ALLSUM_PROBE_ENABLED:
                         import time as _ap_t
                         _t0 = _ap_t.perf_counter()
-                        mx.eval(y)
+                        if _should_fence:
+                            mx.eval(y)
                         _ms = (_ap_t.perf_counter() - _t0) * 1000.0
                         _ALLSUM_PROBE_ACC.setdefault(
                             self.layer_idx, []
@@ -1451,7 +1471,8 @@ class DeepseekV4MoE(nn.Module):
                             ):
                                 _allsum_probe_dump()
                     else:
-                        mx.eval(y)
+                        if _should_fence:
+                            mx.eval(y)
                     y = finalize(y)
             return y
 
