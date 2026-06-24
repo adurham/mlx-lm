@@ -1137,9 +1137,14 @@ def _sparse_pooled_attention(
         offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
         topk_flat = (topk + offset).reshape(-1)
         pooled_kv = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
-        # Need (B, 1, k, D) for concat with local_kv
-        pooled_kv = pooled_kv[:, None, :, :]  # (B, 1, k, D)
-        # Concat along seq axis: local_kv (B, 1, sw, D) + pooled_kv (B, 1, k, D)
+        # Match local_kv's ndim. local_kv is normally (B, 1, sw, D) = 4D,
+        # but in some MTP verify paths it can be 5D (B, 1, L, sw, D).
+        # Insert a singleton at axis 1 to get (B, 1, L, k, D) = 5D, then
+        # squeeze the L axis if local_kv is 4D.
+        pooled_kv = pooled_kv[:, None, :, :, :]  # (B, 1, L, k, D) = 5D
+        if local_kv.ndim == 4:
+            pooled_kv = pooled_kv.squeeze(2)  # (B, 1, k, D) = 4D
+        # Concat along seq axis: local_kv + pooled_kv
         combined_kv = mx.concatenate([local_kv, pooled_kv], axis=2)
 
         # Merge masks if either is present. local_mask comes from the
