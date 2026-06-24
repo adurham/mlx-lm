@@ -2198,7 +2198,14 @@ class BatchKVCache(_BaseCache):
         cache = cls(padding)
         cache.keys = keys
         cache.values = values
-        cache.offset += keys.shape[2]
+        # OPT-12 fix (2026-06-24): set per-stream absolute offsets, not
+        # max_length. The original `cache.offset += keys.shape[2]` set
+        # offset = max_length (=128 for ring buffer), but the real
+        # per-stream offsets are the original c.offset values (e.g., 97957).
+        # Using max_length as offset gives wrong RoPE positions at decode
+        # → garbage output. Fix: set offset to the original per-stream
+        # absolute offsets.
+        cache.offset = mx.array([c.offset for c in caches])
         cache._idx = keys.shape[2]
 
         return cache
