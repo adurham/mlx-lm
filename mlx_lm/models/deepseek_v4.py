@@ -2297,13 +2297,26 @@ class CompressedAttention(nn.Module):
                 out = finalize(out)
 
             if _seq and _sg is not None:
-                # Reconstruct full sequence from per-rank bands: all_gather on
-                # axis 0 → (N, band, H), rank order == row order → (B, L, H).
+                # Reconstruct full sequence from per-rank bands. out is
+                # (B, band, H); all_gather concatenates each rank's full
+                # B-batch along axis 0 in rank order → (N*B, band, H) with
+                # memory layout [r0s0, r0s1, ..., r1s0, r1s1, ...] (rank-major).
+                # The naive reshape(B, L, H) is row-major and would interpret
+                # that as [s0_band0, s0_band1, s1_band0, ...] — scrambling
+                # which band lands in which stream at B>1. Fix: view as
+                # (N, B, band, H), transpose to (B, N, band, H), then flatten
+                # N and band into L so each stream's L axis is the concat of
+                # ITS OWN bands across ranks. Bit-exact vs unsharded at B=1.
                 with span("attn.all_gather"):
                     _B = out.shape[0]
                     _H = out.shape[-1]
+                    _N = _sg.size()
+                    _band = L // _N
+                    _g = mx.distributed.all_gather(out, group=_sg)
                     out = finalize(
-                        mx.distributed.all_gather(out, group=_sg).reshape(_B, L, _H)
+                        _g.reshape(_N, _B, _band, _H)
+                        .transpose(1, 0, 2, 3)
+                        .reshape(_B, L, _H)
                     )
             elif self.sharding_group is not None:
                 with span("attn.all_sum"):
@@ -2660,14 +2673,26 @@ class SparseCompressedAttention(nn.Module):
 
             if _seq and _sg is not None:
                 # Reconstruct the full sequence from per-rank row bands. out is
-                # (B, band, hidden); all_gather concatenates along axis 0 across
-                # ranks → (N, band, hidden), ordered by rank == row-band order →
-                # reshape to (B, L, hidden). Bit-exact vs the unsharded output.
+                # (B, band, hidden); all_gather concatenates each rank's full
+                # B-batch along axis 0 in rank order → (N*B, band, hidden),
+                # memory layout [r0s0, r0s1, ..., r1s0, r1s1, ...] (rank-major).
+                # The naive reshape(B, L, H) is row-major and would interpret
+                # that as [s0_band0, s0_band1, s1_band0, ...] — scrambling
+                # which band lands in which stream at B>1. Fix: view as
+                # (N, B, band, H), transpose to (B, N, band, H), then flatten
+                # N and band into L so each stream's L axis is the concat of
+                # ITS OWN bands across ranks. Bit-exact vs unsharded at B=1.
                 with span("attn.all_gather"):
                     _B = out.shape[0]
                     _H = out.shape[-1]
+                    _N = _sg.size()
+                    _band = L // _N
                     _g = mx.distributed.all_gather(out, group=_sg)
-                    out = finalize(_g.reshape(_B, L, _H))
+                    out = finalize(
+                        _g.reshape(_N, _B, _band, _H)
+                        .transpose(1, 0, 2, 3)
+                        .reshape(_B, L, _H)
+                    )
             elif self.sharding_group is not None:
                 with span("attn.all_sum"):
                     out = finalize(
