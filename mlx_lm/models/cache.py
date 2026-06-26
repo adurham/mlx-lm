@@ -2683,13 +2683,21 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         B = self.offset.shape[0]
         if self.keys is not None:
             B = self.keys.shape[0]
-            # Buffer is temporal-ordered (oldest-first). Lay the `valid` real
-            # tokens into a WIDE ring (max_size + slack) so logical position p
-            # lives at physical slot `p % ring_width`. The wide ring is what
-            # update_and_fetch / make_mask use (slack absorbs the L>1 verify's
-            # extra query rows without clobbering committed keys).
-            self.keys = mx.contiguous(self.keys[..., :valid, :])
-            self.values = mx.contiguous(self.values[..., :valid, :])
+            # The base BatchRotatingKVCache buffer after a long prefill is
+            # ~max_size + chunk wide, temporal-ordered OLDEST-FIRST (the base
+            # _update_concat trims the front/oldest and appends new tokens at
+            # the end, so the NEWEST tokens live at the TAIL). The sliding
+            # window must keep the newest `valid` tokens, so slice the TAIL
+            # [..., -valid:, :], NOT the head. Taking the head (oldest) was the
+            # c>=2 high-context MTP degeneration bug: at abs_off > max_size the
+            # head slice grabbed the oldest `valid` tokens, the bootstrap then
+            # labeled them as positions [abs_off-valid, abs_off) (the newest),
+            # and attention read the oldest context as if it were the newest ->
+            # degenerate output from the first decode step. At low context
+            # (abs_off <= max_size) valid == abs_off and the buffer is <= valid
+            # wide, so head == tail and the bug doesn't fire.
+            self.keys = mx.contiguous(self.keys[..., -valid:, :])
+            self.values = mx.contiguous(self.values[..., -valid:, :])
             Hk = self.keys.shape[1]
             Dk = self.keys.shape[3]
             Dv = self.values.shape[3]
