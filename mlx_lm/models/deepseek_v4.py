@@ -1418,18 +1418,49 @@ class DeepseekV4MoE(nn.Module):
             with span("moe.switch_mlp"):
                 y = finalize(self.switch_mlp(x, inds))
 
-            with span("moe.post_combine"):
-                # Phase H: fused weighted_reduce + shared_experts add via
-                # @mx.compile (_moe_post_combine). Was two separate spans
-                # before. shared_experts forward (the matmul itself) stays
-                # separate; we fuse only the y-side combine, which is
-                # the elementwise + sum + add path.
-                shared_out = self.shared_experts(x)
-                y = finalize(_moe_post_combine(y, scores, shared_out))
+            # EXO_DSV4_MOE_OVERLAP_SHARED=1: overlap the all_sum collective
+            # (comm stream) with the shared_experts forward (GPU stream).
+            # shared_experts(x) depends only on x (pre-collective); all_sum(y)
+            # depends only on y (routed output, post-switch_mlp). They're
+            # independent and run on separate MLX streams (all_sum uses
+            # detail::communication_stream, ops.cpp:34), so queueing both
+            # before the fence lets the GPU do the shared-expert matmul
+            # concurrently with the cross-rank collective — turning the
+            # collective's GPU-idle stall (fact 752: >99% of switch_mlp
+            # envelope is GPU idle) into useful compute. The mx.eval fence
+            # stays (cross-rank bit-equiv, OPT-7's removal reverted -23%),
+            # just moved to after the combine. Bit-equivalent: same ops, the
+            # all_sum(y) result is identical; only execution order of
+            # independent subgraphs changes.
+            _overlap_shared = _ros.environ.get("EXO_DSV4_MOE_OVERLAP_SHARED", "0") == "1"
 
-            if self.sharding_group is not None:
+            if _overlap_shared and self.sharding_group is not None:
+                # Queue the collective on the comm stream (lazy, async).
                 with span("moe.all_sum"):
-                    y = mx.distributed.all_sum(y, group=self.sharding_group)
+                    y_reduced = mx.distributed.all_sum(y, group=self.sharding_group)
+                # Queue shared_experts + weighted_reduce on the GPU stream,
+                # concurrent with the comm-stream collective.
+                with span("moe.post_combine"):
+                    shared_out = self.shared_experts(x)
+                    y = finalize(_moe_post_combine(y_reduced, scores, shared_out))
+                # Fence: sync both streams. Cross-rank bit-equiv preserved
+                # (the fence is what OPT-7's removal broke).
+                with span("moe.all_sum"):
+                    mx.eval(y)
+                    y = finalize(y)
+            else:
+                with span("moe.post_combine"):
+                    # Phase H: fused weighted_reduce + shared_experts add via
+                    # @mx.compile (_moe_post_combine). Was two separate spans
+                    # before. shared_experts forward (the matmul itself) stays
+                    # separate; we fuse only the y-side combine, which is
+                    # the elementwise + sum + add path.
+                    shared_out = self.shared_experts(x)
+                    y = finalize(_moe_post_combine(y, scores, shared_out))
+
+                if self.sharding_group is not None:
+                    with span("moe.all_sum"):
+                        y = mx.distributed.all_sum(y, group=self.sharding_group)
                     # Phase H Lever 1 (2026-05-06): force evaluation of the
                     # collective output before any subsequent layer reads
                     # `y`. The all_sum itself is bit-deterministic across
