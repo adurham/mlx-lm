@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .activations import swiglu
+from ..profiler import span
 
 
 def _gather_sort(x, indices):
@@ -182,19 +183,22 @@ class SwitchGLU(nn.Module):
         idx = indices
         inv_order = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            with span("switch.gather_sort"):
+                x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(
-            self.activation(x_up, x_gate),
-            idx,
-            sorted_indices=do_sort,
-        )
+        with span("switch.up_proj"):
+            x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        with span("switch.gate_proj"):
+            x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        with span("switch.activation"):
+            x_act = self.activation(x_up, x_gate)
+        with span("switch.down_proj"):
+            x = self.down_proj(x_act, idx, sorted_indices=do_sort)
 
         if do_sort:
-            x = _scatter_unsort(x, inv_order, indices.shape)
+            with span("switch.scatter_unsort"):
+                x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
 
