@@ -1133,10 +1133,11 @@ def _sparse_pooled_attention(
         # B=2 P=95000 (1.4ms vs 19.3ms) and does NOT scale with P. B-general.
         P_dim = pooled.shape[1]
         k_dim = topk.shape[2]
-        pooled_flat = pooled.reshape(B * P_dim, D)
-        offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
-        topk_flat = (topk + offset).reshape(-1)
-        pooled_kv = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
+        with span("attn.gather"):
+            pooled_flat = pooled.reshape(B * P_dim, D)
+            offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
+            topk_flat = (topk + offset).reshape(-1)
+            pooled_kv = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
         # Match local_kv's ndim. local_kv is normally (B, 1, sw, D) = 4D,
         # but in some MTP verify paths it can be 5D (B, 1, L, sw, D).
         # Insert a singleton at axis 1 to get (B, 1, L, k, D) = 5D, then
@@ -1247,10 +1248,11 @@ def _sparse_pooled_attention(
     # broadcast. 14× faster, does NOT scale with P, B-general.
     P_dim = pooled.shape[1]
     k_dim = topk.shape[2]
-    pooled_flat = pooled.reshape(B * P_dim, D)
-    offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
-    topk_flat = (topk + offset).reshape(-1)
-    pooled_gathered = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
+    with span("attn.gather"):
+        pooled_flat = pooled.reshape(B * P_dim, D)
+        offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
+        topk_flat = (topk + offset).reshape(-1)
+        pooled_gathered = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
     # Need (B, 1, L, k, D) for the inner kernel
     pooled_gathered = pooled_gathered[:, None, :, :, :]  # (B, 1, L, k, D)
     sinks_expanded = sinks[None, :, None, None] if sinks is not None else None
@@ -1938,23 +1940,24 @@ class Indexer(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = _rope_dispatch(position_rope, q, q_off)
 
-        if _INDEXER_PBLOCK > 0:
-            scores = _indexer_score_tiled(
-                q,
-                pooled,
-                self.weights_proj(x),
-                self.scale,
-                self.n_heads**-0.5,
-                _INDEXER_PBLOCK,
-            )
-        else:
-            scores = _indexer_score(
-                q,
-                pooled,
-                self.weights_proj(x),
-                self.scale,
-                self.n_heads**-0.5,
-            )
+        with span("indexer.score"):
+            if _INDEXER_PBLOCK > 0:
+                scores = _indexer_score_tiled(
+                    q,
+                    pooled,
+                    self.weights_proj(x),
+                    self.scale,
+                    self.n_heads**-0.5,
+                    _INDEXER_PBLOCK,
+                )
+            else:
+                scores = _indexer_score(
+                    q,
+                    pooled,
+                    self.weights_proj(x),
+                    self.scale,
+                    self.n_heads**-0.5,
+                )
         if pmask is not None:
             scores = mx.where(
                 pmask if pmask.ndim == 3 else pmask[None],
@@ -1975,34 +1978,35 @@ class Indexer(nn.Module):
             or (_topk_os.environ.get("EXO_DSV4_TOPK_FUSED", "0") == "1"
                 and "topk_off" not in _topk_targets)
         )
-        if (_topk_enabled
-                and scores.shape[1] == 1
-                and pmask is None
-                and k <= 1024):
-            fused = _fused_topk(scores, k)
-            if fused is not None:
-                return fused
-        # OPT-1 (env-gated EXO_DSV4_PREFILL_ARGPARTITION=1): in PREFILL (L>1)
-        # the argsort below is a full O(P log P) sort over the pool just to take
-        # the top-k. argpartition is O(P) and the top-k SET is identical; the
-        # downstream take_along_axis → gathered-KV attention is order-invariant
-        # (softmax sums over all gathered positions), so unordered top-k is
-        # quality-equivalent. Decode (L==1) keeps argsort untouched (the
-        # ~5%-faster-on-Metal claim was measured at L=1), so decode is unaffected
-        # by construction. Gated for clean A/B against the section-time harness.
-        #
-        # P-threshold (2026-06-21): argpartition is SLOWER than argsort on Metal
-        # at small P (kernel launch overhead dominates the O(P log P)->O(P) win).
-        # Measured: at P=500 (2K context) argpartition drops throughput 295->163
-        # t/s. Only fire when P exceeds EXO_DSV4_ARGPARTITION_MIN_P (default 0 =
-        # always fire when env enabled; set e.g. 20000 to only fire past ~80K ctx).
-        if (scores.shape[1] > 1
-                and _topk_os.environ.get("EXO_DSV4_PREFILL_ARGPARTITION", "0") == "1"
-                and pooled.shape[1] >= int(_topk_os.environ.get("EXO_DSV4_ARGPARTITION_MIN_P", "0"))):
-            return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-        # Fallback: 2026-05-13 argsort+slice. Bit-equivalent to argpartition
-        # +slice for this shape and ~5% faster on Apple's Metal kernel.
-        return mx.argsort(-scores, axis=-1)[..., :k]
+        with span("indexer.topk"):
+            if (_topk_enabled
+                    and scores.shape[1] == 1
+                    and pmask is None
+                    and k <= 1024):
+                fused = _fused_topk(scores, k)
+                if fused is not None:
+                    return fused
+            # OPT-1 (env-gated EXO_DSV4_PREFILL_ARGPARTITION=1): in PREFILL (L>1)
+            # the argsort below is a full O(P log P) sort over the pool just to take
+            # the top-k. argpartition is O(P) and the top-k SET is identical; the
+            # downstream take_along_axis → gathered-KV attention is order-invariant
+            # (softmax sums over all gathered positions), so unordered top-k is
+            # quality-equivalent. Decode (L==1) keeps argsort untouched (the
+            # ~5%-faster-on-Metal claim was measured at L=1), so decode is unaffected
+            # by construction. Gated for clean A/B against the section-time harness.
+            #
+            # P-threshold (2026-06-21): argpartition is SLOWER than argsort on Metal
+            # at small P (kernel launch overhead dominates the O(P log P)->O(P) win).
+            # Measured: at P=500 (2K context) argpartition drops throughput 295->163
+            # t/s. Only fire when P exceeds EXO_DSV4_ARGPARTITION_MIN_P (default 0 =
+            # always fire when env enabled; set e.g. 20000 to only fire past ~80K ctx).
+            if (scores.shape[1] > 1
+                    and _topk_os.environ.get("EXO_DSV4_PREFILL_ARGPARTITION", "0") == "1"
+                    and pooled.shape[1] >= int(_topk_os.environ.get("EXO_DSV4_ARGPARTITION_MIN_P", "0"))):
+                return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+            # Fallback: 2026-05-13 argsort+slice. Bit-equivalent to argpartition
+            # +slice for this shape and ~5% faster on Apple's Metal kernel.
+            return mx.argsort(-scores, axis=-1)[..., :k]
 
 
 class LocalAttention(nn.Module):
