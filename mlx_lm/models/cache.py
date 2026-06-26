@@ -2678,24 +2678,30 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         """
         max_size = self.max_size
         ring_width = max_size + self._RING_SLACK
-        abs_off = int(self._offset)
+        # abs_off is the LOGICAL absolute position (the true token count, e.g.
+        # 138696 after a long prefill), NOT the ring write cursor self._offset
+        # (which caps at ~max_size). self.offset is the per-stream logical
+        # position tensor; all streams are uniform at swap time (no divergence
+        # yet), so take offset[0]. Reading self._offset here was the c>=2
+        # high-context MTP degeneration root cause: it rebased self.offset
+        # from 138696 down to ~131, so RoPE/the rotating mask used position
+        # 131 while the (unrebased) BatchPoolingCache held entries at the
+        # 138696 scale -> position mismatch -> degenerate output from the
+        # first decode step. The comment below ("Keep absolute offsets — RoPE
+        # needs the true position") is only honored if abs_off comes from
+        # self.offset, not self._offset.
+        abs_off = int(self.offset[0]) if hasattr(self.offset, "shape") else int(self.offset)
         valid = min(abs_off, max_size)
         B = self.offset.shape[0]
         if self.keys is not None:
             B = self.keys.shape[0]
-            # The base BatchRotatingKVCache buffer after a long prefill is
-            # ~max_size + chunk wide, temporal-ordered OLDEST-FIRST (the base
-            # _update_concat trims the front/oldest and appends new tokens at
-            # the end, so the NEWEST tokens live at the TAIL). The sliding
-            # window must keep the newest `valid` tokens, so slice the TAIL
-            # [..., -valid:, :], NOT the head. Taking the head (oldest) was the
-            # c>=2 high-context MTP degeneration bug: at abs_off > max_size the
-            # head slice grabbed the oldest `valid` tokens, the bootstrap then
-            # labeled them as positions [abs_off-valid, abs_off) (the newest),
-            # and attention read the oldest context as if it were the newest ->
-            # degenerate output from the first decode step. At low context
-            # (abs_off <= max_size) valid == abs_off and the buffer is <= valid
-            # wide, so head == tail and the bug doesn't fire.
+            # Keep the newest `valid` tokens. The base buffer is a rotated
+            # ring of exactly max_size slots (verified via EXO_DSV4_SWAP_DIAG:
+            # keys.shape=(B,H,128,512) at max_size=128), and _temporal_order
+            # (run above when rotated=True) rolls it oldest-first — so the
+            # newest live at the tail. Slice [..., -valid:, :] to keep them.
+            # At low context (abs_off <= max_size) valid == abs_off and the
+            # buffer is <= valid wide, so head == tail and this is a no-op.
             self.keys = mx.contiguous(self.keys[..., -valid:, :])
             self.values = mx.contiguous(self.values[..., -valid:, :])
             Hk = self.keys.shape[1]
