@@ -2149,26 +2149,19 @@ class BatchKVCache(_BaseCache):
         self._idx = max_idx
 
     def extract(self, idx):
-        # OPT-12 (2026-06-24): return RotatingKVCache, not plain KVCache.
-        # The batched prefill merges per-stream RotatingKVCache into
-        # BatchRotatingKVCache, runs prefill, then extracts per-stream.
-        # The base extract returned a plain KVCache which doesn't have
-        # ring buffer semantics — the decode path expects RotatingKVCache.
-        # A plain KVCache causes the model to see wrong KV positions →
-        # garbage output → immediate EOS. Fix: return a RotatingKVCache
-        # with the correct offset and temporal-ordered keys/values.
-        offset_b = int(self.offset[idx].item()) if self.offset is not None else 0
-        cache = RotatingKVCache(self.max_size)
+        # BatchKVCache (non-rotating) extract: return a plain KVCache.
+        # The OPT-12 RotatingKVCache return belongs on BatchRotatingKVCache
+        # (which has max_size); BatchKVCache has no max_size, so
+        # RotatingKVCache(self.max_size) here crashes with AttributeError.
+        # Qwen3.6's vanilla decode path uses BatchKVCache (not the rotating
+        # variant) and hit this crash at warmup. Keep the plain-KVCache
+        # return — correct for the non-rotating batched cache.
+        cache = KVCache()
         padding = self.left_padding[idx].item()
-        keys_slice = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
-        values_slice = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
-        cache.keys = keys_slice
-        cache.values = values_slice
-        # Buffer is temporal (oldest-first): _idx == phys rows so
-        # RotatingKVCache._temporal_order is a no-op. offset is absolute
-        # so size()==valid==phys_rows and RoPE positions are correct.
-        cache._idx = keys_slice.shape[2]
-        cache.offset = offset_b
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
+        cache.offset = cache.keys.shape[2]
+        return cache
         return cache
 
     @classmethod
