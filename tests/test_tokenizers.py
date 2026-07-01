@@ -72,6 +72,61 @@ class TestTokenizers(unittest.TestCase):
         tokenizer._detokenizer = NaiveStreamingDetokenizer(tokenizer)
         self.check_tokenizer(tokenizer)
 
+    def test_bpe_multibyte_split_across_tokens(self):
+        """A multi-byte UTF-8 char whose bytes span two BPE tokens, followed by
+        an unrelated complete token, must NOT corrupt to U+FFFD.
+
+        Regression for the DSv4 narrow-no-break-space (U+202F) bug: the model
+        emits U+202F as two byte-level tokens ('âĢ' = e2,80 then '¯' = af). When
+        the incomplete 'âĢ' half was buffered and the next word token arrived,
+        the old add_token flushed the still-incomplete prefix as '�'
+        (rendering 'Chain, or' as 'Chain,�or'). The detokenizer must instead
+        retain the incomplete trailing bytes and only flush complete UTF-8.
+        """
+        from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+        # Build a minimal fake HF-like tokenizer exposing just what the
+        # BPEStreamingDetokenizer __init__ needs: vocab (id->char) + the
+        # clean_up flag. We map ids to the byte-level BPE chars for the three
+        # bytes of U+202F (e2,80,af) plus a couple of ASCII chars.
+        BPEStreamingDetokenizer.make_byte_decoder()
+        inv = {b: c for c, b in BPEStreamingDetokenizer._byte_decoder.items()}
+        ch_e2, ch_80, ch_af = inv[0xE2], inv[0x80], inv[0xAF]
+        # token 0 -> 'âĢ' (e2,80), token 1 -> '¯' (af), 2 -> 'o', 3 -> 'r', 4 -> ','
+        vocab = {
+            ch_e2 + ch_80: 0,
+            ch_af: 1,
+            "o": 2,
+            "r": 3,
+            ",": 4,
+        }
+
+        class _FakeTok:
+            def __init__(self, vocab):
+                self.vocab = vocab
+                self.clean_up_tokenization_spaces = False
+
+        det = BPEStreamingDetokenizer(_FakeTok(vocab))
+
+        # Stream: ',' then U+202F (two tokens) then 'o','r' -> ",\u202for"
+        det.reset()
+        out = ""
+        for tid in [4, 0, 1, 2, 3]:
+            det.add_token(tid)
+            out += det.last_segment
+        det.finalize()
+        out += det.last_segment
+
+        self.assertNotIn("\ufffd", out)
+        self.assertEqual(out, ",\u202for")
+
+        # The incomplete-half must be held back (empty segment), not flushed.
+        det.reset()
+        det.add_token(0)  # 'âĢ' — incomplete e2,80
+        self.assertEqual(det.last_segment, "")
+        det.add_token(1)  # '¯' — completes U+202F
+        self.assertEqual(det.last_segment, "\u202f")
+
     def test_special_tokens(self):
         tokenizer_repo = "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx"
         tokenizer = load_tokenizer(tokenizer_repo)

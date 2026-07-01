@@ -203,22 +203,114 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             return current_text[1:]
         return current_text
 
+    def _unflushed_to_bytes(self):
+        """Map the buffered byte-decoder chars back to their raw bytes.
+
+        Each char in ``_unflushed`` is a byte-level BPE char that maps to a
+        single byte via ``_byte_decoder``; chars absent from the decoder are
+        emitted as their own utf-8 encoding (mirrors ``_decode_bytes``).
+        """
+        barr = bytearray()
+        for c in self._unflushed:
+            res = self._byte_decoder.get(c, False)
+            if res:
+                barr.append(res)
+            else:
+                barr.extend(bytes(c, "utf-8"))
+        return barr
+
+    @staticmethod
+    def _valid_utf8_prefix_len(barr):
+        """Length (in bytes) of the longest prefix of ``barr`` that is a
+        complete, valid utf-8 sequence — i.e. excluding a trailing incomplete
+        multi-byte character. Returns len(barr) when the whole buffer is
+        complete.
+        """
+        n = len(barr)
+        # A utf-8 sequence is at most 4 bytes, so only the final <=3 bytes can
+        # be an incomplete lead+continuation run. Walk back from the last
+        # non-continuation (lead) byte and check whether it starts a complete
+        # sequence.
+        i = n - 1
+        # continuation bytes are 0b10xxxxxx (0x80..0xBF)
+        while i >= 0 and (barr[i] & 0xC0) == 0x80:
+            i -= 1
+        if i < 0:
+            return n  # all continuation bytes (shouldn't happen) — flush as-is
+        lead = barr[i]
+        if lead < 0x80:
+            expected = 1
+        elif lead >= 0xF0:
+            expected = 4
+        elif lead >= 0xE0:
+            expected = 3
+        elif lead >= 0xC0:
+            expected = 2
+        else:
+            # stray continuation byte as "lead" — malformed; flush everything
+            return n
+        have = n - i
+        if have >= expected:
+            return n  # the final sequence is complete
+        return i  # hold back the incomplete trailing sequence
+
     def add_token(self, token):
         self.tokens.append(token)
         v = self.tokenmap[token] if token < len(self.tokenmap) else "!"
         self._unflushed += v
-        text = self._decode_bytes(self._unflushed)
 
-        # For multi-byte utf-8 wait until they are complete
-        # For single spaces wait until the next token to clean it if needed
-        if not text.endswith("\ufffd") and not (
-            len(v) == 1 and self._byte_decoder.get(v[0]) == 32
-        ):
-            self.text += self._maybe_trim_space(text)
+        # Split the buffer into (complete-utf-8 prefix, incomplete trailing
+        # bytes). The previous implementation flushed the WHOLE buffer whenever
+        # the decoded string did not end in U+FFFD — but a buffer like
+        # [incomplete âĢ prefix of U+202F] + [next complete word token] decodes
+        # without a trailing U+FFFD, so it flushed the still-incomplete âĢ as
+        # garbage (rendering narrow-no-break-space / en-dash / smart-quote
+        # boundaries as "�"). Instead flush only the valid-utf-8 prefix and
+        # RETAIN the trailing incomplete multi-byte sequence for the next token.
+        barr = self._unflushed_to_bytes()
+        cut = self._valid_utf8_prefix_len(barr)
+
+        if cut == 0:
+            # Nothing complete yet — keep buffering the incomplete char.
+            return
+
+        complete = bytes(barr[:cut])
+        incomplete = barr[cut:]
+        text = complete.decode("utf-8", "replace")
+
+        # Preserve the original single-space deferral: if the completable text
+        # is exactly a single space (and nothing incomplete is trailing), hold
+        # it so the NEXT token's _maybe_trim_space can strip a space-before-
+        # punctuation ("a ,b" -> "a,b"). Without this, the space flushes
+        # immediately and the cleanup never happens.
+        if not incomplete and text == " ":
+            return
+
+        self.text += self._maybe_trim_space(text)
+        # Retain any incomplete trailing bytes as byte-decoder chars so the next
+        # add_token concatenation stays consistent with _decode_bytes/finalize.
+        if incomplete:
+            inv = self._byte_encoder_cache()
+            self._unflushed = "".join(inv[b] for b in incomplete)
+        else:
             self._unflushed = ""
 
+    @classmethod
+    def _byte_encoder_cache(cls):
+        """Inverse of ``_byte_decoder``: byte value -> byte-level BPE char.
+
+        Lets us re-encode retained incomplete bytes back into the ``_unflushed``
+        char representation so the next ``add_token`` concatenation stays
+        consistent with ``_decode_bytes`` / ``finalize``.
+        """
+        cache = getattr(cls, "_byte_encoder", None)
+        if cache is None:
+            cache = {b: c for c, b in cls._byte_decoder.items()}
+            cls._byte_encoder = cache
+        return cache
+
     def finalize(self):
-        current_text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
+        current_text = bytes(self._unflushed_to_bytes()).decode(
             "utf-8",
             "replace",
         )
