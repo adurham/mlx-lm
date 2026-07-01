@@ -147,6 +147,45 @@ class TestSampleUtils(unittest.TestCase):
         self.assertAlmostEqual(result[0, 2].item(), 0.0)
         self.assertAlmostEqual(result[0, 3].item(), 0.0)
 
+    def test_repetition_penalty_count_aware(self):
+        from mlx_lm.sample_utils import make_repetition_penalty
+
+        penalty = 1.5
+        # Token 0 appears 3x (positive logit), token 1 appears 2x (negative
+        # logit). The count-aware penalty applies ``penalty ** count`` — a token
+        # dominating the window is penalized geometrically harder. This is the
+        # fix for decode-loop degeneration: the old presence-based version
+        # applied the penalty ONCE regardless of repeat count, so it could not
+        # break a tight loop.
+        tokens = mx.array([0, 0, 0, 1, 1])
+        logits = mx.array([[2.0, -2.0, 0.0, 4.0]])
+        processor = make_repetition_penalty(penalty, context_size=5)
+        result = processor(tokens, logits)
+        # Token 0 (positive, 3x): 2.0 / 1.5**3
+        self.assertAlmostEqual(result[0, 0].item(), 2.0 / (penalty**3), places=4)
+        # Token 1 (negative, 2x): -2.0 * 1.5**2
+        self.assertAlmostEqual(result[0, 1].item(), -2.0 * (penalty**2), places=4)
+        # Token 2 absent: untouched
+        self.assertAlmostEqual(result[0, 2].item(), 0.0, places=4)
+        # Token 3 absent: untouched
+        self.assertAlmostEqual(result[0, 3].item(), 4.0, places=4)
+
+    def test_repetition_penalty_count_one_backward_compat(self):
+        from mlx_lm.sample_utils import make_repetition_penalty
+
+        penalty = 1.5
+        # Every token appears exactly once: count-aware factor == penalty, i.e.
+        # identical to the original single-application behaviour. Guards against
+        # regressing normal (non-looping) generation.
+        tokens = mx.array([0, 1, 2, 3])
+        logits = mx.array([[2.0, -2.0, 5.0, -0.5]])
+        processor = make_repetition_penalty(penalty, context_size=64)
+        result = processor(tokens, logits)
+        self.assertAlmostEqual(result[0, 0].item(), 2.0 / penalty, places=4)
+        self.assertAlmostEqual(result[0, 1].item(), -2.0 * penalty, places=4)
+        self.assertAlmostEqual(result[0, 2].item(), 5.0 / penalty, places=4)
+        self.assertAlmostEqual(result[0, 3].item(), -0.5 * penalty, places=4)
+
     def test_make_logits_processors(self):
         from mlx_lm.sample_utils import make_logits_processors
 
@@ -165,12 +204,13 @@ class TestSampleUtils(unittest.TestCase):
         # Apply all processors
         for processor in processors:
             logits = processor(tokens, logits)
-        # Token 0 (appears 3x): 1.0/1.5 - 0.5 - 0.75 = -0.5833
-        # Token 1 (appears 2x): 0.5/1.5 - 0.5 - 0.5 = -0.6667
+        # Repetition penalty is now COUNT-AWARE (penalty ** count):
+        # Token 0 (appears 3x): 1.0/1.5**3 - 0.5 - 3*0.25 = 0.2963 - 0.5 - 0.75
+        # Token 1 (appears 2x): 0.5/1.5**2 - 0.5 - 2*0.25 = 0.2222 - 0.5 - 0.5
         # Token 2 (not in context): 0.0 (no penalty)
         # Token 3 (not in context): -0.5 (no penalty)
-        self.assertAlmostEqual(logits[0, 0].item(), -0.5833, places=4)
-        self.assertAlmostEqual(logits[0, 1].item(), -0.6667, places=4)
+        self.assertAlmostEqual(logits[0, 0].item(), -0.9537, places=4)
+        self.assertAlmostEqual(logits[0, 1].item(), -0.7778, places=4)
         self.assertAlmostEqual(logits[0, 2].item(), 0.0, places=4)
         self.assertAlmostEqual(logits[0, 3].item(), -0.5, places=4)
 

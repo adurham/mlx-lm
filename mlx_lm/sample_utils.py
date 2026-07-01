@@ -297,16 +297,36 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
     if penalty < 0 or not isinstance(penalty, (int, float)):
         raise ValueError(f"penalty must be a non-negative float, got {penalty}")
 
+    log_penalty = math.log(penalty) if penalty > 0 else 0.0
+
     def repetition_penalty_processor(tokens, logits):
         if len(tokens) > 0:
             tokens = tokens[-context_size:]
-            selected_logits = logits[:, tokens]
-            selected_logits = mx.where(
-                selected_logits < 0,
-                selected_logits * penalty,
-                selected_logits / penalty,
+            if not isinstance(tokens, mx.array):
+                tokens = mx.array(tokens)
+            tokens = tokens.reshape(-1)
+            # Count-aware repetition penalty. The original implementation used a
+            # fancy-index ASSIGN (``logits[:, tokens] = ...``) which, when a
+            # token appears N times in the window, collapses to a single write:
+            # the penalty is applied ONCE regardless of repeat count (presence-
+            # based). That makes it useless against decode loops — the few
+            # tokens filling a cycle each get only a trivial single ÷penalty
+            # nudge (DSv4 "exo→exo→…", "8bit-8bit-8bit" loops; a repetition
+            # penalty of 1.05 empirically failed to stop them).
+            #
+            # Accumulate instead: build per-vocab occurrence counts over the
+            # window via scatter-add, then apply ``penalty ** count`` so a token
+            # dominating a loop is penalized geometrically harder while a token
+            # that appears once is treated identically to the old behaviour
+            # (count==1 -> factor==penalty). Sign-aware, matching the paper:
+            # positive logits divided, negative logits multiplied.
+            counts = mx.zeros((logits.shape[-1],), dtype=logits.dtype)
+            counts = counts.at[tokens].add(
+                mx.ones((tokens.shape[0],), dtype=logits.dtype)
             )
-            logits[:, tokens] = selected_logits
+            # factor == penalty**count; count==0 -> 1.0 (absent tokens: no-op).
+            factor = mx.exp(counts * log_penalty)
+            logits = mx.where(logits < 0, logits * factor, logits / factor)
         return logits
 
     return repetition_penalty_processor
