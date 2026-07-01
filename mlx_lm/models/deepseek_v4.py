@@ -142,6 +142,13 @@ _SPARSE_SDPA_TILE = int(os.environ.get("EXO_DSV4_SPARSE_SDPA_TILE", "128"))
 # tradeoff (smaller = lower peak, more kernel launches).
 _INDEXER_PBLOCK = int(os.environ.get("EXO_DSV4_INDEXER_PBLOCK", "0"))
 
+# OPT-2 correctness threshold: minimum L for the lm_head last-row shortcut
+# (EXO_DSV4_LMHEAD_LASTROW). Must sit ABOVE the largest small-L forward whose
+# multi-row logits are consumed (MTP verify L=gamma+1, tree verify <= 16) and
+# BELOW the prefill chunk width (default 128). See Model.__call__ for the
+# 2026-07-01 degeneration post-mortem.
+_LMHEAD_LASTROW_MIN_L = int(os.environ.get("EXO_DSV4_LMHEAD_LASTROW_MIN_L", "32"))
+
 
 # FFN sub-attribution (same gate): expert compute vs the cross-rank all_sum
 # (RDMA reduction). Quantifies how much of the ~50%-of-prefill MoE bucket is
@@ -3107,12 +3114,19 @@ class Model(nn.Module):
             # it keeps only the KV cache — and the decode _step only ever reads
             # logits[:, -1, :]. So projecting all L rows through lm_head
             # (L × vocab_size ≈ 128 × 129K) is wasted work every prefill chunk.
-            # When L > 1, project only the last row. This is exact for both
-            # consumers: prefill discards anyway, decode wants the last row.
-            # DSv4 MTP runs its OWN lm_head on hidden states it manages and does
-            # NOT route multi-row logits through here, so it is unaffected.
-            # L == 1 (decode) is unchanged. Gated for clean A/B.
-            if (h.shape[1] > 1
+            # When L is prefill-sized, project only the last row.
+            #
+            # CORRECTNESS GATE (2026-07-01): the original `L > 1` gate was WRONG
+            # under MTP — the speculative VERIFY forward routes through here at
+            # L == gamma+1 (small), and the acceptance check consumes ALL rows
+            # of verify_logits. Slicing it to the last row broke acceptance →
+            # repetition-loop degeneration (reproduced on-cluster, cluster
+            # smoke 2026-07-01). Prefill chunks are >= 32 in practice (default
+            # 128); verify is gamma+1 (2-9) and tree verify <= 16
+            # (_SPARSE_VERIFY_MAX_L). Gate on L > _LMHEAD_LASTROW_MIN_L
+            # (default 32) so ONLY true prefill chunks take the last-row path.
+            # Remainder chunks 1 < L <= 32 harmlessly keep the full projection.
+            if (h.shape[1] > _LMHEAD_LASTROW_MIN_L
                     and os.environ.get("EXO_DSV4_LMHEAD_LASTROW", "0") == "1"):
                 h = h[:, -1:, :]
             _logits = self.lm_head(h)
