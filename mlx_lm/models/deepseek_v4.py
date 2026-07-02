@@ -89,6 +89,13 @@ _ALLSUM_PROBE_LOG_EVERY = int(os.environ.get("EXO_DSV4_ALLSUM_PROBE_LOG_EVERY", 
 # and c=2 stability. EXO_DSV4_FENCE_ASYNC=1 to enable.
 _FENCE_ASYNC = bool(int(os.environ.get("EXO_DSV4_FENCE_ASYNC", "0")))
 
+# Max batch rows the fence may run async for. 1 = the validated c=1-only
+# behavior. EXO_DSV4_FENCE_ASYNC_C2=N (N>=2) extends arming to batched
+# decode/verify up to N streams — experimental (2026-07-02): the historical
+# c=2-under-async corruption was the per-stream ring bootstrap bug (mlx-lm
+# 8b7b5f9), not the fence, but batched arming has not been long-soaked.
+_FENCE_ASYNC_MAX_B = max(1, int(os.environ.get("EXO_DSV4_FENCE_ASYNC_C2", "0") or "0") or 1)
+
 # Runner-controlled arming for the async fence (side channel like
 # _EAGLE_CTX; single-threaded per worker process). The env var enables the
 # FEATURE; the fence goes async only when EVERY key below is True. Two
@@ -1512,18 +1519,17 @@ class DeepseekV4MoE(nn.Module):
                         _FENCE_ASYNC
                         and _FENCE_ASYNC_CTX["engine"]
                         and _FENCE_ASYNC_CTX["cache"]
-                        and y.shape[0] == 1
+                        and y.shape[0] <= _FENCE_ASYNC_MAX_B
                         and y.shape[1] <= 8
                     ):
-                        # Async fence is ONLY safe at steady-state c=1
-                        # decode/verify (armed by the engine via
-                        # _set_fence_async_ok, B==1, short L). A/B'd
+                        # Async fence at steady-state decode/verify (armed
+                        # by the engine via _set_fence_async_ok, B within
+                        # the configured limit — default 1, short L). A/B'd
                         # 2026-07-02: c=1 decode 28.9 -> 37.0 t/s, outputs
-                        # byte-identical. Unarmed cases (prefill, B>1,
-                        # multi-stream, transitions) keep the blocking
-                        # fence — a c=2 join under async corrupted output
-                        # and wedged both ranks (cache merge racing the
-                        # deferred graph).
+                        # byte-identical. Unarmed cases (prefill, B over
+                        # limit, transitions) keep the blocking fence —
+                        # transitions must synchronize before cache
+                        # merges/rebuilds (owners' disarm does this).
                         mx.async_eval(y)
                     else:
                         mx.eval(y)
