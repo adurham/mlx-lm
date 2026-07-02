@@ -89,22 +89,24 @@ _ALLSUM_PROBE_LOG_EVERY = int(os.environ.get("EXO_DSV4_ALLSUM_PROBE_LOG_EVERY", 
 # and c=2 stability. EXO_DSV4_FENCE_ASYNC=1 to enable.
 _FENCE_ASYNC = bool(int(os.environ.get("EXO_DSV4_FENCE_ASYNC", "0")))
 
-# Runner-controlled arming flag for the async fence (side channel like
+# Runner-controlled arming for the async fence (side channel like
 # _EAGLE_CTX; single-threaded per worker process). The env var enables the
-# FEATURE; this flag arms it only while the engine is in steady-state
-# single-stream (c=1) operation. Default False so an engine that never
-# calls the setter (non-MTP path, other frontends) keeps the blocking
-# fence. The 2026-07-02 c=2 corruption was traced to cache merges at the
-# stream-join transition racing a still-in-flight deferred async graph —
-# engines must call _set_fence_async_ok(False) + mx.synchronize() before
-# any cache transition, and re-arm with True only at single-uid
-# steady state.
-_FENCE_ASYNC_CTX: Dict[str, Any] = {"ok": False}
+# FEATURE; the fence goes async only when EVERY key below is True. Two
+# independent owners must both agree (2026-07-02: a single flag left
+# ordering holes at stream join/leave — corrupt logits and rank wedges):
+#   "engine" — the request-level owner (batch_generate): True iff exactly
+#              one request is active and none is being admitted.
+#   "cache"  — the KV/stream-level owner (dsv4_mtp): True iff single-uid
+#              steady state, False around any cache merge/rebuild.
+# Both default False so anything that never calls the setter keeps the
+# blocking Phase H Lever 1 fence. Owners must mx.synchronize() when
+# clearing their key (drain deferred graphs before mutating shared state).
+_FENCE_ASYNC_CTX: Dict[str, bool] = {"engine": False, "cache": False}
 
 
-def _set_fence_async_ok(ok: bool) -> None:
-    """Arm (True) or disarm (False) the c=1 async fence."""
-    _FENCE_ASYNC_CTX["ok"] = bool(ok)
+def _set_fence_async_ok(ok: bool, key: str = "engine") -> None:
+    """Set one owner's arming key for the c=1 async fence."""
+    _FENCE_ASYNC_CTX[key] = bool(ok)
 _ALLSUM_PROBE_ACC: Dict[int, List[float]] = {}    # layer_idx -> list[ms]
 _ALLSUM_PROBE_CYCLES: int = 0
 
@@ -1508,7 +1510,8 @@ class DeepseekV4MoE(nn.Module):
                                 _allsum_probe_dump()
                     elif (
                         _FENCE_ASYNC
-                        and _FENCE_ASYNC_CTX["ok"]
+                        and _FENCE_ASYNC_CTX["engine"]
+                        and _FENCE_ASYNC_CTX["cache"]
                         and y.shape[0] == 1
                         and y.shape[1] <= 8
                     ):
