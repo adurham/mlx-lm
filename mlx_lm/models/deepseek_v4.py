@@ -88,6 +88,23 @@ _ALLSUM_PROBE_LOG_EVERY = int(os.environ.get("EXO_DSV4_ALLSUM_PROBE_LOG_EVERY", 
 # Default OFF until A/B'd for throughput, bit-determinism across ranks,
 # and c=2 stability. EXO_DSV4_FENCE_ASYNC=1 to enable.
 _FENCE_ASYNC = bool(int(os.environ.get("EXO_DSV4_FENCE_ASYNC", "0")))
+
+# Runner-controlled arming flag for the async fence (side channel like
+# _EAGLE_CTX; single-threaded per worker process). The env var enables the
+# FEATURE; this flag arms it only while the engine is in steady-state
+# single-stream (c=1) operation. Default False so an engine that never
+# calls the setter (non-MTP path, other frontends) keeps the blocking
+# fence. The 2026-07-02 c=2 corruption was traced to cache merges at the
+# stream-join transition racing a still-in-flight deferred async graph —
+# engines must call _set_fence_async_ok(False) + mx.synchronize() before
+# any cache transition, and re-arm with True only at single-uid
+# steady state.
+_FENCE_ASYNC_CTX: Dict[str, Any] = {"ok": False}
+
+
+def _set_fence_async_ok(ok: bool) -> None:
+    """Arm (True) or disarm (False) the c=1 async fence."""
+    _FENCE_ASYNC_CTX["ok"] = bool(ok)
 _ALLSUM_PROBE_ACC: Dict[int, List[float]] = {}    # layer_idx -> list[ms]
 _ALLSUM_PROBE_CYCLES: int = 0
 
@@ -1489,16 +1506,21 @@ class DeepseekV4MoE(nn.Module):
                                 == 0
                             ):
                                 _allsum_probe_dump()
-                    elif _FENCE_ASYNC and y.shape[0] == 1 and y.shape[1] <= 8:
-                        # Async fence is ONLY safe for c=1 decode/verify
-                        # (B==1, short L). A/B'd 2026-07-02: c=1 decode
-                        # 28.9 -> 37.0 t/s, outputs byte-identical; but a
-                        # c=2 (B=2 batched verify) run under async fence
-                        # degenerated within ~1s and wedged both ranks —
-                        # the blocking eval is load-bearing for cross-rank
-                        # lockstep exactly as the Phase H Lever 1 note
-                        # says. Prefill (L large) and any B>1 keep the
-                        # blocking fence unconditionally.
+                    elif (
+                        _FENCE_ASYNC
+                        and _FENCE_ASYNC_CTX["ok"]
+                        and y.shape[0] == 1
+                        and y.shape[1] <= 8
+                    ):
+                        # Async fence is ONLY safe at steady-state c=1
+                        # decode/verify (armed by the engine via
+                        # _set_fence_async_ok, B==1, short L). A/B'd
+                        # 2026-07-02: c=1 decode 28.9 -> 37.0 t/s, outputs
+                        # byte-identical. Unarmed cases (prefill, B>1,
+                        # multi-stream, transitions) keep the blocking
+                        # fence — a c=2 join under async corrupted output
+                        # and wedged both ranks (cache merge racing the
+                        # deferred graph).
                         mx.async_eval(y)
                     else:
                         mx.eval(y)
