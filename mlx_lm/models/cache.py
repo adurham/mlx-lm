@@ -2671,60 +2671,80 @@ class PerStreamBatchRotatingKVCache(BatchRotatingKVCache):
         """
         max_size = self.max_size
         ring_width = max_size + self._RING_SLACK
-        # abs_off is the LOGICAL absolute position (the true token count, e.g.
-        # 138696 after a long prefill), NOT the ring write cursor self._offset
-        # (which caps at ~max_size). self.offset is the per-stream logical
-        # position tensor; all streams are uniform at swap time (no divergence
-        # yet), so take offset[0]. Reading self._offset here was the c>=2
-        # high-context MTP degeneration root cause: it rebased self.offset
-        # from 138696 down to ~131, so RoPE/the rotating mask used position
-        # 131 while the (unrebased) BatchPoolingCache held entries at the
-        # 138696 scale -> position mismatch -> degenerate output from the
-        # first decode step. The comment below ("Keep absolute offsets — RoPE
-        # needs the true position") is only honored if abs_off comes from
-        # self.offset, not self._offset.
-        abs_off = int(self.offset[0]) if hasattr(self.offset, "shape") else int(self.offset)
-        valid = min(abs_off, max_size)
-        B = self.offset.shape[0]
+        # Per-stream LOGICAL absolute positions (true token counts, e.g.
+        # 138696 after a long prefill), NOT the ring write cursor
+        # self._offset (which caps at ~max_size). Reading self._offset here
+        # was the c>=2 high-context MTP degeneration root cause (position
+        # mismatch vs the unrebased BatchPoolingCache). Streams are NOT
+        # uniform at swap time when the swap follows a decode-time join
+        # (veteran at 264, newcomer at 74): collapsing to offset[0] stamped
+        # the veteran's position onto the newcomer — the 2026-07-02 c>=2
+        # join corruption. Keep the full per-stream vector.
+        if hasattr(self.offset, "shape"):
+            offs = [int(o) for o in self.offset.tolist()]
+        else:
+            offs = [int(self.offset)]
+        B = len(offs)
         if self.keys is not None:
             B = self.keys.shape[0]
-            # Keep the newest `valid` tokens. The base buffer is a rotated
-            # ring of exactly max_size slots (verified via EXO_DSV4_SWAP_DIAG:
-            # keys.shape=(B,H,128,512) at max_size=128), and _temporal_order
-            # (run above when rotated=True) rolls it oldest-first — so the
-            # newest live at the tail. Slice [..., -valid:, :] to keep them.
-            # At low context (abs_off <= max_size) valid == abs_off and the
-            # buffer is <= valid wide, so head == tail and this is a no-op.
-            self.keys = mx.contiguous(self.keys[..., -valid:, :])
-            self.values = mx.contiguous(self.values[..., -valid:, :])
+            if len(offs) != B:
+                offs = (offs * B)[:B]
             Hk = self.keys.shape[1]
+            width = self.keys.shape[2]
             Dk = self.keys.shape[3]
             Dv = self.values.shape[3]
+            # Real (written) rows of the base buffer are [0:real_w) in
+            # temporal order (caller ran _temporal_order when rotated, which
+            # sets _idx = width). The buffer can be WIDER than the written
+            # region: _update_in_place grows it in `step`-sized zero chunks,
+            # so at low context rows [_idx:width) are zeros. Slicing the
+            # newest tokens from the END of the full buffer read that zero
+            # tail and wiped the entire prompt KV (the 2026-07-02 low-context
+            # c>=2 corruption: every rendezvous-batched pair went to
+            # deterministic gibberish at token 3).
+            real_w = int(self._idx) if 0 < int(self._idx) <= width else width
+            # Base-class invariant: stream b's newest row is real_w-1 holding
+            # logical position offs[b]-1, i.e. rows [real_w-v : real_w) hold
+            # positions [offs[b]-v : offs[b]) — never left-padding rows,
+            # since v <= offs[b].
             ring_k = mx.zeros((B, Hk, ring_width, Dk), dtype=self.keys.dtype)
             ring_v = mx.zeros((B, Hk, ring_width, Dv), dtype=self.values.dtype)
-            # Temporal token j (0..valid-1) → logical pos (abs_off - valid + j)
-            # → physical slot ((abs_off - valid + j) % ring_width).
-            start_slot = (abs_off - valid) % ring_width
-            if start_slot + valid <= ring_width:
-                ring_k[..., start_slot : start_slot + valid, :] = self.keys
-                ring_v[..., start_slot : start_slot + valid, :] = self.values
-            else:
-                first = ring_width - start_slot
-                ring_k[..., start_slot:, :] = self.keys[..., :first, :]
-                ring_v[..., start_slot:, :] = self.values[..., :first, :]
-                ring_k[..., : valid - first, :] = self.keys[..., first:, :]
-                ring_v[..., : valid - first, :] = self.values[..., first:, :]
+            for b in range(B):
+                valid_b = min(offs[b], max_size, real_w)
+                if valid_b <= 0:
+                    continue
+                src_k = self.keys[b : b + 1, :, real_w - valid_b : real_w, :]
+                src_v = self.values[b : b + 1, :, real_w - valid_b : real_w, :]
+                # Temporal token j (0..valid_b-1) → logical pos
+                # (offs[b]-valid_b+j) → physical slot (pos % ring_width).
+                positions = mx.arange(offs[b] - valid_b, offs[b], dtype=mx.int32)
+                slots = positions % ring_width
+                idx_k = mx.broadcast_to(
+                    slots[None, None, :, None], (1, Hk, valid_b, Dk)
+                )
+                idx_v = mx.broadcast_to(
+                    slots[None, None, :, None], (1, Hk, valid_b, Dv)
+                )
+                ring_k[b : b + 1] = mx.put_along_axis(
+                    ring_k[b : b + 1], idx_k, src_k, axis=2
+                )
+                ring_v[b : b + 1] = mx.put_along_axis(
+                    ring_v[b : b + 1], idx_v, src_v, axis=2
+                )
             self.keys = ring_k
             self.values = ring_v
-        # Keep absolute offsets — RoPE (LocalAttention reads cache.offset)
-        # needs the true position, NOT a rebased small value.
-        self.offset = mx.full((B,), abs_off, dtype=mx.int32)
+        # Keep absolute per-stream offsets — RoPE (LocalAttention reads
+        # cache.offset) needs the true position, NOT a rebased small value.
+        # left_padding is zeroed because the per-stream modular ring layout
+        # has no padding: each stream's rows live at its own pos % ring_width.
+        self.offset = mx.array(offs, dtype=mx.int32)
         self.left_padding = mx.zeros((B,), dtype=mx.int32)
-        self._idx = abs_off % ring_width  # ring write head
-        self._offset = abs_off
-        self._per_stream_max = abs_off
-        self._offsets_py = [abs_off] * B
-        self.rotated = abs_off >= max_size
+        abs_max = max(offs) if offs else 0
+        self._idx = abs_max % ring_width  # ring write head
+        self._offset = abs_max
+        self._per_stream_max = abs_max
+        self._offsets_py = list(offs)
+        self.rotated = abs_max >= max_size
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Unified per-stream physical write. Same code handles L=1
