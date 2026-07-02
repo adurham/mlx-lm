@@ -74,6 +74,20 @@ _OP_PROBE_ENABLED = bool(os.environ.get("MLX_OP_PROBE"))
 # _ALLSUM_PROBE_LOG_EVERY forward passes; _ACC is cleared after each dump.
 _ALLSUM_PROBE_ENABLED = bool(os.environ.get("EXO_DSV4_ALLSUM_PROBE"))
 _ALLSUM_PROBE_LOG_EVERY = int(os.environ.get("EXO_DSV4_ALLSUM_PROBE_LOG_EVERY", "50"))
+
+# 2026-07-02 decode-fence overlap experiment. The Phase H Lever 1 fence
+# below is a BLOCKING mx.eval(y): the CPU waits for the GPU to finish each
+# layer before encoding the next, so a decode cycle pays
+# (graph-build + GPU) serially 44 times (MTP-PROF: verify = 90% of the
+# 62 ms cycle; ALLSUM probe: ~1.1 ms fence wall per layer vs ~0.5 ms
+# weight-read floor). mx.async_eval(y) commits the graph at the same
+# per-layer points — the cross-rank dispatch ORDER that Lever 1 needs is
+# still pinned — but does not block, letting the CPU encode layer n+1
+# while the GPU runs layer n. This is DIFFERENT from OPT-7 (which removed
+# the per-layer eval entirely and paid a bigger batched-graph cost).
+# Default OFF until A/B'd for throughput, bit-determinism across ranks,
+# and c=2 stability. EXO_DSV4_FENCE_ASYNC=1 to enable.
+_FENCE_ASYNC = bool(int(os.environ.get("EXO_DSV4_FENCE_ASYNC", "0")))
 _ALLSUM_PROBE_ACC: Dict[int, List[float]] = {}    # layer_idx -> list[ms]
 _ALLSUM_PROBE_CYCLES: int = 0
 
@@ -1475,6 +1489,8 @@ class DeepseekV4MoE(nn.Module):
                                 == 0
                             ):
                                 _allsum_probe_dump()
+                    elif _FENCE_ASYNC:
+                        mx.async_eval(y)
                     else:
                         mx.eval(y)
                     y = finalize(y)
