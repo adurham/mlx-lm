@@ -1489,7 +1489,16 @@ class DeepseekV4MoE(nn.Module):
                                 == 0
                             ):
                                 _allsum_probe_dump()
-                    elif _FENCE_ASYNC:
+                    elif _FENCE_ASYNC and y.shape[0] == 1 and y.shape[1] <= 8:
+                        # Async fence is ONLY safe for c=1 decode/verify
+                        # (B==1, short L). A/B'd 2026-07-02: c=1 decode
+                        # 28.9 -> 37.0 t/s, outputs byte-identical; but a
+                        # c=2 (B=2 batched verify) run under async fence
+                        # degenerated within ~1s and wedged both ranks —
+                        # the blocking eval is load-bearing for cross-rank
+                        # lockstep exactly as the Phase H Lever 1 note
+                        # says. Prefill (L large) and any B>1 keep the
+                        # blocking fence unconditionally.
                         mx.async_eval(y)
                     else:
                         mx.eval(y)
