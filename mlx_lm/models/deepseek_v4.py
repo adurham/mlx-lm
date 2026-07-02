@@ -1966,11 +1966,53 @@ class Indexer(nn.Module):
                     self.n_heads**-0.5,
                 )
         if pmask is not None:
-            scores = mx.where(
-                pmask if pmask.ndim == 3 else pmask[None],
-                scores,
-                mx.finfo(scores.dtype).min,
+            # OPT-12 (env-gated EXO_DSV4_TAIL_PMASK=1, default ON): tail-
+            # restricted pmask apply. The row-causal pmask row j is
+            # ``pool_idx < (q_off + j + 1) // ratio`` — monotone in j. Pool
+            # columns below vis_min = (q_off+1)//ratio are visible to EVERY
+            # row of this chunk; columns >= vis_max = (q_off+L)//ratio + 1
+            # are visible to NONE. Only the tiny [vis_min, vis_max) band
+            # (≈ L/ratio + 1 columns, e.g. ~65 at L=256 ratio=4) is row-
+            # dependent. Applying the full (L, P) where() drags an O(L·P)
+            # bool tensor through memory per indexer layer per chunk —
+            # ~127 MB at P=124K — when all but the band is constant.
+            # Restricting the where() to the band is EXACT: outside the
+            # band the mask is constant-true (keep score) or constant-false
+            # (min-fill), applied as a cheap slice fill. Tree-verify passes
+            # a non-monotone mask — detected via _TREE_VERIFY_CTX — and
+            # keeps the full-P path. Decode/verify (pmask None) unaffected.
+            _tail_ok = (
+                _topk_os.environ.get("EXO_DSV4_TAIL_PMASK", "1") == "1"
+                and pmask.ndim == 2
+                and _TREE_VERIFY_CTX.get("positions") is None
+                and not isinstance(q_off, mx.array)
             )
+            if _tail_ok:
+                P_len = scores.shape[-1]
+                L_rows = scores.shape[1]
+                ratio = self.compressor.compress_ratio
+                vis_min = min((q_off + 1) // ratio, P_len)
+                vis_max = min((q_off + L_rows) // ratio + 1, P_len)
+                neg = mx.finfo(scores.dtype).min
+                parts = [scores[..., :vis_min]]
+                if vis_max > vis_min:
+                    parts.append(mx.where(
+                        pmask[None, :, vis_min:vis_max],
+                        scores[..., vis_min:vis_max],
+                        neg,
+                    ))
+                if P_len > vis_max:
+                    parts.append(mx.full(
+                        (scores.shape[0], L_rows, P_len - vis_max),
+                        neg, dtype=scores.dtype,
+                    ))
+                scores = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=-1)
+            else:
+                scores = mx.where(
+                    pmask if pmask.ndim == 3 else pmask[None],
+                    scores,
+                    mx.finfo(scores.dtype).min,
+                )
         k = min(self.index_topk, pooled.shape[1])
         # EXO_DSV4_TOPK_FUSED=1: use fused Metal top-K kernel that beats
         # argsort+slice by ~5x at the pipelined chain level (microbench
