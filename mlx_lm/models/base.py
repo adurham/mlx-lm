@@ -105,6 +105,18 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
+def _sdpa_rowsplit_enabled() -> bool:
+    global _SDPA_ROWSPLIT
+    if _SDPA_ROWSPLIT is None:
+        import os
+
+        _SDPA_ROWSPLIT = os.environ.get("MLX_LM_SDPA_ROWSPLIT", "1") != "0"
+    return _SDPA_ROWSPLIT
+
+
+_SDPA_ROWSPLIT = None
+
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -148,6 +160,34 @@ def scaled_dot_product_attention(
             sinks=sinks,
         )
     else:
+        # MLX's fused SDPA has fast paths for (B==1, any L) and (any B,
+        # L==1) but falls off both at B>1 AND L>1 — the batched
+        # speculative-verify shape — onto a path that degrades with KV
+        # length (measured M4 Max, heads=64/kv_heads=1/dk=512: B=2 L=3
+        # costs 3.7x two B=1 calls at ctx 512, 7.6x at ctx 4096). Split
+        # per batch row into B fused B=1 calls until the kernel grows a
+        # small-L batched fast path. MLX_LM_SDPA_ROWSPLIT=0 disables.
+        B = queries.shape[0]
+        L_q = queries.shape[2]
+        if 2 <= B <= 8 and 1 < L_q <= 8 and _sdpa_rowsplit_enabled():
+            outs = []
+            for b in range(B):
+                mask_b = (
+                    mask[b : b + 1]
+                    if isinstance(mask, mx.array) and mask.shape[0] == B
+                    else mask
+                )
+                outs.append(
+                    mx.fast.scaled_dot_product_attention(
+                        queries[b : b + 1],
+                        keys[b : b + 1],
+                        values[b : b + 1],
+                        scale=scale,
+                        mask=mask_b,
+                        sinks=sinks,
+                    )
+                )
+            return mx.concatenate(outs, axis=0)
         return mx.fast.scaled_dot_product_attention(
             queries,
             keys,
