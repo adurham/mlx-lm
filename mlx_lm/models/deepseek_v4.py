@@ -352,16 +352,25 @@ _orig_all_sum = mx.distributed.all_sum
 _orig_all_gather = mx.distributed.all_gather
 
 
-def _collective_fp32_safe(fn):
+_FP32_COLL_SEEN = set()
+
+
+def _collective_fp32_safe(fn, _name="?"):
     def wrapped(x, *args, **kwargs):
         if isinstance(x, mx.array) and x.dtype == mx.float32:
+            if os.environ.get("EXO_DSV4_FP32_COLL_LOG") == "1" and _name not in _FP32_COLL_SEEN:
+                _FP32_COLL_SEEN.add(_name)
+                import sys as _s
+                _s.stderr.write("[FP32_COLL] %s downcast fp32->bf16 shape=%s\n"
+                                % (_name, tuple(x.shape)))
+                _s.stderr.flush()
             return fn(x.astype(mx.bfloat16), *args, **kwargs).astype(mx.float32)
         return fn(x, *args, **kwargs)
     return wrapped
 
 
 if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
-    _all_sum_fp32 = _collective_fp32_safe(_orig_all_sum)
+    _all_sum_fp32 = _collective_fp32_safe(_orig_all_sum, "all_sum")
 
     def _all_sum_nop_aware(x, *args, **kwargs):
         if "all_sum" in _get_nop_targets():
@@ -370,10 +379,14 @@ if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
     _all_sum_nop_aware._all_sum_nop_wrapped = True
     mx.distributed.all_sum = _all_sum_nop_aware
 
-if not getattr(mx.distributed.all_gather, "_all_gather_fp32_wrapped", False):
-    _all_gather_fp32 = _collective_fp32_safe(_orig_all_gather)
-    _all_gather_fp32._all_gather_fp32_wrapped = True
-    mx.distributed.all_gather = _all_gather_fp32
+# Wrap ALL collectives that can carry fp32 activations (all_gather, and
+# defensively all_max/all_min/sum_scatter) so no fp32 payload reaches jaccl.
+for _cname in ("all_gather", "all_max", "all_min", "sum_scatter"):
+    _cfn = getattr(mx.distributed, _cname, None)
+    if _cfn is not None and not getattr(_cfn, "_fp32_wrapped", False):
+        _wrapped_c = _collective_fp32_safe(_cfn, _cname)
+        _wrapped_c._fp32_wrapped = True
+        setattr(mx.distributed, _cname, _wrapped_c)
 
 
 # Token-tree drafting verify-pass side channel. Set by the exo
