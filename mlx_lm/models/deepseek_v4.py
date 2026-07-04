@@ -3035,6 +3035,28 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             _bp_t_start = _BUILD_PROBE_PERF()
         with span("model.embed"):
             h = self.embed_tokens(inputs)
+            # Batch-invariance fix (EXO_DSV4_FP32_ACT=1): compute the whole
+            # forward with fp32 ACTIVATIONS (weights stay bf16/quantized — same
+            # bytes read, so the weight-bandwidth-bound cost is ~unchanged;
+            # MLX auto-promotes bf16/quantized matmuls to fp32 accumulation and
+            # output). bf16 activations round each op's output in a
+            # batch-SIZE-dependent order, so a B=2 verify forward flips ~17% of
+            # argmaxes vs the B=1 single-stream forward (bench: bdiff_matched.py
+            # 0.833 -> 1.000 agree); temp>0 sampling turns those tie-flips into
+            # the c>=2 repetition-attractor degeneration. fp32 activations make
+            # the forward batch-invariant (max logit diff 0.03 -> 1e-5). The KV
+            # cache also becomes fp32 (DSv4's compressed KV is small, so the
+            # doubling is affordable); keep the flag on for ALL forwards so the
+            # cache dtype stays consistent across prefill/decode/verify.
+            # Gated on batch>=2: c=1 (single-stream decode + prefill) is the
+            # correctness REFERENCE and never corrupts, so it stays bf16 (no
+            # perf hit); only the batched forwards (c>=2 verify + rendezvous
+            # batched prefill) — where the corruption lives — pay the fp32 cost.
+            if (
+                os.environ.get("EXO_DSV4_FP32_ACT") == "1"
+                and h.shape[0] >= 2
+            ):
+                h = h.astype(mx.float32)
             h = mx.broadcast_to(
                 h[:, :, None, :],
                 (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[2]),
