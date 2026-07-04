@@ -162,6 +162,14 @@ _ATTN_SUB_ACC: Dict[str, float] = {
 # disable (falls back to fully-replicated attention).
 _SEQ_SPLIT_ENABLED = os.environ.get("EXO_DSV4_SEQ_SPLIT", "1") == "1"
 _SEQ_SPLIT_MIN_L = int(os.environ.get("EXO_DSV4_SEQ_SPLIT_MIN_L", "16"))
+# fp32-activation batch-invariance fix. When on, the whole forward runs fp32
+# activations (weights stay bf16/quantized) so B=2 verify is batch-invariant.
+# To halve the fp32 memory (the 4000-tok c=2 run faulted the GPU at the 112GB
+# wired limit), the KV CACHE is kept BF16: a bf16 cast of batch-invariant fp32
+# values is still batch-invariant, so downcasting KV before the cache write
+# preserves the fix while halving cache bytes. SDPA auto-promotes (fp32 q ×
+# bf16 kv → fp32).
+_FP32_ACT = os.environ.get("EXO_DSV4_FP32_ACT") == "1"
 
 # OPT-4 two-level chunking: max query-row width for the sparse SDPA's gathered
 # (B,H,L_q,k,D) tensor. The rest of the layer (proj_qkv/indexer/o_proj/MoE) runs
@@ -1706,6 +1714,8 @@ class Compressor(nn.Module):
             # Escape hatch: putting "compressor_defer_off" in
             # /tmp/dsv4_nop_targets reverts to the synchronous path
             # for forensic A/B if a regression surfaces.
+            if _FP32_ACT and new_pooled.dtype == mx.float32:
+                new_pooled = new_pooled.astype(mx.bfloat16)  # bf16 pooled cache
             if "compressor_defer_off" in _nop:
                 new_pooled = pool_cache.update_and_fetch(new_pooled)
             else:
@@ -2237,6 +2247,8 @@ class LocalAttention(nn.Module):
                 kv = finalize(kv)
             if cache is not None:
                 with span("attn.kv_cache"):
+                    if _FP32_ACT and kv.dtype == mx.float32:
+                        kv = kv.astype(mx.bfloat16)  # keep KV cache bf16 (batch-invariant)
                     kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
                     kv = finalize(kv)
 
@@ -2383,6 +2395,8 @@ class CompressedAttention(nn.Module):
                 kv = finalize(kv)
             if local_cache is not None:
                 with span("attn.kv_cache"):
+                    if _FP32_ACT and kv.dtype == mx.float32:
+                        kv = kv.astype(mx.bfloat16)  # keep KV cache bf16 (batch-invariant)
                     kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
                     kv = finalize(kv)
             pooled_mask = None
@@ -2622,6 +2636,8 @@ class SparseCompressedAttention(nn.Module):
                 kv = finalize(kv)
             if local_cache is not None:
                 with span("attn.kv_cache"):
+                    if _FP32_ACT and kv.dtype == mx.float32:
+                        kv = kv.astype(mx.bfloat16)  # keep KV cache bf16 (batch-invariant)
                     kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
                     kv = finalize(kv)
             with span("attn.mask"):
@@ -3102,7 +3118,7 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             # 75 tokens then flipped a near-tie); fp32 is batch-invariant ->
             # eliminates the drift. Collectives are downcast fp32->bf16 for
             # jaccl (batch-invariant at any dtype; see the wrappers above).
-            if os.environ.get("EXO_DSV4_FP32_ACT") == "1":
+            if _FP32_ACT:
                 h = h.astype(mx.float32)
             h = mx.broadcast_to(
                 h[:, :, None, :],
