@@ -337,14 +337,43 @@ def _get_nop_targets():
 
 # Monkey-patch mx.distributed.all_sum to honor the NOP flag.
 # Idempotent: guarded by _all_sum_nop_wrapped attribute.
+#
+# fp32-activation batch-invariance fix (EXO_DSV4_FP32_ACT=1): the batched
+# forward runs in fp32 activations, but the jaccl RDMA collective path chokes
+# on the doubled fp32 payload ([jaccl] QP-to-RTR errno 16 EBUSY). The
+# batch-non-invariance we are fixing is in the LOCAL matmul tiling, NOT the
+# cross-rank reduction — the collective sums fixed per-rank shards and is
+# batch-invariant at any dtype. So downcast fp32 -> bf16 for the transfer and
+# upcast back: keeps the collective bf16 (jaccl-safe) while the fp32-local
+# compute stays batch-invariant (a bf16 cast of a batch-invariant fp32 value is
+# itself batch-invariant). Only fp32 arrays are touched, so the flag-off path
+# is byte-identical.
 _orig_all_sum = mx.distributed.all_sum
+_orig_all_gather = mx.distributed.all_gather
+
+
+def _collective_fp32_safe(fn):
+    def wrapped(x, *args, **kwargs):
+        if isinstance(x, mx.array) and x.dtype == mx.float32:
+            return fn(x.astype(mx.bfloat16), *args, **kwargs).astype(mx.float32)
+        return fn(x, *args, **kwargs)
+    return wrapped
+
+
 if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
+    _all_sum_fp32 = _collective_fp32_safe(_orig_all_sum)
+
     def _all_sum_nop_aware(x, *args, **kwargs):
         if "all_sum" in _get_nop_targets():
             return x  # NOP: pass through, skip cross-rank reduce
-        return _orig_all_sum(x, *args, **kwargs)
+        return _all_sum_fp32(x, *args, **kwargs)
     _all_sum_nop_aware._all_sum_nop_wrapped = True
     mx.distributed.all_sum = _all_sum_nop_aware
+
+if not getattr(mx.distributed.all_gather, "_all_gather_fp32_wrapped", False):
+    _all_gather_fp32 = _collective_fp32_safe(_orig_all_gather)
+    _all_gather_fp32._all_gather_fp32_wrapped = True
+    mx.distributed.all_gather = _all_gather_fp32
 
 
 # Token-tree drafting verify-pass side channel. Set by the exo
