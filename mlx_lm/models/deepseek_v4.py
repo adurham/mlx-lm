@@ -3118,7 +3118,16 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             # 75 tokens then flipped a near-tie); fp32 is batch-invariant ->
             # eliminates the drift. Collectives are downcast fp32->bf16 for
             # jaccl (batch-invariant at any dtype; see the wrappers above).
-            if _FP32_ACT:
+            # fp32 the DECODE/VERIFY only (small L), not prefill. The recurring
+            # c=2 corruption is a batch-dependent bf16 drift that accumulates
+            # over DECODE cycles (the B=2 L=gamma+1 verify); fp32 there makes it
+            # batch-invariant. Prefill (large L) stays bf16 -> no global fp32
+            # memory blowup (global fp32 faulted the GPU at the 112GB wired
+            # limit via pool accumulation). The KV cache is bf16 regardless
+            # (downcast on write above), so bf16-prefill / fp32-decode never
+            # straddle a cache dtype boundary. L<=8 = decode(1) + verify(gamma+1)
+            # + draft, excludes prefill chunks (>=256).
+            if _FP32_ACT and h.shape[1] <= 8:
                 h = h.astype(mx.float32)
             h = mx.broadcast_to(
                 h[:, :, None, :],
