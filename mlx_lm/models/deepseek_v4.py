@@ -171,6 +171,68 @@ _SEQ_SPLIT_MIN_L = int(os.environ.get("EXO_DSV4_SEQ_SPLIT_MIN_L", "16"))
 # bf16 kv → fp32).
 _FP32_ACT = os.environ.get("EXO_DSV4_FP32_ACT") == "1"
 
+# ---------------------------------------------------------------------------
+# Batch-invariant matmul (the REAL c>=2 corruption fix, bf16, no fp32/jaccl).
+# ROOT CAUSE (proven 2026-07-04): MLX routes min(M,N)==1 to a GEMV kernel and
+# M>=2 to a GEMM (steel) kernel with a different K-reduction order. Bare bf16
+# matmul, same input row: M=1(gemv) vs M>=2(gemm) differ 6e-5; M=2 vs M=3 (both
+# gemm) differ 0.0. So c=1 decode (M=1 gemv) and c>=2 decode (M>=2 gemm) round
+# differently; 6e-5/matmul accumulates over layers/cycles until a near-tied
+# sampled token flips -> repetition attractor. SDPA is already batch-invariant
+# (verified 0.0). fp32 also fixes it but crashes this cluster's jaccl.
+#
+# Fix: force small-M matmuls to compute PER-ROW (each row min(M,N)==1 -> gemv),
+# so M>=2 bitwise-matches M=1. Weights are re-read per row (~M x bandwidth at
+# decode) — correctness first; the M-batched gemv kernel (adurham/mlx) is the
+# perf follow-up. Gated so it is a no-op unless explicitly enabled.
+_BATCH_INVARIANT_MM = os.environ.get("EXO_DSV4_BATCH_INVARIANT_MM") == "1"
+# Only reroute the small batch sizes that actually occur at decode/verify
+# (B*L for B in {1..} x L in {1, gamma+1}); prefill's large M keeps the fast
+# gemm (prefill is one-shot and the drift is a decode-cycle accumulation).
+_BI_MM_MAX_M = int(os.environ.get("EXO_DSV4_BATCH_INVARIANT_MM_MAX_M", "8"))
+
+if _BATCH_INVARIANT_MM:
+    _orig_matmul = mx.matmul
+    _orig_qmm = mx.quantized_matmul
+
+    def _rows(shape: tuple[int, ...]) -> int:
+        r = 1
+        for d in shape[:-1]:
+            r *= d
+        return r
+
+    def _bi_matmul(*args, **kwargs):
+        # Signature-agnostic (mx.matmul is a *args/**kwargs C++ binding).
+        # args[0]=a (activations), args[1]=b (weight). Only reroute the
+        # linear-layer case: 2D weight on the right, small leading M.
+        a, b = args[0], args[1]
+        if b.ndim == 2 and a.ndim >= 2:
+            m = _rows(a.shape)
+            if 2 <= m <= _BI_MM_MAX_M:
+                af = a.reshape(m, a.shape[-1])
+                rest = args[2:]
+                rows = [_orig_matmul(af[i:i + 1], b, *rest, **kwargs) for i in range(m)]
+                out = mx.concatenate(rows, axis=0)
+                return out.reshape(*a.shape[:-1], b.shape[-1])
+        return _orig_matmul(*args, **kwargs)
+
+    def _bi_qmm(*args, **kwargs):
+        # args[0]=x, args[1:]=(w, scales, biases, ...) — pass through verbatim,
+        # only slicing x per row. quantized_matmul is a *args/**kwargs binding.
+        x = args[0]
+        if x.ndim >= 2:
+            m = _rows(x.shape)
+            if 2 <= m <= _BI_MM_MAX_M:
+                xf = x.reshape(m, x.shape[-1])
+                rest = args[1:]
+                rows = [_orig_qmm(xf[i:i + 1], *rest, **kwargs) for i in range(m)]
+                out = mx.concatenate(rows, axis=0)
+                return out.reshape(*x.shape[:-1], rows[0].shape[-1])
+        return _orig_qmm(*args, **kwargs)
+
+    mx.matmul = _bi_matmul
+    mx.quantized_matmul = _bi_qmm
+
 # OPT-4 two-level chunking: max query-row width for the sparse SDPA's gathered
 # (B,H,L_q,k,D) tensor. The rest of the layer (proj_qkv/indexer/o_proj/MoE) runs
 # at the full prefill super-chunk width for weight-bandwidth amortization, but
