@@ -3090,14 +3090,19 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             # cache also becomes fp32 (DSv4's compressed KV is small, so the
             # doubling is affordable); keep the flag on for ALL forwards so the
             # cache dtype stays consistent across prefill/decode/verify.
-            # Gated on batch>=2: c=1 (single-stream decode + prefill) is the
-            # correctness REFERENCE and never corrupts, so it stays bf16 (no
-            # perf hit); only the batched forwards (c>=2 verify + rendezvous
-            # batched prefill) — where the corruption lives — pay the fp32 cost.
-            if (
-                os.environ.get("EXO_DSV4_FP32_ACT") == "1"
-                and h.shape[0] >= 2
-            ):
+            # GLOBAL fp32 activations when enabled (was B>=2-gated, but that
+            # mixed a bf16 prefill/c=1 cache with fp32 c>=2 verify writes ->
+            # garbage). Unconditional keeps the KV cache a single consistent
+            # dtype across a stream's whole life, so c1<->c2 transitions and the
+            # rotating-ring reuse never straddle a dtype boundary. Weights stay
+            # bf16/quantized (MLX auto-promotes; quantized_matmul dequants to
+            # fp32) so the cost is activation/KV bandwidth (~1.4x), not weight.
+            # On-cluster trace (2026-07-04) confirmed the c=2 corruption is a
+            # slow batch-dependent bf16 drift (c=2 stream matched c=1 bitwise
+            # 75 tokens then flipped a near-tie); fp32 is batch-invariant ->
+            # eliminates the drift. Collectives are downcast fp32->bf16 for
+            # jaccl (batch-invariant at any dtype; see the wrappers above).
+            if os.environ.get("EXO_DSV4_FP32_ACT") == "1":
                 h = h.astype(mx.float32)
             h = mx.broadcast_to(
                 h[:, :, None, :],
