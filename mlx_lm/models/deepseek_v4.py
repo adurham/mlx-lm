@@ -3153,6 +3153,13 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         _bp = _BUILD_PROBE_ENABLED
         if _bp:
             _bp_t_start = _BUILD_PROBE_PERF()
+        _il_shape = inputs.shape
+        if _il_shape[1] > 1:
+            import sys as _sys
+            print(
+                f"[DSV4_SHAPE] forward B={_il_shape[0]} L={_il_shape[1]}",
+                file=_sys.stderr, flush=True,
+            )
         with span("model.embed"):
             h = self.embed_tokens(inputs)
             # Batch-invariance fix (EXO_DSV4_FP32_ACT=1): compute the whole
