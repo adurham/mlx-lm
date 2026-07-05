@@ -116,6 +116,7 @@ def _set_fence_async_ok(ok: bool, key: str = "engine") -> None:
     _FENCE_ASYNC_CTX[key] = bool(ok)
 _ALLSUM_PROBE_ACC: Dict[int, List[float]] = {}    # layer_idx -> list[ms]
 _ALLSUM_PROBE_CYCLES: int = 0
+_DSV4_FWD_COUNT: int = 0  # diag: total model-forward invocations (loop detector)
 
 
 # ── GPU-time section probe (env-gated EXO_DSV4_SECTION_TIME=1) ──────────────
@@ -3154,10 +3155,12 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if _bp:
             _bp_t_start = _BUILD_PROBE_PERF()
         _il_shape = inputs.shape
-        if _il_shape[1] > 1:
+        global _DSV4_FWD_COUNT
+        _DSV4_FWD_COUNT += 1
+        if _il_shape[1] > 1 or _DSV4_FWD_COUNT % 200 == 0:
             import sys as _sys
             print(
-                f"[DSV4_SHAPE] forward B={_il_shape[0]} L={_il_shape[1]}",
+                f"[DSV4_SHAPE] fwd#{_DSV4_FWD_COUNT} B={_il_shape[0]} L={_il_shape[1]}",
                 file=_sys.stderr, flush=True,
             )
         with span("model.embed"):
