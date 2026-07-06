@@ -1913,6 +1913,8 @@ class BatchPoolingCache(_BaseCache):
             idx_list = batch_indices.tolist()
         else:
             idx_list = list(batch_indices)
+        # Committed above -> all bumps zero; resize to the filtered batch.
+        self._pending_bumps = [0] * len(idx_list)
 
         if self.buf_kv is not None:
             self.buf_kv = self.buf_kv[batch_indices]
@@ -1929,6 +1931,10 @@ class BatchPoolingCache(_BaseCache):
         self.commit_pending()  # see filter()
         if hasattr(other, "commit_pending"):
             other.commit_pending()
+        # Committed -> zeros; size grows to the combined batch. Missing this
+        # was an IndexError at the first post-admission deferred update
+        # (2026-07-06, MTP-on c=2 battery pair 1).
+        self._pending_bumps = [0] * (len(self.remainder) + len(other.remainder))
         # Merge the remainder buffers
         if self.buf_kv is None and other.buf_kv is None:
             pass
