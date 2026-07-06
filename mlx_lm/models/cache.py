@@ -1510,21 +1510,86 @@ class BatchPoolingCache(_BaseCache):
     """Batched pooling cache with per-element variable-length tracking."""
 
     def commit_pending(self) -> None:
-        """Stub for API parity with PoolingCache. BatchPoolingCache does NOT
-        support deferred updates; Compressor.__call__'s defer path is
-        c=1-only (user policy 2026-05-24: c=2 frozen). Calling this is a
-        no-op so Compressor.__call__ can call it unconditionally without
-        an isinstance branch.
+        """Apply per-stream pool-length bumps staged by the previous
+        ``update_and_fetch_deferred`` call. Mirrors PoolingCache W4 path-1;
+        Compressor.__call__ invokes this at the top of every forward.
         """
-        pass
+        if any(self._pending_bumps):
+            for i, bump in enumerate(self._pending_bumps):
+                self._pool_lengths[i] += bump
+            self._pending_bumps = [0] * len(self._pending_bumps)
+        if self.pooled is not None:
+            self._visible_width = self.pooled.shape[1]
 
     def update_and_fetch_deferred(self, px: mx.array):
-        """BatchPoolingCache does NOT support deferred updates. Fall back to
-        the synchronous path; defer doesn't apply at c>=2 (frozen). If the
-        toggle is set at c=2 anyway, this preserves correctness at the cost
-        of the toggle being a no-op for c>=2 requests.
+        """Per-stream deferred pool update — the batched twin of
+        PoolingCache.update_and_fetch_deferred (W4 path-1).
+
+        HISTORY (the c>=2 B-invariance skew, 2026-07-06): this used to fall
+        back to the SYNCHRONOUS path ("c=2 frozen"), so at c>=2 a just-
+        pooled entry was attendable IMMEDIATELY while at c=1 it becomes
+        attendable NEXT step. Identical content therefore produced different
+        pool visibility at B>=2 vs B=1 (measured: P=13 vs P=14 at the r4
+        indexer during an L=3 MTP verify) — a structural, non-numeric batch
+        divergence in every pooled attention layer, worst in L>1 verify
+        chunks. Implementing true deferral restores B-invariance.
+
+        Semantics: write ``px`` into pool storage NOW at each stream's
+        current ``_pool_lengths``; stage the per-stream length bumps in
+        ``_pending_bumps`` for the next ``commit_pending()``. Return the
+        PRE-WRITE tensor (captured before the slice-assigns), so SDPA's lazy
+        graph has no dependency on the compress kernel; per-stream masks use
+        the pre-bump ``_pool_lengths``, so the new entries are invisible
+        until commit — exactly the c=1 behavior.
         """
-        return self.update_and_fetch(px)
+        B, N, D = px.shape
+        if any(self._pending_bumps):
+            raise RuntimeError(
+                "update_and_fetch_deferred called with uncommitted bumps — "
+                "Compressor must commit_pending() first"
+            )
+
+        if N == 0:
+            if self.pooled is None:
+                return mx.zeros((B, 0, D), dtype=px.dtype)
+            return self.pooled
+
+        new_counts = [
+            (self._processed[i] - self.remainder[i]) // self.ratio
+            - self._pool_lengths[i]
+            for i in range(B)
+        ]
+        max_new = max(new_counts)
+        if max_new == 0:
+            if self.pooled is None:
+                return mx.zeros((B, 0, D), dtype=px.dtype)
+            return self.pooled
+
+        max_pool = max(self._pool_lengths) + max_new
+
+        # Capture the pre-write visible tensor BEFORE any growth/assign.
+        # Slice-assign below rebinds self.pooled to a new array version, so
+        # this captured object never gains a dependency on px's producer.
+        if self.pooled is None:
+            visible = mx.zeros((B, 0, D), dtype=px.dtype)
+            self.pooled = mx.zeros((B, max_pool, D), dtype=px.dtype)
+        else:
+            visible = self.pooled
+            if self.pooled.shape[1] < max_pool:
+                pad = mx.zeros(
+                    (B, max_pool - self.pooled.shape[1], D), dtype=px.dtype
+                )
+                self.pooled = mx.concatenate([self.pooled, pad], axis=1)
+
+        for i in range(B):
+            nc = new_counts[i]
+            if nc > 0:
+                pl = self._pool_lengths[i]
+                self.pooled[i, pl : pl + nc] = px[i, :nc]
+                self._pending_bumps[i] = nc
+
+        self._visible_width = visible.shape[1]
+        return visible
 
     def __init__(self, ratio: int, left_padding: List[int]):
         self.ratio = ratio
@@ -1540,6 +1605,14 @@ class BatchPoolingCache(_BaseCache):
 
         self.pooled = None
         self._pool_lengths = [0] * batch_size
+        # Per-stream deferred pool-length bumps (W4 path-1 parity with
+        # PoolingCache._pending_offset_bump). Staged by
+        # update_and_fetch_deferred, applied by commit_pending.
+        self._pending_bumps = [0] * batch_size
+        # Width of the pool tensor most recently RETURNED to the model (the
+        # visible pool). With a deferred update in flight this is the
+        # pre-growth storage width; masks must match it, not storage width.
+        self._visible_width = None
 
         self._lengths = [2**31] * batch_size
         self._processed = [0] * batch_size
@@ -1679,6 +1752,7 @@ class BatchPoolingCache(_BaseCache):
                 self.pooled[i, pl : pl + nc] = px[i, :nc]
                 self._pool_lengths[i] = pl + nc
 
+        self._visible_width = self.pooled.shape[1]
         return self.pooled
 
     def make_mask(self, L: int = 1, offset=0):
@@ -1686,6 +1760,12 @@ class BatchPoolingCache(_BaseCache):
             return None
 
         B, P, _ = self.pooled.shape
+        # Mask width must match the pool tensor the model actually consumes.
+        # With a deferred update staged, storage has grown past the visible
+        # width returned by update_and_fetch_deferred; masks over storage
+        # width would broadcast-mismatch (and expose the deferred slot).
+        if self._visible_width is not None:
+            P = min(P, self._visible_width)
         pool_lengths = mx.array(self._pool_lengths)
 
         # Length based mask
@@ -1740,11 +1820,13 @@ class BatchPoolingCache(_BaseCache):
 
     @property
     def meta_state(self):
+        self.commit_pending()  # see filter(); keeps the tuple shape stable
         return (self.ratio, self.remainder, self._pool_lengths, self._processed)
 
     @meta_state.setter
     def meta_state(self, v):
         self.ratio, self.remainder, self._pool_lengths, self._processed = v
+        self._pending_bumps = [0] * len(self._pool_lengths)
 
     def is_trimmable(self):
         return self.pooled is None
@@ -1780,6 +1862,7 @@ class BatchPoolingCache(_BaseCache):
             list(self._processed),
             buf_kv,
             buf_gate,
+            list(self._pending_bumps),
         )
 
     def restore_meta(self, snap):
@@ -1791,10 +1874,17 @@ class BatchPoolingCache(_BaseCache):
         rejected-draft pooled entries beyond the rewound lengths become
         invisible and are overwritten by the next genuine window flush.
         """
-        pool_lengths, remainder, processed, buf_kv, buf_gate = snap
+        # 6-tuple (with pending bumps) since the deferred-update fix;
+        # tolerate old 5-tuples from snapshots taken before it.
+        if len(snap) == 6:
+            pool_lengths, remainder, processed, buf_kv, buf_gate, pending = snap
+        else:
+            pool_lengths, remainder, processed, buf_kv, buf_gate = snap
+            pending = [0] * len(pool_lengths)
         self._pool_lengths = list(pool_lengths)
         self.remainder = list(remainder)
         self._processed = list(processed)
+        self._pending_bumps = list(pending)
         if buf_kv is not None and self.buf_kv is not None:
             self.buf_kv = buf_kv
             self.buf_gate = buf_gate
@@ -1815,6 +1905,10 @@ class BatchPoolingCache(_BaseCache):
         return total
 
     def filter(self, batch_indices):
+        # Structural ops run between forwards, when deferred bumps may still
+        # be staged; commit them so per-stream bookkeeping can't be lost or
+        # misindexed (one-entry-early visibility only at this transition).
+        self.commit_pending()
         if isinstance(batch_indices, mx.array):
             idx_list = batch_indices.tolist()
         else:
@@ -1832,6 +1926,9 @@ class BatchPoolingCache(_BaseCache):
         self._processed = [self._processed[i] for i in idx_list]
 
     def extend(self, other):
+        self.commit_pending()  # see filter()
+        if hasattr(other, "commit_pending"):
+            other.commit_pending()
         # Merge the remainder buffers
         if self.buf_kv is None and other.buf_kv is None:
             pass
@@ -1905,6 +2002,7 @@ class BatchPoolingCache(_BaseCache):
         self._processed = self._processed + other._processed
 
     def extract(self, idx):
+        self.commit_pending()  # see filter()
         cache = PoolingCache(self.ratio)
         pl = self._pool_lengths[idx]
         r = self.remainder[idx]
@@ -1928,6 +2026,9 @@ class BatchPoolingCache(_BaseCache):
                 "BatchPoolingCache can only merge caches with the same ratio"
             )
         ratio = caches[0].ratio
+        for c in caches:
+            if hasattr(c, "commit_pending"):
+                c.commit_pending()  # see filter()
         batch_cache = cls(ratio, [0] * B)
 
         # Check if all caches are empty
