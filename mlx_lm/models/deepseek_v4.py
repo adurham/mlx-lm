@@ -1282,6 +1282,485 @@ _SPARSE_VERIFY_BATCHED = (
 )
 
 
+# ─────────── Fused sparse gather-SDPA kernel (EXO_DSV4_SPARSE_FUSED_SDPA) ──────────
+# One Metal kernel per sparse layer replacing the whole decode/verify sparse
+# block: index-gather from the pool + local/pool mask application + per-row
+# online-softmax attention (with sinks), reading local KV and pool rows
+# DIRECTLY — no gathered tensor, no local+pool concat, no mask
+# fill/broadcast/concat, no per-row SDPA loop. The 2026-07-07 500K ladder
+# attributed ~2.3ms/4L (L=3) to this block with only ~0.14ms of isolated op
+# time — the rest is per-step graph-node latency (~15 python ops + kernel
+# chain per layer), which is exactly what a single fused call removes.
+#
+# Numerics: the kernel body replicates mlx's sdpa_vector.h EXACTLY — same
+# BN=32/BD=32 simdgroup split, same key iteration order over the virtual
+# [local | gathered] concatenation, same fp32 online-softmax update with
+# fast::exp, same sink initialization on simdgroup 0, same cross-simdgroup
+# threadgroup reduction — so per-row arithmetic is order-identical to the
+# mx.fast SDPA call on the concatenated KV that it replaces. K and V are the
+# same tensor in this path, so a single load feeds both the score and the
+# value accumulation (fewer bytes, identical values).
+# Gate: EXO_DSV4_SPARSE_FUSED_SDPA (default 1; 0 = legacy path).
+
+_SPARSE_FUSED_KERNEL_CACHE = {}
+
+# Default OFF (2026-07-07): at prod shape (D=512, 64:1 MQA) the kernel is
+# GPU-neutral isolated (per-head key re-reads offset the node savings, and
+# the wrapper's own prep nodes offset the removed ones) and the model-level
+# equivalence gate measured worst |dlogit| 0.141 with 5/60 argmax flips —
+# 6x the landed L-split bar. Kept for future work (a head-shared flash-style
+# restructure + bitwise gemv/softmax order matching would be needed).
+_SPARSE_FUSED_SDPA = (
+    os.environ.get("EXO_DSV4_SPARSE_FUSED_SDPA", "0") == "1"
+)
+_SPARSE_FUSED_DEBUG = (
+    os.environ.get("EXO_DSV4_SPARSE_FUSED_DEBUG", "0") == "1"
+)
+_SPARSE_FUSED_DEBUG_SEEN: set = set()
+
+
+def _sparse_fused_debug_note(fired, q, lm, pm, sinks):
+    key = (
+        fired, q.shape,
+        None if lm is None else (getattr(lm, "shape", "str"),
+                                 getattr(lm, "dtype", None)),
+        None if pm is None else (getattr(pm, "shape", "str"),
+                                 getattr(pm, "dtype", None)),
+        sinks is None,
+    )
+    if key in _SPARSE_FUSED_DEBUG_SEEN:
+        return
+    _SPARSE_FUSED_DEBUG_SEEN.add(key)
+    print(f"[SPARSE_FUSED] fired={fired} q={q.shape} lm={key[2]} "
+          f"pm={key[3]} sinks_none={key[4]}", flush=True)
+
+
+def _sparse_fused_sdpa_source() -> str:
+    # Numerics contract: replicate the mx.fast SDPA COMPOSED FALLBACK that
+    # this model's shapes actually dispatch (use_fallback: qsl*gqa = L*64 >
+    # 32, so the vector kernel never runs here). Fallback pipeline and the
+    # matching kernel steps:
+    #   q_s   = bf16(bf16(scale) * q)                  [multiply op, bf16 out]
+    #   score = bf16(fp32_dot(q_s, k))                 [matmul, fp32 acc]
+    #   score = mask ? score : bf16_min                [where]
+    #   probs = softmax([sink | scores], precise)      [fp32 fast::exp, sum,
+    #            = bf16(exp(s - max) * (1/sum))         reciprocal-multiply]
+    #   out   = fp32_dot(probs_bf16, v) -> bf16        [matmul, fp32 acc]
+    # The ONLY residual difference is fp32 accumulation ORDER inside the
+    # dot products and the softmax sum (simd-strided here vs gemv/softmax
+    # thread-chunked there) — the same noise class as MLX's own
+    # gemv/gemm dispatch drift (~6e-5/matmul, see
+    # exo_dsv4_gemv_gemm_batchdrift). Requires sinks (prod always passes
+    # them); with a sink present, all-masked rows match the fallback's
+    # semantics (probs ~ 0) exactly.
+    return """
+uint h = threadgroup_position_in_grid.x;
+uint l = threadgroup_position_in_grid.y;
+uint b = threadgroup_position_in_grid.z;
+uint simd_gid = thread_position_in_threadgroup.x / 32;
+uint simd_lid = thread_position_in_threadgroup.x % 32;
+
+const uint sw = dims[0];
+const uint K_sel = dims[1];
+const uint P = dims[2];
+const uint N = sw + K_sel;
+
+typedef float U;
+constexpr int BN = 32;
+constexpr int BD = 32;
+constexpr int qk_per_thread = D_ / BD;
+constexpr int MAX_KEYS_PER_SIMD = 24;  // N <= 768 enforced by caller
+
+thread U q_r[qk_per_thread];
+thread U o_r[qk_per_thread];
+thread U s_exp[MAX_KEYS_PER_SIMD];
+
+threadgroup U outputs[BN * BD];
+threadgroup U red_buf[BN];
+
+const size_t q_off =
+    ((size_t(b) * H_ + h) * L_ + l) * D_ + simd_lid * qk_per_thread;
+for (int i = 0; i < qk_per_thread; i++) {
+    // bf16(bf16_scale * q): scale[0] is the bf16-rounded scale value.
+    q_r[i] = static_cast<U>(static_cast<bfloat16_t>(
+        scale[0] * static_cast<U>(queries[q_off + i])));
+}
+for (int i = 0; i < qk_per_thread; i++) {
+    o_r[i] = 0;
+}
+
+const U BF16_MIN = -3.3895313892515355e+38f;  // finfo(bfloat16).min
+const size_t lkv_base = size_t(b) * sw * D_;
+const size_t pool_base = size_t(b) * P * D_;
+const size_t lm_base = (size_t(b) * L_ + l) * sw;
+const size_t pm_base = (size_t(b) * L_ + l) * K_sel;
+const size_t tk_base = (size_t(b) * L_ + l) * K_sel;
+
+// Phase A: bf16-rounded scores for this simdgroup's strided keys.
+U local_max = BF16_MIN;
+int n_local = 0;
+for (uint i = simd_gid; i < N; i += BN, n_local++) {
+    bool use_key = true;
+    if (i < sw) {
+#if HAS_LMASK_
+        use_key = lmask[lm_base + i];
+#endif
+    } else {
+#if HAS_PMASK_
+        use_key = pmask[pm_base + (i - sw)];
+#endif
+    }
+    U score = BF16_MIN;
+    if (use_key) {
+        size_t row_off;
+        if (i < sw) {
+            row_off = lkv_base + size_t(i) * D_;
+        } else {
+            uint idx = topk[tk_base + (i - sw)];
+            row_off = pool_base + size_t(idx) * D_;
+        }
+        const size_t koff = row_off + simd_lid * qk_per_thread;
+        U part = 0;
+        #pragma unroll
+        for (int j = 0; j < qk_per_thread; j++) {
+            part = fma(q_r[j],
+                       static_cast<U>(kv_local_or_pool(koff + j, i < sw)),
+                       part);
+        }
+        score = static_cast<U>(static_cast<bfloat16_t>(simd_sum(part)));
+    }
+    s_exp[n_local] = score;
+    local_max = max(local_max, score);
+}
+
+// Phase B: global max (incl. sink), then fp32 exp-sum and reciprocal.
+if (simd_lid == 0) {
+    red_buf[simd_gid] = local_max;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+U max_score = simd_max(red_buf[simd_lid]);
+const U sink_v = static_cast<U>(sinks[h]);
+max_score = max(max_score, sink_v);
+
+U part_sum = 0;
+for (int i = 0; i < n_local; i++) {
+    U e = fast::exp(s_exp[i] - max_score);
+    s_exp[i] = e;
+    part_sum += e;
+}
+if (simd_lid == 0) {
+    red_buf[simd_gid] = part_sum;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+U denom = simd_sum(red_buf[simd_lid]);
+denom += fast::exp(sink_v - max_score);
+const U inv_denom = 1 / denom;
+
+// Phase C: bf16-rounded probs, fp32 accumulate probs * V.
+int idx_local = 0;
+for (uint i = simd_gid; i < N; i += BN, idx_local++) {
+    U p = static_cast<U>(static_cast<bfloat16_t>(s_exp[idx_local] * inv_denom));
+    if (p != 0) {
+        size_t row_off;
+        if (i < sw) {
+            row_off = lkv_base + size_t(i) * D_;
+        } else {
+            uint idx = topk[tk_base + (i - sw)];
+            row_off = pool_base + size_t(idx) * D_;
+        }
+        const size_t voff = row_off + simd_lid * qk_per_thread;
+        #pragma unroll
+        for (int j = 0; j < qk_per_thread; j++) {
+            o_r[j] = fma(p,
+                         static_cast<U>(kv_local_or_pool(voff + j, i < sw)),
+                         o_r[j]);
+        }
+    }
+}
+
+// Cross-simdgroup output reduction (probs pre-normalized: plain sum).
+for (int i = 0; i < qk_per_thread; i++) {
+    outputs[simd_lid * BD + simd_gid] = o_r[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    o_r[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (simd_lid == 0) {
+    const size_t o_off = ((size_t(b) * H_ + h) * L_ + l) * D_;
+    for (int i = 0; i < qk_per_thread; i++) {
+        out[o_off + simd_gid * qk_per_thread + i] =
+            static_cast<bfloat16_t>(o_r[i]);
+    }
+}
+"""
+
+
+def _get_sparse_fused_kernel(L: int, H: int, D: int,
+                             has_lmask: bool, has_pmask: bool):
+    key = (L, H, D, has_lmask, has_pmask)
+    if key in _SPARSE_FUSED_KERNEL_CACHE:
+        return _SPARSE_FUSED_KERNEL_CACHE[key]
+    input_names = ["queries", "local_kv", "pooled", "topk", "dims", "scale"]
+    if has_lmask:
+        input_names.append("lmask")
+    if has_pmask:
+        input_names.append("pmask")
+    input_names.append("sinks")
+    # kv_local_or_pool(off, is_local) selects the source tensor for a key
+    # row; K and V are the same tensor in this path so one macro serves both.
+    src = _sparse_fused_sdpa_source()
+    header = f"""
+constant uint L_ = {L};
+constant uint H_ = {H};
+constant uint D_ = {D};
+#define HAS_LMASK_ {1 if has_lmask else 0}
+#define HAS_PMASK_ {1 if has_pmask else 0}
+#define kv_local_or_pool(off, is_local) ((is_local) ? local_kv[(off)] : pooled[(off)])
+"""
+    kern = mx.fast.metal_kernel(
+        name=f"dsv4_sparse_fused_sdpa_L{L}_lm{int(has_lmask)}"
+             f"_pm{int(has_pmask)}",
+        input_names=input_names,
+        output_names=["out"],
+        source=src,
+        header=header,
+        ensure_row_contiguous=True,
+    )
+    _SPARSE_FUSED_KERNEL_CACHE[key] = kern
+    return kern
+
+
+def _bf16_round_py(x: float) -> float:
+    """Round a python float to bfloat16 precision (round-to-nearest-even),
+    matching mx.array(x, mx.bfloat16) without an eager mx op."""
+    import struct
+    u = struct.unpack("<I", struct.pack("<f", x))[0]
+    u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
+    return struct.unpack("<f", struct.pack("<I", u))[0]
+
+
+_SCALE_BF16_CACHE: dict = {}
+
+
+def _sparse_fused_sdpa(
+    q: mx.array,
+    local_kv: mx.array,
+    pooled: mx.array,
+    topk: mx.array,
+    local_mask: Optional[mx.array],
+    pooled_mask: Optional[mx.array],
+    scale: float,
+    sinks: Optional[mx.array],
+) -> Optional[mx.array]:
+    """Fused sparse block dispatch. Returns None when the shape/dtype
+    contract isn't met (caller falls back to the legacy path).
+
+    Contract: q (B,H,L,D) bf16 with D==128; local_kv (B,1,sw,D) bf16;
+    pooled (B,P,D) bf16; topk (B,L,k) integer; masks bool with a
+    broadcastable head axis (values identical across heads) or None;
+    sinks (H,) or None. Semantics == mx.fast SDPA over
+    concat([local_kv, pooled[topk]]) per row with the concatenated mask.
+    """
+    B, H, L, D = q.shape
+    if (
+        D not in (128, 512)  # prod: 512 (attention head_dim); 128 kept for tests
+        or sinks is None
+        or q.dtype != mx.bfloat16
+        or local_kv.dtype != mx.bfloat16
+        or pooled.dtype != mx.bfloat16
+        or local_kv.ndim != 4
+        or local_kv.shape[1] != 1
+        or L > 16
+    ):
+        return None
+    sw = local_kv.shape[2]
+    k_sel = topk.shape[-1]
+    P_dim = pooled.shape[1]
+    if sw + k_sel > 768:  # s_exp register array bound (24 keys/simdgroup)
+        return None
+
+    def _norm_mask(m, width):
+        # Normalize to a dense (B, L, width) bool row-block; the kernel
+        # applies the same row to every head (values are head-uniform in
+        # this path — pooled/local masks are built per (b, l)).
+        if m is None:
+            return None
+        if not isinstance(m, mx.array):
+            return False  # "causal"-style string masks: legacy path
+        if m.dtype != mx.bool_:
+            return False  # additive float masks: legacy path
+        if m.ndim == 2:
+            m = m[None, None]
+        if m.shape[-1] > width:
+            m = m[..., -width:] if width > 0 else m[..., :0]
+        if m.shape[-1] != width:
+            return False
+        if m.shape[1] != 1:
+            # Potentially head-dependent mask content: not expressible in
+            # the kernel's per-(b,l) row masks — legacy path.
+            return False
+        m = mx.broadcast_to(m, (B, 1, L, width))
+        return m.reshape(B, L, width)
+
+    lm = _norm_mask(local_mask, sw)
+    if lm is False:
+        return None
+    pm = _norm_mask(pooled_mask, k_sel)
+    if pm is False:
+        return None
+    if topk.dtype not in (mx.uint32, mx.int32):
+        return None
+    if topk.dtype == mx.int32:
+        try:
+            topk = topk.view(mx.uint32)
+        except Exception:
+            return None  # non-viewable layout (diag paths): legacy path
+    if sinks.dtype != mx.bfloat16:
+        sinks = sinks.astype(mx.bfloat16)
+
+    kern = _get_sparse_fused_kernel(L, H, D, lm is not None, pm is not None)
+    dims = mx.array([sw, k_sel, P_dim], dtype=mx.uint32)
+    # The fallback multiplies q by array(scale, bf16) — pre-round the scale
+    # to bf16 so the kernel's q-scaling matches it bitwise.
+    scale_bf = _SCALE_BF16_CACHE.get(scale)
+    if scale_bf is None:
+        scale_bf = _bf16_round_py(scale)
+        _SCALE_BF16_CACHE[scale] = scale_bf
+    scale_arr = mx.array([scale_bf], dtype=mx.float32)
+    inputs = [q, local_kv, pooled, topk, dims, scale_arr]
+    if lm is not None:
+        inputs.append(lm)
+    if pm is not None:
+        inputs.append(pm)
+    inputs.append(sinks)
+    outs = kern(
+        inputs=inputs,
+        grid=(1024 * H, L, B),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(B, H, L, D)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return outs[0]
+
+# Fold the small-L verify rows into the SDPA batch axis: one (B*L, H, 1, D)
+# fused call instead of L separate L=1 calls. Each verify row has its OWN
+# gathered KV, so rows are independent (B*L, 1, sw+k, D) batch entries —
+# exactly the vector-kernel layout. Measured (sdpa_fold_microbench.py,
+# m4-2, prod verify shape sw=128 k=512 L=3): 0.096 → 0.057 ms isolated;
+# in-graph the win is larger (2 fewer dependent dispatches + no output
+# concat + no per-row slice chains; the in-graph sparse block runs ~6x its
+# isolated cost — dispatch-latency dominated). Numerics: same per-row data
+# through the same fused kernel; batching changes only the grid split, so
+# outputs differ by at most 1 bf16 ulp (measured maxdiff 4.9e-4) — the same
+# accuracy class as the landed CATTN L-split (_CATTN_LSPLIT_MAX_L) and
+# variant_d. Gate: EXO_DSV4_SPARSE_VERIFY_FOLD (default 0).
+# SUPERSEDED 2026-07-07 by the fused gather-SDPA kernel below: in-model the
+# fold measured neutral-to-slower (the block's cost is graph-NODE count,
+# and the fold's transposes/reshapes replaced the nodes it removed), so it
+# stays available for experiments but defaults OFF.
+_SPARSE_VERIFY_FOLD = (
+    os.environ.get("EXO_DSV4_SPARSE_VERIFY_FOLD", "0") == "1"
+)
+
+
+# ─────────── Decode node diet (EXO_DSV4_DECODE_NODE_DIET) ───────────
+# The 2026-07-07 500K ladder attributed most of the decode/verify sparse and
+# CATTN block cost to per-step GRAPH NODES (python op construction +
+# dispatch), not GPU time (~0.14ms isolated vs ~2.3ms in-graph per 4 sparse
+# layers). These helpers remove nodes whose outputs are bitwise-determined
+# by integer shapes alone:
+#   * verify combined mask cache — at L<=8 the pool mask is None
+#     (PoolingCache.make_mask) and the 2-D local causal mask content is a
+#     pure function of (L, sw): row j of the trailing-sw clamp sees cols
+#     < sw - L + j + 1. The combined [lm | ones(k)] mask is built once per
+#     (B, H, L, sw, k) and reused — the first build goes through the exact
+#     legacy op chain, so cached bits == legacy bits.
+#   * B==1 gather shortcut — the batch-offset arange/mul/add chain is an
+#     identity at B==1 (offset == 0).
+#   * per-module sinks cast cache — attn_sink.astype(q.dtype) is a fresh
+#     node every layer call for a constant parameter.
+# Gate: EXO_DSV4_DECODE_NODE_DIET (default 1; 0 = legacy per-step builds).
+_DECODE_NODE_DIET = (
+    os.environ.get("EXO_DSV4_DECODE_NODE_DIET", "1") == "1"
+)
+
+_VERIFY_MASK_CACHE: dict = {}
+_VERIFY_MASK_CACHE_MAX = 64
+
+# attn_sink.astype(dtype) result per attention module — one graph node per
+# layer per step for a constant parameter otherwise. Keyed by module id;
+# invalidated when the parameter object or target dtype changes (set_dtype
+# / quantize replace the array object, changing its id).
+_SINKS_CAST_CACHE: dict = {}
+
+
+_ZERO_VALUES_CACHE: dict = {}
+
+
+def _zero_values(B, L):
+    """Zero-width (B, 1, L, 0) dummy values arg for update_and_fetch —
+    content-free (0 elements), so caching is trivially exact."""
+    if not _DECODE_NODE_DIET:
+        return mx.zeros((B, 1, L, 0))
+    key = (B, L)
+    z = _ZERO_VALUES_CACHE.get(key)
+    if z is None:
+        z = mx.zeros((B, 1, L, 0))
+        mx.eval(z)
+        if len(_ZERO_VALUES_CACHE) >= 64:
+            _ZERO_VALUES_CACHE.clear()
+        _ZERO_VALUES_CACHE[key] = z
+    return z
+
+
+def _cached_sinks(module, dtype):
+    if not _DECODE_NODE_DIET:
+        return module.attn_sink.astype(dtype)
+    key = id(module)
+    hit = _SINKS_CAST_CACHE.get(key)
+    if (
+        hit is not None
+        and hit[0] == dtype
+        and hit[1] is module.attn_sink
+    ):
+        return hit[2]
+    s = module.attn_sink.astype(dtype)
+    mx.eval(s)
+    _SINKS_CAST_CACHE[key] = (dtype, module.attn_sink, s)
+    return s
+
+
+def _cached_verify_mask(local_mask, B, H, L, sw, k_dim):
+    """Return the combined (B,H,L,sw+k) verify mask, cached.
+
+    Only used when local_mask is a 2-D bool causal mask and pooled_mask is
+    None (the canonical MTP-verify state at L<=8 — PoolingCache.make_mask
+    returns None there). Content is a pure function of (L, sw): the model's
+    2-D causal mask clamped to its trailing sw columns has row j visible
+    for cols < sw - L + j + 1, independent of offset (offset < window is
+    covered because sw == offset + L there). Cache hit returns the exact
+    array built by the legacy chain on first use."""
+    key = (B, H, L, sw, k_dim)
+    m = _VERIFY_MASK_CACHE.get(key)
+    if m is not None:
+        return m
+    lm = local_mask
+    if lm.ndim == 2:
+        lm = lm[None, None]
+    if lm.shape[-1] > sw:
+        lm = lm[..., -sw:] if sw > 0 else lm[..., :0]
+    pm = mx.ones((B, 1, L, k_dim), dtype=mx.bool_)
+    lm = mx.broadcast_to(lm, (B, H, L, sw))
+    pm = mx.broadcast_to(pm, (B, H, L, k_dim))
+    m = mx.concatenate([lm, pm], axis=-1)
+    mx.eval(m)
+    if len(_VERIFY_MASK_CACHE) >= _VERIFY_MASK_CACHE_MAX:
+        _VERIFY_MASK_CACHE.clear()
+    _VERIFY_MASK_CACHE[key] = m
+    return m
+
+
 def _sparse_verify_rows_batched(
     q: mx.array,
     local_kv: mx.array,
@@ -1304,6 +1783,11 @@ def _sparse_verify_rows_batched(
     outputs are bit-identical; only kernel count changes. Verified by
     sparse_batched_equiv.py (maxdiff 0.0 vs legacy loop).
 
+    With EXO_DSV4_SPARSE_VERIFY_FOLD=1 (default) the L per-row SDPA calls
+    additionally fold into ONE (B*L)-batched fused call — see
+    _SPARSE_VERIFY_FOLD above for the measurement and the 1-bf16-ulp
+    equivalence argument.
+
     Only handles 4-D local_kv (B, 1, sw, D) — the canonical decode/verify
     layout; callers fall back to the legacy loop otherwise.
     Gate: EXO_DSV4_SPARSE_VERIFY_BATCHED (default 1).
@@ -1313,16 +1797,46 @@ def _sparse_verify_rows_batched(
     k_dim = topk.shape[2]
     with span("attn.gather"):
         pooled_flat = pooled.reshape(B * P_dim, D)
-        offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
-        topk_flat = (topk + offset).reshape(-1)
+        if B == 1 and _DECODE_NODE_DIET:
+            # batch-offset chain is an identity at B==1 (offsets all 0)
+            topk_flat = topk.reshape(-1)
+        else:
+            offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
+            topk_flat = (topk + offset).reshape(-1)
         gathered = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
     sw = local_kv.shape[2]
-    local_b = mx.broadcast_to(local_kv[:, :, None], (B, 1, L, sw, D))
-    # (B, 1, L, sw + k, D): row l's combined KV == concat(local, gathered_l)
-    combined = mx.concatenate([local_b, gathered[:, None]], axis=3)
+    fold = _SPARSE_VERIFY_FOLD
+    if fold:
+        # Row-major (B, L, 1, sw+k, D) so the (B*L, 1, sw+k, D) batch-fold
+        # reshape below is a free view (no transpose copy of the KV block).
+        local_b = mx.broadcast_to(local_kv[:, None], (B, L, 1, sw, D))
+        combined = mx.concatenate([local_b, gathered[:, :, None]], axis=3)
+    else:
+        local_b = mx.broadcast_to(local_kv[:, :, None], (B, 1, L, sw, D))
+        # (B, 1, L, sw + k, D): row l's combined KV == concat(local, gathered_l)
+        combined = mx.concatenate([local_b, gathered[:, None]], axis=3)
 
     combined_mask: Optional[mx.array] = None
-    if local_mask is not None or pooled_mask is not None:
+    if (
+        _DECODE_NODE_DIET
+        and pooled_mask is None
+        and local_mask is not None
+        and isinstance(local_mask, mx.array)
+        and local_mask.dtype == mx.bool_
+        and (
+            local_mask.ndim == 2
+            or (
+                local_mask.ndim == 4
+                and local_mask.shape[0] == 1
+                and local_mask.shape[1] == 1
+            )
+        )
+    ):
+        # Canonical verify state: 2-D bool causal local mask, pool mask
+        # None. Content is (L, sw)-structural — serve from cache (first
+        # build runs the exact legacy chain; see _cached_verify_mask).
+        combined_mask = _cached_verify_mask(local_mask, B, H, L, sw, k_dim)
+    elif local_mask is not None or pooled_mask is not None:
         target_dtype = (
             local_mask.dtype if local_mask is not None else pooled_mask.dtype
         )
@@ -1339,8 +1853,14 @@ def _sparse_verify_rows_batched(
         # attention keeps the most-recent keys).
         if lm.shape[-1] > sw:
             lm = lm[..., -sw:] if sw > 0 else lm[..., :0]
+        # KERNEL CONTRACT (sdpa_vector.h): the mask is indexed as
+        # (b*H + h) * head_stride with a SINGLE stride, so any mask with
+        # batch > 1 MUST be dense over (B, H) — an H=1 mask at B>1 reads
+        # out of bounds (silent garbage). Always expand to full H here;
+        # at B==1 an H=1 mask would be fine (head_stride=0) but dense is
+        # what the pre-fold path always passed, so keep it identical.
         if lm.shape[1] == 1 and H > 1:
-            lm = mx.broadcast_to(lm, (B, H, L, sw))
+            lm = mx.broadcast_to(lm, (B, H, L, lm.shape[-1]))
         if pm.shape[1] == 1 and H > 1:
             pm = mx.broadcast_to(pm, (B, H, L, k_dim))
         if lm.dtype != pm.dtype:
@@ -1351,6 +1871,29 @@ def _sparse_verify_rows_batched(
                 lm = lm.astype(target_dtype)
                 pm = pm.astype(target_dtype)
         combined_mask = mx.concatenate([lm, pm], axis=-1)  # (B, H, L, sw+k)
+
+    if fold:
+        S = sw + k_dim
+        q_fold = q.transpose(0, 2, 1, 3).reshape(B * L, H, 1, D)
+        kv_fold = combined.reshape(B * L, 1, S, D)
+        mask_fold = None
+        if combined_mask is not None:
+            # combined_mask is (B, H, L, S) dense — see the kernel-contract
+            # note above; the (B*L, H, 1, S) view must keep strides(0) ==
+            # H * strides(1) (contiguous after the transpose copy), which
+            # is exactly what the kernel's flat (b*H + h) indexing needs.
+            mask_fold = combined_mask.transpose(0, 2, 1, 3).reshape(
+                B * L, H, 1, S
+            )
+        out = mx.fast.scaled_dot_product_attention(
+            q_fold,
+            kv_fold,
+            kv_fold,
+            scale=scale,
+            mask=mask_fold,
+            sinks=sinks,
+        )
+        return out.reshape(B, L, H, D).transpose(0, 2, 1, 3)
 
     outs = []
     for l in range(L):
@@ -1405,6 +1948,21 @@ def _sparse_pooled_attention(
     MTP-on (L_q=γ+1>=2) falls through to the inner kernel as before.
     """
     B, H, L, D = q.shape
+
+    # Fused gather-SDPA kernel: replaces the whole decode/verify sparse
+    # block (gather + concat + mask build + SDPA loop) with one dispatch.
+    # Declines (returns None) on any shape/dtype/mask contract miss, in
+    # which case the legacy paths below run unchanged.
+    if _SPARSE_FUSED_SDPA and L <= 16 and local_kv.ndim == 4:
+        fused_out = _sparse_fused_sdpa(
+            q, local_kv, pooled, topk, local_mask, pooled_mask, scale, sinks
+        )
+        if _SPARSE_FUSED_DEBUG:
+            _sparse_fused_debug_note(
+                fused_out is not None, q, local_mask, pooled_mask, sinks
+            )
+        if fused_out is not None:
+            return fused_out
 
     # L_q=1 fast path: concat-and-fused-sdpa
     if L == 1:
@@ -1476,7 +2034,10 @@ def _sparse_pooled_attention(
             # slice directly rather than via the Optional-typed helper.
             if lm.shape[-1] > sw:
                 lm = lm[..., -sw:] if sw > 0 else lm[..., :0]
-            # Broadcast head axis if needed
+            # Broadcast head axis if needed. KERNEL CONTRACT
+            # (sdpa_vector.h): masks with batch > 1 must be dense over
+            # (B, H) — the kernel indexes (b*H + h) * head_stride with a
+            # single stride, so an H=1 mask at B>1 reads out of bounds.
             if lm.shape[1] == 1 and H > 1:
                 lm = mx.broadcast_to(lm, (B, H, L, sw))
             if pm.shape[1] == 1 and H > 1:
@@ -2453,7 +3014,7 @@ class LocalAttention(nn.Module):
                 with span("attn.kv_cache"):
                     if _FP32_ACT and kv.dtype == mx.float32:
                         kv = kv.astype(mx.bfloat16)  # keep KV cache bf16 (batch-invariant)
-                    kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv, _ = cache.update_and_fetch(kv, _zero_values(B, L))
                     kv = finalize(kv)
 
             # The model-level / speculative tree mask is sized for the full
@@ -2473,7 +3034,7 @@ class LocalAttention(nn.Module):
                         cache=cache,
                         scale=self.scale,
                         mask=mask,
-                        sinks=self.attn_sink.astype(q.dtype),
+                        sinks=_cached_sinks(self, q.dtype),
                     )
                 )
             with span("attn.rope_out"):
@@ -2601,7 +3162,7 @@ class CompressedAttention(nn.Module):
                 with span("attn.kv_cache"):
                     if _FP32_ACT and kv.dtype == mx.float32:
                         kv = kv.astype(mx.bfloat16)  # keep KV cache bf16 (batch-invariant)
-                    kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv, _ = local_cache.update_and_fetch(kv, _zero_values(B, L))
                     kv = finalize(kv)
             pooled_mask = None
             with span("attn.mask"):
@@ -2638,7 +3199,7 @@ class CompressedAttention(nn.Module):
                 if "compressed_attn" in _get_nop_targets():
                     out = mx.zeros(q.shape, dtype=q.dtype)
                 else:
-                    _sinks = self.attn_sink.astype(q.dtype)
+                    _sinks = _cached_sinks(self, q.dtype)
                     _Lq = q.shape[2]
                     if (
                         2 <= _Lq <= _CATTN_LSPLIT_MAX_L
@@ -2889,7 +3450,7 @@ class SparseCompressedAttention(nn.Module):
                 with span("attn.kv_cache"):
                     if _FP32_ACT and kv.dtype == mx.float32:
                         kv = kv.astype(mx.bfloat16)  # keep KV cache bf16 (batch-invariant)
-                    kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv, _ = local_cache.update_and_fetch(kv, _zero_values(B, L))
                     kv = finalize(kv)
             with span("attn.mask"):
                 # Tree-aware pmask dispatch: see _tree_pmask docstring. Built for
@@ -2935,7 +3496,7 @@ class SparseCompressedAttention(nn.Module):
                 # The indexer block alone (pre-indexer fence above isolated it).
                 _ATTN_SUB_ACC["indexer"] += (_t_idx - _sub_t)
                 _sub_t = _t_idx
-            sinks = self.attn_sink.astype(q.dtype)
+            sinks = _cached_sinks(self, q.dtype)
 
             # seq-split v2: q, topk, and pmask are ALREADY banded above (the
             # q-projection, indexer score, and pmask all ran on the band). Only
