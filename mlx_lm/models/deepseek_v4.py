@@ -1304,9 +1304,35 @@ _SPARSE_VERIFY_BATCHED = (
 
 _SPARSE_FUSED_KERNEL_CACHE = {}
 
+# Default OFF (2026-07-07): at prod shape (D=512, 64:1 MQA) the kernel is
+# GPU-neutral isolated (per-head key re-reads offset the node savings, and
+# the wrapper's own prep nodes offset the removed ones) and the model-level
+# equivalence gate measured worst |dlogit| 0.141 with 5/60 argmax flips —
+# 6x the landed L-split bar. Kept for future work (a head-shared flash-style
+# restructure + bitwise gemv/softmax order matching would be needed).
 _SPARSE_FUSED_SDPA = (
-    os.environ.get("EXO_DSV4_SPARSE_FUSED_SDPA", "1") == "1"
+    os.environ.get("EXO_DSV4_SPARSE_FUSED_SDPA", "0") == "1"
 )
+_SPARSE_FUSED_DEBUG = (
+    os.environ.get("EXO_DSV4_SPARSE_FUSED_DEBUG", "0") == "1"
+)
+_SPARSE_FUSED_DEBUG_SEEN: set = set()
+
+
+def _sparse_fused_debug_note(fired, q, lm, pm, sinks):
+    key = (
+        fired, q.shape,
+        None if lm is None else (getattr(lm, "shape", "str"),
+                                 getattr(lm, "dtype", None)),
+        None if pm is None else (getattr(pm, "shape", "str"),
+                                 getattr(pm, "dtype", None)),
+        sinks is None,
+    )
+    if key in _SPARSE_FUSED_DEBUG_SEEN:
+        return
+    _SPARSE_FUSED_DEBUG_SEEN.add(key)
+    print(f"[SPARSE_FUSED] fired={fired} q={q.shape} lm={key[2]} "
+          f"pm={key[3]} sinks_none={key[4]}", flush=True)
 
 
 def _sparse_fused_sdpa_source() -> str:
@@ -1343,10 +1369,9 @@ typedef float U;
 constexpr int BN = 32;
 constexpr int BD = 32;
 constexpr int qk_per_thread = D_ / BD;
-constexpr int MAX_KEYS_PER_SIMD = 32;  // N <= 1024 enforced by caller
+constexpr int MAX_KEYS_PER_SIMD = 24;  // N <= 768 enforced by caller
 
 thread U q_r[qk_per_thread];
-thread U k_r[qk_per_thread];
 thread U o_r[qk_per_thread];
 thread U s_exp[MAX_KEYS_PER_SIMD];
 
@@ -1396,8 +1421,11 @@ for (uint i = simd_gid; i < N; i += BN, n_local++) {
         }
         const size_t koff = row_off + simd_lid * qk_per_thread;
         U part = 0;
+        #pragma unroll
         for (int j = 0; j < qk_per_thread; j++) {
-            part += q_r[j] * static_cast<U>(kv_local_or_pool(koff + j, i < sw));
+            part = fma(q_r[j],
+                       static_cast<U>(kv_local_or_pool(koff + j, i < sw)),
+                       part);
         }
         score = static_cast<U>(static_cast<bfloat16_t>(simd_sum(part)));
     }
@@ -1441,8 +1469,11 @@ for (uint i = simd_gid; i < N; i += BN, idx_local++) {
             row_off = pool_base + size_t(idx) * D_;
         }
         const size_t voff = row_off + simd_lid * qk_per_thread;
+        #pragma unroll
         for (int j = 0; j < qk_per_thread; j++) {
-            o_r[j] += p * static_cast<U>(kv_local_or_pool(voff + j, i < sw));
+            o_r[j] = fma(p,
+                         static_cast<U>(kv_local_or_pool(voff + j, i < sw)),
+                         o_r[j]);
         }
     }
 }
@@ -1533,7 +1564,7 @@ def _sparse_fused_sdpa(
     """
     B, H, L, D = q.shape
     if (
-        D != 128
+        D not in (128, 512)  # prod: 512 (attention head_dim); 128 kept for tests
         or sinks is None
         or q.dtype != mx.bfloat16
         or local_kv.dtype != mx.bfloat16
@@ -1546,7 +1577,7 @@ def _sparse_fused_sdpa(
     sw = local_kv.shape[2]
     k_sel = topk.shape[-1]
     P_dim = pooled.shape[1]
-    if sw + k_sel > 1024:  # s_exp register array bound (32 keys/simdgroup)
+    if sw + k_sel > 768:  # s_exp register array bound (24 keys/simdgroup)
         return None
 
     def _norm_mask(m, width):
@@ -1633,6 +1664,103 @@ _SPARSE_VERIFY_FOLD = (
 )
 
 
+# ─────────── Decode node diet (EXO_DSV4_DECODE_NODE_DIET) ───────────
+# The 2026-07-07 500K ladder attributed most of the decode/verify sparse and
+# CATTN block cost to per-step GRAPH NODES (python op construction +
+# dispatch), not GPU time (~0.14ms isolated vs ~2.3ms in-graph per 4 sparse
+# layers). These helpers remove nodes whose outputs are bitwise-determined
+# by integer shapes alone:
+#   * verify combined mask cache — at L<=8 the pool mask is None
+#     (PoolingCache.make_mask) and the 2-D local causal mask content is a
+#     pure function of (L, sw): row j of the trailing-sw clamp sees cols
+#     < sw - L + j + 1. The combined [lm | ones(k)] mask is built once per
+#     (B, H, L, sw, k) and reused — the first build goes through the exact
+#     legacy op chain, so cached bits == legacy bits.
+#   * B==1 gather shortcut — the batch-offset arange/mul/add chain is an
+#     identity at B==1 (offset == 0).
+#   * per-module sinks cast cache — attn_sink.astype(q.dtype) is a fresh
+#     node every layer call for a constant parameter.
+# Gate: EXO_DSV4_DECODE_NODE_DIET (default 1; 0 = legacy per-step builds).
+_DECODE_NODE_DIET = (
+    os.environ.get("EXO_DSV4_DECODE_NODE_DIET", "1") == "1"
+)
+
+_VERIFY_MASK_CACHE: dict = {}
+_VERIFY_MASK_CACHE_MAX = 64
+
+# attn_sink.astype(dtype) result per attention module — one graph node per
+# layer per step for a constant parameter otherwise. Keyed by module id;
+# invalidated when the parameter object or target dtype changes (set_dtype
+# / quantize replace the array object, changing its id).
+_SINKS_CAST_CACHE: dict = {}
+
+
+_ZERO_VALUES_CACHE: dict = {}
+
+
+def _zero_values(B, L):
+    """Zero-width (B, 1, L, 0) dummy values arg for update_and_fetch —
+    content-free (0 elements), so caching is trivially exact."""
+    if not _DECODE_NODE_DIET:
+        return mx.zeros((B, 1, L, 0))
+    key = (B, L)
+    z = _ZERO_VALUES_CACHE.get(key)
+    if z is None:
+        z = mx.zeros((B, 1, L, 0))
+        mx.eval(z)
+        if len(_ZERO_VALUES_CACHE) >= 64:
+            _ZERO_VALUES_CACHE.clear()
+        _ZERO_VALUES_CACHE[key] = z
+    return z
+
+
+def _cached_sinks(module, dtype):
+    if not _DECODE_NODE_DIET:
+        return module.attn_sink.astype(dtype)
+    key = id(module)
+    hit = _SINKS_CAST_CACHE.get(key)
+    if (
+        hit is not None
+        and hit[0] == dtype
+        and hit[1] is module.attn_sink
+    ):
+        return hit[2]
+    s = module.attn_sink.astype(dtype)
+    mx.eval(s)
+    _SINKS_CAST_CACHE[key] = (dtype, module.attn_sink, s)
+    return s
+
+
+def _cached_verify_mask(local_mask, B, H, L, sw, k_dim):
+    """Return the combined (B,H,L,sw+k) verify mask, cached.
+
+    Only used when local_mask is a 2-D bool causal mask and pooled_mask is
+    None (the canonical MTP-verify state at L<=8 — PoolingCache.make_mask
+    returns None there). Content is a pure function of (L, sw): the model's
+    2-D causal mask clamped to its trailing sw columns has row j visible
+    for cols < sw - L + j + 1, independent of offset (offset < window is
+    covered because sw == offset + L there). Cache hit returns the exact
+    array built by the legacy chain on first use."""
+    key = (B, H, L, sw, k_dim)
+    m = _VERIFY_MASK_CACHE.get(key)
+    if m is not None:
+        return m
+    lm = local_mask
+    if lm.ndim == 2:
+        lm = lm[None, None]
+    if lm.shape[-1] > sw:
+        lm = lm[..., -sw:] if sw > 0 else lm[..., :0]
+    pm = mx.ones((B, 1, L, k_dim), dtype=mx.bool_)
+    lm = mx.broadcast_to(lm, (B, H, L, sw))
+    pm = mx.broadcast_to(pm, (B, H, L, k_dim))
+    m = mx.concatenate([lm, pm], axis=-1)
+    mx.eval(m)
+    if len(_VERIFY_MASK_CACHE) >= _VERIFY_MASK_CACHE_MAX:
+        _VERIFY_MASK_CACHE.clear()
+    _VERIFY_MASK_CACHE[key] = m
+    return m
+
+
 def _sparse_verify_rows_batched(
     q: mx.array,
     local_kv: mx.array,
@@ -1669,8 +1797,12 @@ def _sparse_verify_rows_batched(
     k_dim = topk.shape[2]
     with span("attn.gather"):
         pooled_flat = pooled.reshape(B * P_dim, D)
-        offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
-        topk_flat = (topk + offset).reshape(-1)
+        if B == 1 and _DECODE_NODE_DIET:
+            # batch-offset chain is an identity at B==1 (offsets all 0)
+            topk_flat = topk.reshape(-1)
+        else:
+            offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
+            topk_flat = (topk + offset).reshape(-1)
         gathered = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
     sw = local_kv.shape[2]
     fold = _SPARSE_VERIFY_FOLD
@@ -1685,7 +1817,26 @@ def _sparse_verify_rows_batched(
         combined = mx.concatenate([local_b, gathered[:, None]], axis=3)
 
     combined_mask: Optional[mx.array] = None
-    if local_mask is not None or pooled_mask is not None:
+    if (
+        _DECODE_NODE_DIET
+        and pooled_mask is None
+        and local_mask is not None
+        and isinstance(local_mask, mx.array)
+        and local_mask.dtype == mx.bool_
+        and (
+            local_mask.ndim == 2
+            or (
+                local_mask.ndim == 4
+                and local_mask.shape[0] == 1
+                and local_mask.shape[1] == 1
+            )
+        )
+    ):
+        # Canonical verify state: 2-D bool causal local mask, pool mask
+        # None. Content is (L, sw)-structural — serve from cache (first
+        # build runs the exact legacy chain; see _cached_verify_mask).
+        combined_mask = _cached_verify_mask(local_mask, B, H, L, sw, k_dim)
+    elif local_mask is not None or pooled_mask is not None:
         target_dtype = (
             local_mask.dtype if local_mask is not None else pooled_mask.dtype
         )
@@ -1806,6 +1957,10 @@ def _sparse_pooled_attention(
         fused_out = _sparse_fused_sdpa(
             q, local_kv, pooled, topk, local_mask, pooled_mask, scale, sinks
         )
+        if _SPARSE_FUSED_DEBUG:
+            _sparse_fused_debug_note(
+                fused_out is not None, q, local_mask, pooled_mask, sinks
+            )
         if fused_out is not None:
             return fused_out
 
@@ -2859,7 +3014,7 @@ class LocalAttention(nn.Module):
                 with span("attn.kv_cache"):
                     if _FP32_ACT and kv.dtype == mx.float32:
                         kv = kv.astype(mx.bfloat16)  # keep KV cache bf16 (batch-invariant)
-                    kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv, _ = cache.update_and_fetch(kv, _zero_values(B, L))
                     kv = finalize(kv)
 
             # The model-level / speculative tree mask is sized for the full
@@ -2879,7 +3034,7 @@ class LocalAttention(nn.Module):
                         cache=cache,
                         scale=self.scale,
                         mask=mask,
-                        sinks=self.attn_sink.astype(q.dtype),
+                        sinks=_cached_sinks(self, q.dtype),
                     )
                 )
             with span("attn.rope_out"):
@@ -3007,7 +3162,7 @@ class CompressedAttention(nn.Module):
                 with span("attn.kv_cache"):
                     if _FP32_ACT and kv.dtype == mx.float32:
                         kv = kv.astype(mx.bfloat16)  # keep KV cache bf16 (batch-invariant)
-                    kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv, _ = local_cache.update_and_fetch(kv, _zero_values(B, L))
                     kv = finalize(kv)
             pooled_mask = None
             with span("attn.mask"):
@@ -3044,7 +3199,7 @@ class CompressedAttention(nn.Module):
                 if "compressed_attn" in _get_nop_targets():
                     out = mx.zeros(q.shape, dtype=q.dtype)
                 else:
-                    _sinks = self.attn_sink.astype(q.dtype)
+                    _sinks = _cached_sinks(self, q.dtype)
                     _Lq = q.shape[2]
                     if (
                         2 <= _Lq <= _CATTN_LSPLIT_MAX_L
@@ -3295,7 +3450,7 @@ class SparseCompressedAttention(nn.Module):
                 with span("attn.kv_cache"):
                     if _FP32_ACT and kv.dtype == mx.float32:
                         kv = kv.astype(mx.bfloat16)  # keep KV cache bf16 (batch-invariant)
-                    kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+                    kv, _ = local_cache.update_and_fetch(kv, _zero_values(B, L))
                     kv = finalize(kv)
             with span("attn.mask"):
                 # Tree-aware pmask dispatch: see _tree_pmask docstring. Built for
@@ -3341,7 +3496,7 @@ class SparseCompressedAttention(nn.Module):
                 # The indexer block alone (pre-indexer fence above isolated it).
                 _ATTN_SUB_ACC["indexer"] += (_t_idx - _sub_t)
                 _sub_t = _t_idx
-            sinks = self.attn_sink.astype(q.dtype)
+            sinks = _cached_sinks(self, q.dtype)
 
             # seq-split v2: q, topk, and pmask are ALREADY banded above (the
             # q-projection, indexer score, and pmask all ran on the band). Only
