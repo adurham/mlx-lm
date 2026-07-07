@@ -1277,6 +1277,101 @@ def _sparse_pooled_attention_inner(
     return out.astype(q_scaled.dtype)
 
 
+_SPARSE_VERIFY_BATCHED = (
+    os.environ.get("EXO_DSV4_SPARSE_VERIFY_BATCHED", "1") == "1"
+)
+
+
+def _sparse_verify_rows_batched(
+    q: mx.array,
+    local_kv: mx.array,
+    pooled: mx.array,
+    topk: mx.array,
+    local_mask: Optional[mx.array],
+    pooled_mask: Optional[mx.array],
+    scale: float,
+    sinks: Optional[mx.array],
+) -> mx.array:
+    """Batched-prep variant of the small-L (MTP verify) per-row loop.
+
+    The legacy path runs the FULL prep pipeline per query row — its own
+    gather, local+pooled KV concat, mask fill/broadcast/concat — costing
+    ~10 small kernels per row per layer (~30/layer at gamma=2). This builds
+    the gathered KV, the combined KV block and the combined mask ONCE at
+    (B, ·, L, ·) shape and hands each row a slice view. The per-row fused
+    L=1 SDPA calls (the accuracy-bearing op) receive bit-identical inputs
+    to the legacy path — gather/concat/broadcast are exact copies — so the
+    outputs are bit-identical; only kernel count changes. Verified by
+    sparse_batched_equiv.py (maxdiff 0.0 vs legacy loop).
+
+    Only handles 4-D local_kv (B, 1, sw, D) — the canonical decode/verify
+    layout; callers fall back to the legacy loop otherwise.
+    Gate: EXO_DSV4_SPARSE_VERIFY_BATCHED (default 1).
+    """
+    B, H, L, D = q.shape
+    P_dim = pooled.shape[1]
+    k_dim = topk.shape[2]
+    with span("attn.gather"):
+        pooled_flat = pooled.reshape(B * P_dim, D)
+        offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
+        topk_flat = (topk + offset).reshape(-1)
+        gathered = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
+    sw = local_kv.shape[2]
+    local_b = mx.broadcast_to(local_kv[:, :, None], (B, 1, L, sw, D))
+    # (B, 1, L, sw + k, D): row l's combined KV == concat(local, gathered_l)
+    combined = mx.concatenate([local_b, gathered[:, None]], axis=3)
+
+    combined_mask: Optional[mx.array] = None
+    if local_mask is not None or pooled_mask is not None:
+        target_dtype = (
+            local_mask.dtype if local_mask is not None else pooled_mask.dtype
+        )
+        target_is_bool = target_dtype == mx.bool_
+
+        def _full(shape):
+            if target_is_bool:
+                return mx.ones(shape, dtype=mx.bool_)
+            return mx.zeros(shape, dtype=target_dtype)
+
+        lm = local_mask if local_mask is not None else _full((B, H, L, sw))
+        pm = pooled_mask if pooled_mask is not None else _full((B, H, L, k_dim))
+        # Same trailing-column clamp as the legacy L=1 path (sliding-window
+        # attention keeps the most-recent keys).
+        if lm.shape[-1] > sw:
+            lm = lm[..., -sw:] if sw > 0 else lm[..., :0]
+        if lm.shape[1] == 1 and H > 1:
+            lm = mx.broadcast_to(lm, (B, H, L, sw))
+        if pm.shape[1] == 1 and H > 1:
+            pm = mx.broadcast_to(pm, (B, H, L, k_dim))
+        if lm.dtype != pm.dtype:
+            if target_is_bool:
+                lm = lm.astype(mx.bool_)
+                pm = pm.astype(mx.bool_)
+            else:
+                lm = lm.astype(target_dtype)
+                pm = pm.astype(target_dtype)
+        combined_mask = mx.concatenate([lm, pm], axis=-1)  # (B, H, L, sw+k)
+
+    outs = []
+    for l in range(L):
+        kv_l = combined[:, :, l]
+        outs.append(
+            mx.fast.scaled_dot_product_attention(
+                q[:, :, l : l + 1, :],
+                kv_l,
+                kv_l,
+                scale=scale,
+                mask=(
+                    None
+                    if combined_mask is None
+                    else combined_mask[..., l : l + 1, :]
+                ),
+                sinks=sinks,
+            )
+        )
+    return mx.concatenate(outs, axis=2)
+
+
 def _sparse_pooled_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -1417,6 +1512,11 @@ def _sparse_pooled_attention(
             local_mask = local_mask[None, None]
         if pooled_mask is not None and pooled_mask.ndim == 2:
             pooled_mask = pooled_mask[None, None]
+        if _SPARSE_VERIFY_BATCHED and local_kv.ndim == 4:
+            return _sparse_verify_rows_batched(
+                q, local_kv, pooled, topk, local_mask, pooled_mask,
+                scale, sinks,
+            )
         outs = []
         for li in range(L):
             out_l = _sparse_pooled_attention(
