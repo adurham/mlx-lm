@@ -2626,6 +2626,214 @@ def _fused_topk(scores: mx.array, k: int):
     return outs[0]
 
 
+# ─────────── EXACT fused top-K (EXO_DSV4_EXACT_TOPK) ───────────
+# Replaces ``mx.argsort(-scores)[..., :k]`` (decode, L==1) and
+# ``mx.argpartition(-scores, kth=k-1)[..., :k]`` (verify, 1<L<=16) in
+# Indexer.__call__ with one Metal kernel per score row:
+#   1. bf16 scores map to a monotonic 16-bit key (sign-flip trick), so an
+#      EXACT selection threshold is found with two 256-bin histogram
+#      passes (high byte, then low byte within the boundary bin).
+#   2. One compaction pass emits ALL indices with score > threshold, then
+#      ties (== threshold) in ascending-index order until k is reached.
+# The selected SET is exactly a top-k set: the multiset of selected
+# scores is ALWAYS identical to argpartition's (asserted by the unit
+# gate). Tie-breaking at the boundary value differs — deterministic
+# lowest-index here vs argpartition's implementation-defined pick — the
+# same "ties at the cutoff are arbitrary" class the landed argpartition
+# change documented. This also removes the ``-scores`` negation pass
+# (the kernel selects MAX keys directly).
+# This is the session-5-endorsed exact design; the older approximate
+# _fused_topk above (4 candidates/thread, loses ~3% of true top-512)
+# remains gated off and should NOT be enabled at k=512.
+
+_EXACT_TOPK = os.environ.get("EXO_DSV4_EXACT_TOPK", "1") == "1"
+_EXACT_TOPK_KERNEL_CACHE: dict = {}
+_EXACT_TOPK_PARAM_CACHE: dict = {}
+
+
+def _exact_topk_source() -> str:
+    return """
+uint l = threadgroup_position_in_grid.y;
+uint b = threadgroup_position_in_grid.z;
+uint tid = thread_position_in_threadgroup.x;
+uint simd_gid = tid / 32;
+uint simd_lid = tid % 32;
+
+const uint P = params[0];
+const uint K = params[1];
+constexpr uint T_ = 1024;
+
+const size_t row = (size_t(b) * L_ + l) * P;
+const size_t out_row = (size_t(b) * L_ + l) * K;
+
+threadgroup atomic_uint hist[256];
+threadgroup uint scan_buf[32];
+threadgroup uint bcast[8];
+
+// ---- phase 1: high-byte histogram (strided) ----
+for (uint i = tid; i < 256; i += T_) {
+    atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint i = tid; i < P; i += T_) {
+    ushort key = dsv4_topk_key(scores[row + i]);
+    atomic_fetch_add_explicit(&hist[key >> 8], 1u, memory_order_relaxed);
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (tid == 0) {
+    uint above = 0;
+    uint hb = 0;
+    for (int bin = 255; bin >= 0; bin--) {
+        uint c = atomic_load_explicit(&hist[bin], memory_order_relaxed);
+        if (above + c >= K) { hb = uint(bin); break; }
+        above += c;
+    }
+    bcast[0] = hb;
+    bcast[1] = above;  // count of keys with high byte > hb
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+const uint hb = bcast[0];
+const uint above_hb = bcast[1];
+
+// ---- phase 2: low-byte histogram within the boundary high-byte bin ----
+for (uint i = tid; i < 256; i += T_) {
+    atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint i = tid; i < P; i += T_) {
+    ushort key = dsv4_topk_key(scores[row + i]);
+    if (uint(key >> 8) == hb) {
+        atomic_fetch_add_explicit(&hist[key & 0xFF], 1u, memory_order_relaxed);
+    }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (tid == 0) {
+    uint above = 0;
+    uint lb = 0;
+    for (int bin = 255; bin >= 0; bin--) {
+        uint c = atomic_load_explicit(&hist[bin], memory_order_relaxed);
+        if (above_hb + above + c >= K) { lb = uint(bin); break; }
+        above += c;
+    }
+    bcast[2] = lb;
+    bcast[3] = above_hb + above;      // n_gt: keys strictly > threshold
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+const ushort thresh = ushort((hb << 8) | bcast[2]);
+const uint n_gt = bcast[3];
+const uint n_eq_need = K - n_gt;
+
+// ---- phase 3: deterministic index-ordered compaction ----
+// thread t owns the contiguous chunk [t*chunk, min((t+1)*chunk, P))
+const uint chunk = (P + T_ - 1) / T_;
+const uint lo = min(tid * chunk, P);
+const uint hi = min(lo + chunk, P);
+
+uint my_gt = 0, my_eq = 0;
+for (uint i = lo; i < hi; i++) {
+    ushort key = dsv4_topk_key(scores[row + i]);
+    if (key > thresh) my_gt++;
+    else if (key == thresh) my_eq++;
+}
+
+// two-level exclusive scans over the 1024 per-thread counts
+uint gt_pre, eq_pre;
+{
+    uint lane_ex = simd_prefix_exclusive_sum(my_gt);
+    uint sg_tot = simd_sum(my_gt);
+    if (simd_lid == 31) scan_buf[simd_gid] = sg_tot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 0) {
+        uint v = scan_buf[simd_lid];
+        scan_buf[simd_lid] = simd_prefix_exclusive_sum(v);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    gt_pre = scan_buf[simd_gid] + lane_ex;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+{
+    uint lane_ex = simd_prefix_exclusive_sum(my_eq);
+    uint sg_tot = simd_sum(my_eq);
+    if (simd_lid == 31) scan_buf[simd_gid] = sg_tot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 0) {
+        uint v = scan_buf[simd_lid];
+        scan_buf[simd_lid] = simd_prefix_exclusive_sum(v);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    eq_pre = scan_buf[simd_gid] + lane_ex;
+}
+
+uint gt_pos = gt_pre;
+uint eq_rank = eq_pre;
+for (uint i = lo; i < hi; i++) {
+    ushort key = dsv4_topk_key(scores[row + i]);
+    if (key > thresh) {
+        out_idx[out_row + gt_pos] = i;
+        gt_pos++;
+    } else if (key == thresh) {
+        if (eq_rank < n_eq_need) {
+            out_idx[out_row + n_gt + eq_rank] = i;
+        }
+        eq_rank++;
+    }
+}
+"""
+
+
+def _get_exact_topk_kernel(L: int):
+    kern = _EXACT_TOPK_KERNEL_CACHE.get(L)
+    if kern is None:
+        kern = mx.fast.metal_kernel(
+            name=f"dsv4_exact_topk_L{L}",
+            input_names=["scores", "params"],
+            output_names=["out_idx"],
+            source=_exact_topk_source(),
+            header=(
+                f"constant uint L_ = {L};\n"
+                # monotonic 16-bit key: order(key) == float order for all
+                # non-NaN bf16 (sign-flip trick)
+                "static inline ushort dsv4_topk_key(bfloat16_t v) {\n"
+                "    ushort u = as_type<ushort>(v);\n"
+                "    return (u & 0x8000) ? ushort(~u) : ushort(u | 0x8000);\n"
+                "}\n"
+            ),
+            ensure_row_contiguous=True,
+        )
+        _EXACT_TOPK_KERNEL_CACHE[L] = kern
+    return kern
+
+
+def _exact_topk(scores: mx.array, k: int):
+    """(B, L, k) uint32 indices of an exact top-k set along axis -1.
+
+    Returns None when the contract isn't met (caller keeps the legacy
+    argsort/argpartition path): bf16 scores only (the 16-bit key trick),
+    k < P. Multiset of selected scores == argpartition's, always; ties at
+    the threshold resolve deterministically to the LOWEST indices."""
+    if scores.dtype != mx.bfloat16 or scores.ndim != 3:
+        return None
+    B, L, P = scores.shape
+    if k >= P or k <= 0:
+        return None
+    kern = _get_exact_topk_kernel(L)
+    pkey = (P, k)
+    params = _EXACT_TOPK_PARAM_CACHE.get(pkey)
+    if params is None:
+        params = mx.array([P, k], dtype=mx.uint32)
+        if len(_EXACT_TOPK_PARAM_CACHE) >= 64:
+            _EXACT_TOPK_PARAM_CACHE.clear()
+        _EXACT_TOPK_PARAM_CACHE[pkey] = params
+    outs = kern(
+        inputs=[scores, params],
+        grid=(1024, L, B),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(B, L, k)],
+        output_dtypes=[mx.uint32],
+    )
+    return outs[0]
+
+
 @partial(mx.compile, shapeless=True)
 def _indexer_score(
     q: mx.array,
@@ -2908,6 +3116,21 @@ class Indexer(nn.Module):
                 fused = _fused_topk(scores, k)
                 if fused is not None:
                     return fused
+            # EXACT fused top-k (2026-07-07): decode + MTP-verify rows
+            # (L <= 16) take the histogram/threshold kernel — exact top-k
+            # set (multiset of selected scores == argpartition's, always),
+            # deterministic lowest-index tie-breaking, no ``-scores``
+            # negation pass. Masked scores (finfo.min fills from the pmask
+            # path) map to the lowest key, so masking semantics carry
+            # through unchanged. Prefill chunks (L > 16) keep the landed
+            # argpartition path. Gate: EXO_DSV4_EXACT_TOPK (default 1);
+            # "exact_topk_off" in /tmp/dsv4_nop_targets disables live.
+            if (_EXACT_TOPK
+                    and scores.shape[1] <= 16
+                    and "exact_topk_off" not in _topk_targets):
+                exact = _exact_topk(scores, k)
+                if exact is not None:
+                    return exact
             # OPT-1 (env-gated EXO_DSV4_PREFILL_ARGPARTITION=1): in PREFILL (L>1)
             # the argsort below is a full O(P log P) sort over the pool just to take
             # the top-k. argpartition is O(P) and the top-k SET is identical; the
