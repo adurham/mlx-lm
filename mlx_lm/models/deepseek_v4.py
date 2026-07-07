@@ -162,6 +162,19 @@ _ATTN_SUB_ACC: Dict[str, float] = {
 # disable (falls back to fully-replicated attention).
 _SEQ_SPLIT_ENABLED = os.environ.get("EXO_DSV4_SEQ_SPLIT", "1") == "1"
 _SEQ_SPLIT_MIN_L = int(os.environ.get("EXO_DSV4_SEQ_SPLIT_MIN_L", "16"))
+# Reconstruct the seq-split bands via zero-padded all_sum on the TOP-LEVEL
+# group instead of all_gather on the split subgroup. The subgroup all_gather
+# rides raw UC (subgroups have no TCP coordinator, so the reliable ARQ can't
+# arm there) and large-L bands (~4MB at L=1024) intermittently hit the UC
+# stuck-send wedge -> all_gather STALLED -> failed subgroup reconnect ->
+# full re-place (observed 2026-07-06 mid-256K-prefill at step 1024). The
+# padded all_sum is bit-exact (each row has exactly one non-zero
+# contributor; bf16 0+x == x) and rides the reliable pipelined path at
+# ~2x wire bytes — comparable per-layer cost at ARQ ~4GB/s, and it removes
+# the wedge class entirely. Kill switch: =0 restores subgroup all_gather.
+_SEQ_SPLIT_GATHER_VIA_ALLSUM = (
+    os.environ.get("EXO_DSV4_SEQSPLIT_GATHER_VIA_ALLSUM", "1") == "1"
+)
 # fp32-activation batch-invariance fix. When on, the whole forward runs fp32
 # activations (weights stay bf16/quantized) so B=2 verify is batch-invariant.
 # To halve the fp32 memory (the 4000-tok c=2 run faulted the GPU at the 112GB
@@ -2535,16 +2548,40 @@ class CompressedAttention(nn.Module):
                 # N and band into L so each stream's L axis is the concat of
                 # ITS OWN bands across ranks. Bit-exact vs unsharded at B=1.
                 with span("attn.all_gather"):
-                    _B = out.shape[0]
-                    _H = out.shape[-1]
-                    _N = _sg.size()
-                    _band = L // _N
-                    _g = mx.distributed.all_gather(out, group=_sg)
-                    out = finalize(
-                        _g.reshape(_N, _B, _band, _H)
-                        .transpose(1, 0, 2, 3)
-                        .reshape(_B, L, _H)
-                    )
+                    if (
+                        _SEQ_SPLIT_GATHER_VIA_ALLSUM
+                        and self.sharding_group is not None
+                    ):
+                        # Zero-pad this rank's band to full L and all_sum on
+                        # the top-level group (reliable ARQ path). Bit-exact:
+                        # each row has exactly one non-zero contributor and
+                        # bf16 0+x == x. Avoids the subgroup UC all_gather
+                        # (see _SEQ_SPLIT_GATHER_VIA_ALLSUM).
+                        _band_len = out.shape[1]
+                        _full = mx.pad(
+                            out,
+                            (
+                                (0, 0),
+                                (_seq_lo, L - _seq_lo - _band_len),
+                                (0, 0),
+                            ),
+                        )
+                        out = finalize(
+                            mx.distributed.all_sum(
+                                _full, group=self.sharding_group
+                            )
+                        )
+                    else:
+                        _B = out.shape[0]
+                        _H = out.shape[-1]
+                        _N = _sg.size()
+                        _band = L // _N
+                        _g = mx.distributed.all_gather(out, group=_sg)
+                        out = finalize(
+                            _g.reshape(_N, _B, _band, _H)
+                            .transpose(1, 0, 2, 3)
+                            .reshape(_B, L, _H)
+                        )
             elif self.sharding_group is not None:
                 with span("attn.all_sum"):
                     out = finalize(
@@ -2912,16 +2949,40 @@ class SparseCompressedAttention(nn.Module):
                 # N and band into L so each stream's L axis is the concat of
                 # ITS OWN bands across ranks. Bit-exact vs unsharded at B=1.
                 with span("attn.all_gather"):
-                    _B = out.shape[0]
-                    _H = out.shape[-1]
-                    _N = _sg.size()
-                    _band = L // _N
-                    _g = mx.distributed.all_gather(out, group=_sg)
-                    out = finalize(
-                        _g.reshape(_N, _B, _band, _H)
-                        .transpose(1, 0, 2, 3)
-                        .reshape(_B, L, _H)
-                    )
+                    if (
+                        _SEQ_SPLIT_GATHER_VIA_ALLSUM
+                        and self.sharding_group is not None
+                    ):
+                        # Zero-pad this rank's band to full L and all_sum on
+                        # the top-level group (reliable ARQ path). Bit-exact:
+                        # each row has exactly one non-zero contributor and
+                        # bf16 0+x == x. Avoids the subgroup UC all_gather
+                        # (see _SEQ_SPLIT_GATHER_VIA_ALLSUM).
+                        _band_len = out.shape[1]
+                        _full = mx.pad(
+                            out,
+                            (
+                                (0, 0),
+                                (_seq_lo, L - _seq_lo - _band_len),
+                                (0, 0),
+                            ),
+                        )
+                        out = finalize(
+                            mx.distributed.all_sum(
+                                _full, group=self.sharding_group
+                            )
+                        )
+                    else:
+                        _B = out.shape[0]
+                        _H = out.shape[-1]
+                        _N = _sg.size()
+                        _band = L // _N
+                        _g = mx.distributed.all_gather(out, group=_sg)
+                        out = finalize(
+                            _g.reshape(_N, _B, _band, _H)
+                            .transpose(1, 0, 2, 3)
+                            .reshape(_B, L, _H)
+                        )
             elif self.sharding_group is not None:
                 with span("attn.all_sum"):
                     out = finalize(
