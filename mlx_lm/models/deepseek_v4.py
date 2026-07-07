@@ -283,25 +283,29 @@ _FFN_SUB_ACC: Dict[str, float] = {"experts": 0.0, "all_sum": 0.0, "n": 0}
 def _section_time_dump() -> None:
     """Emit accumulated per-section GPU wall time (attn vs ffn) and reset."""
     acc = _SECTION_TIME_ACC
-    n = acc["layer_count"]
+    # layer_count lost its increment site in a refactor; the attn-sub
+    # accumulator still counts sparse-attention invocations, so fall back to
+    # it (dump gate + divisor) or the dump never fires at all.
+    n = acc["layer_count"] or _ATTN_SUB_ACC["n"]
     if not n:
         return
     attn_ms = acc["attn"] * 1000.0
     ffn_ms = acc["ffn"] * 1000.0
     other_ms = acc["other"] * 1000.0
     total_ms = attn_ms + ffn_ms + other_ms
-    if total_ms <= 0:
-        return
     lines = [
         f"[SECTION-TIME pid={os.getpid()}] layer_invocations={int(n)} "
         f"total={total_ms:.1f}ms",
-        f"[SECTION-TIME pid={os.getpid()}]   attn  = {attn_ms:9.1f}ms "
-        f"({100.0 * attn_ms / total_ms:5.1f}%)  avg/layer={attn_ms / n:6.3f}ms",
-        f"[SECTION-TIME pid={os.getpid()}]   ffn   = {ffn_ms:9.1f}ms "
-        f"({100.0 * ffn_ms / total_ms:5.1f}%)  avg/layer={ffn_ms / n:6.3f}ms",
-        f"[SECTION-TIME pid={os.getpid()}]   other = {other_ms:9.1f}ms "
-        f"({100.0 * other_ms / total_ms:5.1f}%)  avg/layer={other_ms / n:6.3f}ms",
     ]
+    if total_ms > 0:
+        lines += [
+            f"[SECTION-TIME pid={os.getpid()}]   attn  = {attn_ms:9.1f}ms "
+            f"({100.0 * attn_ms / total_ms:5.1f}%)  avg/layer={attn_ms / n:6.3f}ms",
+            f"[SECTION-TIME pid={os.getpid()}]   ffn   = {ffn_ms:9.1f}ms "
+            f"({100.0 * ffn_ms / total_ms:5.1f}%)  avg/layer={ffn_ms / n:6.3f}ms",
+            f"[SECTION-TIME pid={os.getpid()}]   other = {other_ms:9.1f}ms "
+            f"({100.0 * other_ms / total_ms:5.1f}%)  avg/layer={other_ms / n:6.3f}ms",
+        ]
     # Attn sub-breakdown: within the attn bucket, where does the time go?
     sub = _ATTN_SUB_ACC
     sn = sub["n"]
@@ -3394,7 +3398,8 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         # which is not guaranteed for runner subprocesses. Default 1 = dump
         # after every forward (one prefill forward already accumulates all
         # layers, so a single prefill yields a complete attribution).
-        if _SECTION_TIME_ENABLED and _SECTION_TIME_ACC["layer_count"]:
+        if _SECTION_TIME_ENABLED and (
+                _SECTION_TIME_ACC["layer_count"] or _ATTN_SUB_ACC["n"]):
             global _SECTION_TIME_CYCLES
             _SECTION_TIME_CYCLES += 1
             if _SECTION_TIME_CYCLES % max(1, _SECTION_TIME_LOG_EVERY) == 0:
