@@ -1453,6 +1453,18 @@ def _sparse_pooled_attention(
 
             lm = local_mask if local_mask is not None else _full((B, H, L, sw))
             pm = pooled_mask if pooled_mask is not None else _full((B, H, L, k))
+            # PRE-EXISTING CRASH FIX (2026-07-07): an L==1 PREFILL remainder
+            # chunk (prompt_len landing a 1-token tail on this path) carries
+            # the model-level 2-D (L, S) causal mask while sparse_mask is
+            # 4-D → "[concatenate] got arrays with dimensions 2 and 4" and a
+            # runner death (seen 2026-07-06 23:07 pre-patch and 2026-07-07
+            # 02:53 at 500K). Same normalization the 1<L<=16 branch already
+            # applies (_DSV4_PREFILL_MASK_FIX). Prompt-length dependent, so
+            # it only fires on unlucky prompt lengths.
+            if lm.ndim == 2:
+                lm = lm[None, None]
+            if pm.ndim == 2:
+                pm = pm[None, None]
             # The local mask is sliced from the model-level windowed mask and
             # can be wider than the rotating local cache once the sequence
             # crosses the sliding-window boundary (e.g. decode mask local-width
