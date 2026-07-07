@@ -1142,6 +1142,24 @@ class CacheList(_BaseCache):
 _POOL_VERIFY_MAX_L = 16
 
 
+
+# ── Pool-write donation threshold (2026-07-06, long-ctx decode slope) ──
+# The W4 "deferred" pool update returns the PRE-WRITE view of the old pool
+# tensor so SDPA's lazy graph has no dependency on the compress kernel.
+# That pre-write reference BLOCKS MLX slice-update donation, forcing a full
+# O(P*D) pool-buffer copy on every flush — 128MB+32MB per ratio-4 layer at
+# 500K ctx, ~every MTP verify cycle (L=3 advances the pool ~every cycle) and
+# every 4th decode token. Above this threshold we return the POST-WRITE
+# prefix view instead: identical visible values (the written slot is still
+# excluded / masked), donation proceeds (true in-place write, zero copy), at
+# the cost of re-serializing compress->SDPA (the W4 win, ~+3% at short ctx —
+# which is why small pools keep the pre-write path).
+import os as _pool_os
+_POOL_DEFER_COPY_MAX_BYTES = int(
+    _pool_os.environ.get("EXO_DSV4_POOL_DEFER_COPY_MAX_BYTES", str(32 * 1024 * 1024))
+)
+
+
 class PoolingCache(_BaseCache):
     """Cache for pooled (compressed) KV tokens with a remainder buffer.
 
@@ -1359,14 +1377,24 @@ class PoolingCache(_BaseCache):
             self._pool_storage = mx.zeros((B, new_size, D), dtype=px.dtype)
             self._pool_storage[:, : self._pool_offset] = old[:, : self._pool_offset]
         else:
-            pre_write = self._pool_storage[:, : self._pool_offset]
+            pre_write = None
+            storage_bytes = (
+                self._pool_storage.size * self._pool_storage.dtype.size
+            )
+            if storage_bytes <= _POOL_DEFER_COPY_MAX_BYTES:
+                pre_write = self._pool_storage[:, : self._pool_offset]
 
-        # Queue the lazy slice-assign. SDPA reads pre_write which doesn't
-        # include this slot, so SDPA has no dependency on the compress
-        # kernel that produced px.
+        # Queue the lazy slice-assign. When pre_write was captured (small
+        # pool), SDPA reads it and has no dependency on the compress kernel
+        # that produced px (W4). For LARGE pools, no pre-write reference is
+        # held so the slice-update DONATES the old buffer (in-place write,
+        # no O(P*D) copy); the post-write prefix view below excludes the
+        # just-written slot, so visibility semantics are identical.
         self._pool_storage[:, self._pool_offset : new_offset] = px
         # Stage the offset bump for next-step commit.
         self._pending_offset_bump += num_new
+        if pre_write is None:
+            return self._pool_storage[:, : self._pool_offset]
         return pre_write
 
     def make_mask(self, L: int = 1, offset: int = 0):
@@ -1570,16 +1598,24 @@ class BatchPoolingCache(_BaseCache):
         # Capture the pre-write visible tensor BEFORE any growth/assign.
         # Slice-assign below rebinds self.pooled to a new array version, so
         # this captured object never gains a dependency on px's producer.
+        # LARGE pools (> _POOL_DEFER_COPY_MAX_BYTES): skip the pre-write
+        # capture — holding it blocks MLX slice-update donation and forces a
+        # full O(P*D) pool copy per flush (the long-ctx decode slope). The
+        # post-write tensor is returned instead; visibility is governed by
+        # the pre-bump _pool_lengths masks, so semantics are identical.
         if self.pooled is None:
             visible = mx.zeros((B, 0, D), dtype=px.dtype)
             self.pooled = mx.zeros((B, max_pool, D), dtype=px.dtype)
         else:
-            visible = self.pooled
             if self.pooled.shape[1] < max_pool:
                 pad = mx.zeros(
                     (B, max_pool - self.pooled.shape[1], D), dtype=px.dtype
                 )
                 self.pooled = mx.concatenate([self.pooled, pad], axis=1)
+            pool_bytes = self.pooled.size * self.pooled.dtype.size
+            visible = (
+                None if pool_bytes > _POOL_DEFER_COPY_MAX_BYTES else self.pooled
+            )
 
         for i in range(B):
             nc = new_counts[i]
@@ -1588,6 +1624,8 @@ class BatchPoolingCache(_BaseCache):
                 self.pooled[i, pl : pl + nc] = px[i, :nc]
                 self._pending_bumps[i] = nc
 
+        if visible is None:
+            visible = self.pooled
         self._visible_width = visible.shape[1]
         return visible
 
