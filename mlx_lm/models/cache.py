@@ -1394,6 +1394,14 @@ class PoolingCache(_BaseCache):
         # Stage the offset bump for next-step commit.
         self._pending_offset_bump += num_new
         if pre_write is None:
+            # Donation determinism: enqueue the slice-update NOW so it
+            # evaluates after the previous cycle's view consumers (GPU queue
+            # order) but before this cycle's attention graph aliases the
+            # buffer again. Measured: without this, async-fence pipelining
+            # keeps stale views alive at eval time and the write silently
+            # degrades to a full O(P*D) copy (~0.85ms/flush at 500K shapes
+            # vs ~0 donated).
+            mx.async_eval(self._pool_storage)
             return self._pool_storage[:, : self._pool_offset]
         return pre_write
 
@@ -1625,6 +1633,8 @@ class BatchPoolingCache(_BaseCache):
                 self._pending_bumps[i] = nc
 
         if visible is None:
+            # Donation determinism — see PoolingCache.update_and_fetch_deferred.
+            mx.async_eval(self.pooled)
             visible = self.pooled
         self._visible_width = visible.shape[1]
         return visible
