@@ -1218,6 +1218,19 @@ def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
 # separates verify (<=~8) from prefill. See _sparse_pooled_attention.
 _SPARSE_VERIFY_MAX_L = 16
 
+# Max query length routed through the per-row L=1 SDPA split in
+# CompressedAttention (the MTP verify shape, L == gamma+1). MLX's fused SDPA
+# at B=1, 1 < L <= 8 over a long concatenated local+pooled KV dispatches off
+# the single-query fast path and costs ~5x the same work issued as L separate
+# L=1 calls (measured 2026-07-07, harness verify_slope_ladder.py: ratio-128
+# layers at 256K ctx, L=3 vs 3x L=1). The L=1 calls use the fused fp32-
+# accumulating kernel — the SAME accuracy argument as the sparse-path
+# per-position split (_SPARSE_VERIFY_MAX_L) and base.py's B-rowsplit.
+# Row-split only fires when the mask is a per-row array (shape[-2] == L), so
+# every row keeps its exact causal visibility; string/None masks keep the
+# single fused call. 0 disables.
+_CATTN_LSPLIT_MAX_L = int(os.environ.get("EXO_DSV4_CATTN_LSPLIT_MAX_L", "8"))
+
 
 @partial(mx.compile, shapeless=True)
 def _sparse_pooled_attention_inner(
@@ -2513,17 +2526,40 @@ class CompressedAttention(nn.Module):
                 if "compressed_attn" in _get_nop_targets():
                     out = mx.zeros(q.shape, dtype=q.dtype)
                 else:
-                    out = finalize(
-                        scaled_dot_product_attention(
-                            q,
-                            kv,
-                            kv,
-                            cache=local_cache,
-                            scale=self.scale,
-                            mask=mask,
-                            sinks=self.attn_sink.astype(q.dtype),
+                    _sinks = self.attn_sink.astype(q.dtype)
+                    _Lq = q.shape[2]
+                    if (
+                        2 <= _Lq <= _CATTN_LSPLIT_MAX_L
+                        and q.shape[0] == 1
+                        and isinstance(mask, mx.array)
+                        and mask.shape[-2] == _Lq
+                    ):
+                        # Verify-shape L-split: see _CATTN_LSPLIT_MAX_L.
+                        _outs = [
+                            scaled_dot_product_attention(
+                                q[:, :, _l : _l + 1, :],
+                                kv,
+                                kv,
+                                cache=local_cache,
+                                scale=self.scale,
+                                mask=mask[..., _l : _l + 1, :],
+                                sinks=_sinks,
+                            )
+                            for _l in range(_Lq)
+                        ]
+                        out = finalize(mx.concatenate(_outs, axis=2))
+                    else:
+                        out = finalize(
+                            scaled_dot_product_attention(
+                                q,
+                                kv,
+                                kv,
+                                cache=local_cache,
+                                scale=self.scale,
+                                mask=mask,
+                                sinks=_sinks,
+                            )
                         )
-                    )
             with span("attn.rope_out"):
                 # seq-split: band sits at positions offset+_seq_lo (rope increments
                 # per row from offset) — shift the inverse-rope offset to match.
