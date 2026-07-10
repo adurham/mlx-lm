@@ -4564,17 +4564,23 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                     or _rowseq_ctx(cache[0]) >= _VERIFY_ROWSEQ_MIN_CTX
                 )
             ):
-                # Per-row hc_head + final norm (see _VERIFY_ROWSEQ_FULLBLOCK):
-                # the model-level HyperHead is the same hc-op family the
-                # block-level forensics implicated; keep the logits path
-                # M=1 per row too.
+                # Per-row hc_head (see _VERIFY_ROWSEQ_FULLBLOCK): the
+                # model-level HyperHead is the same hc-op family the
+                # block-level forensics implicated. The final norm runs
+                # ONCE over the concatenated rows — RMSNorm is row-local
+                # (M-invariant, harness-proven) and the MTP generator's
+                # capture wrapper hooks `norm` to stash the full (B, L, D)
+                # pre-norm hidden; calling it per row would capture only
+                # the last row and break draft chaining.
                 out = finalize(
-                    mx.concatenate(
-                        [
-                            self.norm(self.hc_head(h[:, _fb_j : _fb_j + 1]))
-                            for _fb_j in range(h.shape[1])
-                        ],
-                        axis=1,
+                    self.norm(
+                        mx.concatenate(
+                            [
+                                self.hc_head(h[:, _fb_j : _fb_j + 1])
+                                for _fb_j in range(h.shape[1])
+                            ],
+                            axis=1,
+                        )
                     )
                 )
             else:
