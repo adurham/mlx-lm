@@ -1281,6 +1281,57 @@ _SPARSE_VERIFY_BATCHED = (
     os.environ.get("EXO_DSV4_SPARSE_VERIFY_BATCHED", "1") == "1"
 )
 
+# ─────────── Row-sequential verify attention (EXO_DSV4_VERIFY_ROWSEQ) ──────────
+# Root fix for the MTP verify-vs-sequential logit drift (2026-07-09/10):
+# an L>1 decode-time pass is NOT equivalent to L sequential steps because
+# the attention-side CACHE STATE evolves differently —
+#   * RotatingKVCache._update_in_place writes all L tokens BEFORE any row
+#     attends, so rows 0..L-2 have their window's oldest L-1..1 tokens
+#     already OVERWRITTEN (a mask cannot restore overwritten keys): row j
+#     attends a truncated window vs its sequential twin. Measured (4-layer
+#     quantized random-weight harness, 4K ctx): row0 layer-0 hidden diff
+#     0.17 while row2 (equal window) is bitwise 0.
+#   * PoolingCache prompt-mode accumulate_windows flushes a straddled
+#     window visible to ALL rows in the pass; sequentially it flushes at
+#     the boundary token and (deferred bump) becomes visible a step later.
+#   * The indexer score GEMM runs at M=L (steel gemm) vs M=1 (gemv) with a
+#     different K-reduction order; near-cutoff score ties then select a
+#     different top-k pooled set.
+# Cumulative logit drift reached ~1.7 @115K ctx and flipped near-tied
+# structural tokens (the DSML tool-call corruption class).
+#
+# Fix: at B==1, 2 <= L <= MAX_L, run the ATTENTION module per row with
+# mask=None — each row performs the exact L==1 decode-path computation and
+# cache update, so window contents, pool flush timing, deferred bumps and
+# indexer scoring all evolve bitwise-identically to sequential decode. The
+# FFN/MoE stays batched: quantized matmuls are batch-invariant M=1..8
+# (bitwise, see qmm_invariance_sweep), so batching there is safe. Costs
+# L-1 extra attention dispatches (+ their TP all_reduces) per layer.
+_VERIFY_ROWSEQ = os.environ.get("EXO_DSV4_VERIFY_ROWSEQ", "0") == "1"
+_VERIFY_ROWSEQ_MAX_L = int(os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_MAX_L", "8"))
+# Context threshold: below it the classic batched verify runs (its drift is
+# empirically benign at short ctx — months of clean batteries — and row-seq's
+# L-1 extra attention dispatches + TP all_reduces cost ~1.6x there); at and
+# above it, row-seq guarantees sequential-bitwise attention where the drift
+# demonstrably corrupts structural tokens. 0 = row-seq whenever L fits.
+_VERIFY_ROWSEQ_MIN_CTX = int(
+    os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_MIN_CTX", "0")
+)
+
+
+def _rowseq_ctx(cache: Any) -> int:
+    """Best-effort current offset of a layer cache (CacheList or raw)."""
+    subs = cache.caches if hasattr(cache, "caches") else [cache]
+    for sub in subs:
+        off = getattr(sub, "offset", None)
+        if off is None:
+            continue
+        try:
+            return int(mx.max(off)) if hasattr(off, "shape") else int(off)
+        except Exception:
+            continue
+    return 0
+
 
 # ─────────── Fused sparse gather-SDPA kernel (EXO_DSV4_SPARSE_FUSED_SDPA) ──────────
 # One Metal kernel per sparse layer replacing the whole decode/verify sparse
@@ -3969,7 +4020,30 @@ class DeepseekV4Block(nn.Module):
             finalize(x)
         with span("layer.attn_norm"):
             normed = finalize(self.attn_norm(x))
-        x = self.attn(normed, mask=mask, cache=cache)
+        if (
+            _VERIFY_ROWSEQ
+            and normed.shape[0] == 1
+            and 2 <= normed.shape[1] <= _VERIFY_ROWSEQ_MAX_L
+            and (
+                _VERIFY_ROWSEQ_MIN_CTX == 0
+                or _rowseq_ctx(cache) >= _VERIFY_ROWSEQ_MIN_CTX
+            )
+        ):
+            # Row-sequential verify attention (see gate header above):
+            # per-row L==1 decode-path calls with per-row cache updates ==
+            # bitwise-sequential attention. mask=None matches what a real
+            # single-token decode step passes.
+            x = mx.concatenate(
+                [
+                    self.attn(
+                        normed[:, _j : _j + 1], mask=None, cache=cache
+                    )
+                    for _j in range(normed.shape[1])
+                ],
+                axis=1,
+            )
+        else:
+            x = self.attn(normed, mask=mask, cache=cache)
         with span("layer.attn_residual"):
             h = finalize(hc_expand(x, residual, post, comb))
 
