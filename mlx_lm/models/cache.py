@@ -2070,6 +2070,15 @@ class BatchPoolingCache(_BaseCache):
         pushed, flushes_total, flushes_committed = self._spec_flush_counts(
             rem0, keep
         )
+        if os.environ.get("EXO_DSV4_SPEC_RB_LOG") == "1":
+            import sys as _srb_sys
+
+            _srb_sys.stderr.write(
+                f"[SPEC-RB] pool id={id(self) % 100000} ratio={self.ratio} "
+                f"rem0={rem0} rem_now={self.remainder} keep={keep} "
+                f"pushed={pushed} fl={flushes_total}/{flushes_committed} "
+                f"branch={'trim' if flushes_committed == flushes_total else 'restore'}\n"
+            )
         if flushes_committed == flushes_total:
             self.trim(pushed - keep)
         else:
