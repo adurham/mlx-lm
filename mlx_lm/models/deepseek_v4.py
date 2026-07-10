@@ -1317,6 +1317,28 @@ _VERIFY_ROWSEQ_MAX_L = int(os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_MAX_L", "8"))
 _VERIFY_ROWSEQ_MIN_CTX = int(
     os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_MIN_CTX", "0")
 )
+# Per-row REAL decode mask inside the rowseq loop (2026-07-10, default OFF
+# until gates pass). The loop hardcoded mask=None, which matches what a
+# single-token decode step passes ONLY for the plain cache classes
+# (RotatingKVCache.make_mask(1, window==max_size) -> None). The batched
+# generator's classes (BatchRotatingKVCache) return an explicit ARRAY mask
+# at every N including 1 — so in serving, rowseq rows ran a different SDPA
+# specialization than real decode steps, drifting the compressed-attention
+# layers by ulps at pool-flush rows (ldiff_cycles.py: accept-chains DIRTY
+# with batch classes + mask=None, BITWISE CLEAN once the reference also
+# used None; fix = build the row's mask with create_attention_mask, which
+# yields None for plain caches — bitwise-neutral there — and the decode
+# array for batch caches).
+_VERIFY_ROWSEQ_ROWMASK = (
+    os.environ.get("EXO_DSV4_ROWSEQ_ROWMASK", "0") == "1"
+)
+
+
+def _rowseq_row_mask(row_h: Any, cache: Any):
+    """The mask a REAL single-token decode step would use at the current
+    cache state (must be built BEFORE the row's attn advances the cache)."""
+    mask_cache = cache.caches[0] if hasattr(cache, "caches") else cache
+    return create_attention_mask(row_h, mask_cache, return_array=True)
 
 
 def _rowseq_ctx(cache: Any) -> int:
@@ -4041,7 +4063,13 @@ class DeepseekV4Block(nn.Module):
             x = mx.concatenate(
                 [
                     self.attn(
-                        normed[:, _j : _j + 1], mask=None, cache=cache
+                        normed[:, _j : _j + 1],
+                        mask=(
+                            _rowseq_row_mask(normed[:, _j : _j + 1], cache)
+                            if _VERIFY_ROWSEQ_ROWMASK
+                            else None
+                        ),
+                        cache=cache,
                     )
                     for _j in range(normed.shape[1])
                 ],

@@ -772,6 +772,25 @@ class RotatingKVCache(_BaseCache):
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("RotatingKVCache Quantization NYI")
 
+    def save_spec_state(self):
+        """Materialized snapshot of the full ring for speculative rollback.
+
+        ``trim()`` cannot undo rotated writes: the overwritten oldest rows
+        are physically destroyed and the rotation counters have advanced.
+        NOTE: mx ``__setitem__`` mutates IN PLACE (aliased) — a bare
+        reference does NOT preserve pre-write contents — so keys/values are
+        copied here (``mx.array``). Small: one local ring per layer.
+        """
+        return (
+            None if self.keys is None else mx.array(self.keys),
+            None if self.values is None else mx.array(self.values),
+            self.offset,
+            self._idx,
+        )
+
+    def restore_spec_state(self, snap):
+        self.keys, self.values, self.offset, self._idx = snap
+
     def make_mask(
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
     ):
@@ -1911,6 +1930,16 @@ class BatchPoolingCache(_BaseCache):
             buf_kv,
             buf_gate,
             list(self._pending_bumps),
+            # Pooled STORAGE width + last visible width (2026-07-10): the
+            # verify's deferred write pads ``pooled`` by a column before the
+            # rollback decision; leaving the padded tensor in place after
+            # restore makes the commit-forward attend over a WIDER K (extra
+            # masked row) than sequential decode ever sees — masked softmax
+            # over different K-lengths differs by ulps, which is exactly the
+            # reject-cycle drift ldiff_cycles.py pinned to
+            # _visible_width 13 vs 12. Restore slices the pad back off.
+            0 if self.pooled is None else self.pooled.shape[1],
+            self._visible_width,
         )
 
     def restore_meta(self, snap):
@@ -1922,9 +1951,23 @@ class BatchPoolingCache(_BaseCache):
         rejected-draft pooled entries beyond the rewound lengths become
         invisible and are overwritten by the next genuine window flush.
         """
+        # 8-tuple (with pooled/visible widths) since the width-restore fix;
         # 6-tuple (with pending bumps) since the deferred-update fix;
-        # tolerate old 5-tuples from snapshots taken before it.
-        if len(snap) == 6:
+        # tolerate older tuples from snapshots taken before each.
+        pooled_width = None
+        visible_width = None
+        if len(snap) == 8:
+            (
+                pool_lengths,
+                remainder,
+                processed,
+                buf_kv,
+                buf_gate,
+                pending,
+                pooled_width,
+                visible_width,
+            ) = snap
+        elif len(snap) == 6:
             pool_lengths, remainder, processed, buf_kv, buf_gate, pending = snap
         else:
             pool_lengths, remainder, processed, buf_kv, buf_gate = snap
@@ -1936,6 +1979,16 @@ class BatchPoolingCache(_BaseCache):
         if buf_kv is not None and self.buf_kv is not None:
             self.buf_kv = buf_kv
             self.buf_gate = buf_gate
+        if pooled_width is not None:
+            # Undo any deferred-write pad added during the rolled-back span
+            # so subsequent forwards attend over the SAME K-width sequential
+            # decode would (see save_meta). Content beyond _pool_lengths is
+            # dead either way; the WIDTH is what must match.
+            if pooled_width == 0:
+                self.pooled = None
+            elif self.pooled is not None and self.pooled.shape[1] > pooled_width:
+                self.pooled = self.pooled[:, :pooled_width]
+            self._visible_width = visible_width
 
     def size(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
@@ -2567,6 +2620,40 @@ class BatchRotatingKVCache(_BaseCache):
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("BatchRotatingKVCache Quantization NYI")
+
+    def save_spec_state(self):
+        """Materialized snapshot of the full ring for speculative rollback.
+
+        See RotatingKVCache.save_spec_state (mx ``__setitem__`` is aliased —
+        keys/values must be COPIED). The batch ring additionally carries
+        per-stream ``offset``/``left_padding`` arrays (rebound by their
+        ``+=``/``-=`` updates, so references suffice) and the ``rotated``
+        flag. ``trim()`` alone is NOT rollback-safe on a rotated ring: it
+        neither restores the overwritten oldest rows nor re-increments
+        ``left_padding``, and ``_idx`` can wrap-underflow.
+        """
+        return (
+            None if self.keys is None else mx.array(self.keys),
+            None if self.values is None else mx.array(self.values),
+            # offset/left_padding are mx arrays mutated via +=/-=, which mx
+            # applies IN PLACE (aliased) — copy them too.
+            mx.array(self.offset),
+            mx.array(self.left_padding),
+            self._offset,
+            self._idx,
+            self.rotated,
+        )
+
+    def restore_spec_state(self, snap):
+        (
+            self.keys,
+            self.values,
+            self.offset,
+            self.left_padding,
+            self._offset,
+            self._idx,
+            self.rotated,
+        ) = snap
 
     def make_mask(
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
