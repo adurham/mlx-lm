@@ -4095,6 +4095,48 @@ class DeepseekV4Block(nn.Module):
                 ).hexdigest()[:12]
                 _lh_fh.write(f"{_lh_b + _lh_j} B{_lh_li:02d}.{tag} {_lh_m}\n")
 
+        if _lh_fh is not None:
+            # Pre-forward cache-state hashes: which cache component has
+            # already diverged when this forward starts (state after the
+            # previous committed position).
+            import hashlib as _lhc_hashlib
+
+            import numpy as _lhc_np
+
+            def _lhc_h(arr):
+                mx.eval(arr)
+                return _lhc_hashlib.md5(
+                    _lhc_np.asarray(arr.astype(mx.float32)).tobytes()
+                ).hexdigest()[:12]
+
+            _lhc_subs = cache.caches if hasattr(cache, "caches") else [cache]
+            for _lhc_i, _lhc_c in enumerate(_lhc_subs):
+                _lhc_parts = []
+                if hasattr(_lhc_c, "keys") and _lhc_c.keys is not None:
+                    _lhc_w = min(
+                        int(getattr(_lhc_c, "_offset", 0)), _lhc_c.keys.shape[2]
+                    )
+                    if _lhc_w > 0:
+                        _lhc_parts.append(_lhc_h(_lhc_c.keys[..., :_lhc_w, :]))
+                if hasattr(_lhc_c, "_pool_lengths"):
+                    _lhc_tot = int(_lhc_c._pool_lengths[0]) + int(
+                        _lhc_c._pending_bumps[0]
+                    )
+                    _lhc_p = getattr(_lhc_c, "pooled", None)
+                    if _lhc_p is not None and _lhc_tot > 0:
+                        _lhc_tot = min(_lhc_tot, _lhc_p.shape[1])
+                        _lhc_parts.append(_lhc_h(_lhc_p[:, :_lhc_tot]))
+                    _lhc_rem = int(_lhc_c.remainder[0])
+                    if _lhc_c.buf_kv is not None and _lhc_rem > 0:
+                        _lhc_parts.append(_lhc_h(_lhc_c.buf_kv[:, :_lhc_rem]))
+                        _lhc_parts.append(_lhc_h(_lhc_c.buf_gate[:, :_lhc_rem]))
+                    _lhc_parts.append(f"r{_lhc_rem}t{_lhc_tot}")
+                _lh_fh.write(
+                    f"{_lh_b} B{_lh_li:02d}.cache{_lhc_i} "
+                    + "-".join(_lhc_parts)
+                    + "\n"
+                )
+
         if (
             _VERIFY_ROWSEQ
             and _VERIFY_ROWSEQ_FULLBLOCK
