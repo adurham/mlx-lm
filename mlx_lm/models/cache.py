@@ -712,6 +712,8 @@ class RotatingKVCache(_BaseCache):
         return self.keys, self.values
 
     def update_and_fetch(self, keys, values):
+        if self._spec_stash_armed:
+            self._spec_pushed.append((keys, values))
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
         # Speculative verify sends L_q=γ+1 tokens (typically 3-7). The
@@ -790,6 +792,46 @@ class RotatingKVCache(_BaseCache):
 
     def restore_spec_state(self, snap):
         self.keys, self.values, self.offset, self._idx = snap
+
+    # ── Cache-level speculative rollback (EXO_DSV4_SPEC_CACHE_ROLLBACK) ──
+    # The unified rollback's commit-forward re-runs the WHOLE MODEL on the
+    # committed tokens just to regenerate cache rows the verify already
+    # computed (measured: −41% decode t/s at prod reject rates). Instead:
+    # stash the verify's pushed K/V rows at update time, and on rejection
+    # restore the pre-verify snapshot then re-push only the committed rows
+    # through _update_in_place — the exact op sequence sequential decode
+    # performs, with values bitwise-equal to sequential's (rowseq-proven).
+    _spec_stash_armed = False
+    _spec_pushed: Optional[list] = None
+
+    def arm_spec_stash(self):
+        self._spec_pushed = []
+        self._spec_stash_armed = True
+
+    def disarm_spec_stash(self):
+        self._spec_stash_armed = False
+
+    def spec_pushed_rows(self):
+        if not self._spec_pushed:
+            return 0
+        return sum(k.shape[2] for k, _ in self._spec_pushed)
+
+    def rollback_spec_write(self, snap, keep):
+        """Restore ``snap`` then re-push the first ``keep`` stashed rows.
+
+        Re-pushing row-by-row via _update_in_place reproduces sequential
+        decode's cache ops exactly (single-token writes handle growth,
+        trim, rotation and wrap identically to the decode hot path).
+        """
+        self.restore_spec_state(snap)
+        pushed = 0
+        for k, v in self._spec_pushed or []:
+            for s in range(k.shape[2]):
+                if pushed == keep:
+                    break
+                self._update_in_place(k[:, :, s : s + 1, :], v[:, :, s : s + 1, :])
+                pushed += 1
+        self._spec_pushed = None
 
     def make_mask(
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
@@ -1255,6 +1297,9 @@ class PoolingCache(_BaseCache):
         B, L, D1 = kv.shape
         _, _, D2 = gate.shape
 
+        if self._spec_stash_armed:
+            self._spec_pushed.append((kv, gate, offset))
+
         if self.buf_kv is None:
             self.buf_kv = mx.zeros((B, self.ratio, D1), dtype=kv.dtype)
             self.buf_gate = mx.zeros((B, self.ratio, D2), dtype=gate.dtype)
@@ -1541,6 +1586,73 @@ class PoolingCache(_BaseCache):
             self.buf_kv[:, : buf_kv.shape[1]] = buf_kv
             self.buf_gate[:, : buf_gate.shape[1]] = buf_gate
 
+    # ── Cache-level speculative rollback (EXO_DSV4_SPEC_CACHE_ROLLBACK) ──
+    # Replaces the commit-forward model replay on rejection. Flush
+    # attribution decides the cheap path:
+    #   * flush boundary inside the COMMITTED prefix (or no flush): trim()
+    #     is already exact — post-verify remainder/_processed minus the
+    #     rejected count equals the sequential state, buf contents beyond
+    #     the remainder are dead, and the flushed pooled entry was computed
+    #     from committed tokens only.
+    #   * flush caused by a REJECTED token: restore_meta(snapshot), then
+    #     re-accumulate the committed prefix from the stashed inputs. The
+    #     re-push cannot flush (rem0 + keep < ratio by the case condition),
+    #     so it is pure buffer arithmetic — no compress, no model forward.
+    _spec_stash_armed = False
+    _spec_pushed: Optional[list] = None
+
+    def arm_spec_stash(self):
+        self._spec_pushed = []
+        self._spec_stash_armed = True
+
+    def disarm_spec_stash(self):
+        self._spec_stash_armed = False
+
+    def spec_pushed_rows(self):
+        if not self._spec_pushed:
+            return 0
+        return sum(kv.shape[1] for kv, _, _ in self._spec_pushed)
+
+    def _spec_flush_counts(self, rem0, keep):
+        pushed = self.spec_pushed_rows()
+        flushes_total = (rem0 + pushed) // self.ratio
+        flushes_committed = (rem0 + keep) // self.ratio
+        return pushed, flushes_total, flushes_committed
+
+    def spec_can_rollback(self, snap, keep, expected_pushed):
+        rem0 = snap[2]
+        pushed, flushes_total, flushes_committed = self._spec_flush_counts(
+            rem0, keep
+        )
+        if pushed != expected_pushed or keep > pushed:
+            return False
+        # Re-accumulating the committed prefix must not itself flush; when
+        # the committed prefix contains a flush AND a rejected token caused
+        # a later one (multi-flush, only possible at gamma+1 > ratio), fall
+        # back to the commit-forward.
+        return flushes_committed == flushes_total or flushes_committed == 0
+
+    def spec_rollback(self, snap, keep):
+        rem0 = snap[2]
+        pushed, flushes_total, flushes_committed = self._spec_flush_counts(
+            rem0, keep
+        )
+        if flushes_committed == flushes_total:
+            self.trim(pushed - keep)
+        else:
+            self.restore_meta(snap)
+            done = 0
+            for kv, gate, offset in self._spec_pushed or []:
+                if done == keep:
+                    break
+                take = min(keep - done, kv.shape[1])
+                r_kv, _, _ = self.accumulate_windows(
+                    kv[:, :take], gate[:, :take], offset
+                )
+                assert r_kv.shape[1] == 0, "spec_rollback re-push flushed"
+                done += take
+        self._spec_pushed = None
+
     def size(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
 
@@ -1701,6 +1813,9 @@ class BatchPoolingCache(_BaseCache):
         B, L, D1 = kv.shape
         _, _, D2 = gate.shape
         ratio = self.ratio
+
+        if self._spec_stash_armed:
+            self._spec_pushed.append((kv, gate, offset))
 
         if self.buf_kv is None:
             self.buf_kv = mx.zeros((B, ratio, D1), dtype=kv.dtype)
@@ -1904,6 +2019,72 @@ class BatchPoolingCache(_BaseCache):
             self.remainder[i] -= n
             self._processed[i] -= n
         return n
+
+    # Cache-level speculative rollback — see PoolingCache for the flush-
+    # attribution rationale. B=1 only (the dsv4_mtp single-stream path);
+    # per-stream flush boundaries diverge at B>1, so refuse and let the
+    # orchestrator fall back to the commit-forward.
+    #
+    # Deferred-bump note for the trim path: when the committed prefix's
+    # flush was followed by another verify row, that row's commit_pending
+    # already applied the staged bump, while token-by-token sequential
+    # decode would still hold it pending at the commit point. The SPLIT
+    # differs but the (length + pending) TOTAL matches, and commit_pending
+    # runs at the top of every Compressor call before any read of pool
+    # state — so the two states are indistinguishable from the next
+    # forward onward.
+    _spec_stash_armed = False
+    _spec_pushed: Optional[list] = None
+
+    def arm_spec_stash(self):
+        self._spec_pushed = []
+        self._spec_stash_armed = True
+
+    def disarm_spec_stash(self):
+        self._spec_stash_armed = False
+
+    def spec_pushed_rows(self):
+        if not self._spec_pushed:
+            return 0
+        return sum(kv.shape[1] for kv, _, _ in self._spec_pushed)
+
+    def _spec_flush_counts(self, rem0, keep):
+        pushed = self.spec_pushed_rows()
+        flushes_total = (rem0 + pushed) // self.ratio
+        flushes_committed = (rem0 + keep) // self.ratio
+        return pushed, flushes_total, flushes_committed
+
+    def spec_can_rollback(self, snap, keep, expected_pushed):
+        if len(self.remainder) != 1:
+            return False
+        rem0 = snap[1][0]
+        pushed, flushes_total, flushes_committed = self._spec_flush_counts(
+            rem0, keep
+        )
+        if pushed != expected_pushed or keep > pushed:
+            return False
+        return flushes_committed == flushes_total or flushes_committed == 0
+
+    def spec_rollback(self, snap, keep):
+        rem0 = snap[1][0]
+        pushed, flushes_total, flushes_committed = self._spec_flush_counts(
+            rem0, keep
+        )
+        if flushes_committed == flushes_total:
+            self.trim(pushed - keep)
+        else:
+            self.restore_meta(snap)
+            done = 0
+            for kv, gate, offset in self._spec_pushed or []:
+                if done == keep:
+                    break
+                take = min(keep - done, kv.shape[1])
+                r_kv, _, _ = self.accumulate_windows(
+                    kv[:, :take], gate[:, :take], offset
+                )
+                assert r_kv.shape[1] == 0, "spec_rollback re-push flushed"
+                done += take
+        self._spec_pushed = None
 
     def save_meta(self):
         """Snapshot mutable pooling state for speculative rollback.
@@ -2559,9 +2740,41 @@ class BatchRotatingKVCache(_BaseCache):
         return self.keys, self.values
 
     def update_and_fetch(self, keys, values):
+        if self._spec_stash_armed:
+            self._spec_pushed.append((keys, values))
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
+
+    # Cache-level speculative rollback — see RotatingKVCache for rationale.
+    # The batch ring's per-row re-push goes through ITS _update_in_place
+    # (per-stream offset/left_padding arrays), matching the batched decode
+    # hot path bitwise.
+    _spec_stash_armed = False
+    _spec_pushed: Optional[list] = None
+
+    def arm_spec_stash(self):
+        self._spec_pushed = []
+        self._spec_stash_armed = True
+
+    def disarm_spec_stash(self):
+        self._spec_stash_armed = False
+
+    def spec_pushed_rows(self):
+        if not self._spec_pushed:
+            return 0
+        return sum(k.shape[2] for k, _ in self._spec_pushed)
+
+    def rollback_spec_write(self, snap, keep):
+        self.restore_spec_state(snap)
+        pushed = 0
+        for k, v in self._spec_pushed or []:
+            for s in range(k.shape[2]):
+                if pushed == keep:
+                    break
+                self._update_in_place(k[:, :, s : s + 1, :], v[:, :, s : s + 1, :])
+                pushed += 1
+        self._spec_pushed = None
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:
