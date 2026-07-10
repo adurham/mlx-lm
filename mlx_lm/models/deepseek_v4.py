@@ -1336,6 +1336,22 @@ _VERIFY_ROWSEQ_MIN_CTX = int(
 # used None; fix = build the row's mask with create_attention_mask, which
 # yields None for plain caches — bitwise-neutral there — and the decode
 # array for batch caches).
+# EXO_DSV4_ROWSEQ_FULLBLOCK=1 (default OFF, requires _VERIFY_ROWSEQ): run
+# the ENTIRE block per row during small-L verifies — hc ops and norms as
+# well as attention — batching only the MoE ffn (bitwise M-invariant,
+# probed at full AND TP-sharded shapes; it is also the perf-critical op).
+# Motivation (2026-07-10 serving layer-hash forensics): with attention
+# rowseq'd and cache rollback exact, MTP-on still forks from MTP-off; the
+# per-row/sub-op hash diff pins every primary divergence to hc-adjacent
+# ops (attn_hc/ffn_hc post/comb + hc_expand) at verify M=gamma+1 vs decode
+# M=1 — attention rows, MoE outputs and embeds all match. The tiny-model
+# harness does NOT reproduce it (real-weight value dependence), so this
+# fix is mechanism-agnostic: make every non-MoE op M=1, bitwise equal to
+# sequential decode by construction. Model-level twin: hc_head + final
+# norm run per-row under the same gate (see DeepseekV4Model.__call__).
+_VERIFY_ROWSEQ_FULLBLOCK = (
+    os.environ.get("EXO_DSV4_ROWSEQ_FULLBLOCK", "0") == "1"
+)
 _VERIFY_ROWSEQ_ROWMASK = (
     os.environ.get("EXO_DSV4_ROWSEQ_ROWMASK", "0") == "1"
 )
@@ -4079,6 +4095,61 @@ class DeepseekV4Block(nn.Module):
                 ).hexdigest()[:12]
                 _lh_fh.write(f"{_lh_b + _lh_j} B{_lh_li:02d}.{tag} {_lh_m}\n")
 
+        if (
+            _VERIFY_ROWSEQ
+            and _VERIFY_ROWSEQ_FULLBLOCK
+            and 2 <= h.shape[1] <= _VERIFY_ROWSEQ_MAX_L
+            and h.shape[0] * h.shape[1] <= 8
+            and (
+                _VERIFY_ROWSEQ_MIN_CTX == 0
+                or _rowseq_ctx(cache) >= _VERIFY_ROWSEQ_MIN_CTX
+            )
+        ):
+            # Full per-row block (see _VERIFY_ROWSEQ_FULLBLOCK): everything
+            # M=1 except the MoE ffn, which is batched over the per-row
+            # pre-ffn norms (bitwise M-invariant, incl. TP-sharded shapes).
+            _fb_L = h.shape[1]
+            _fb_rows = []
+            for _fb_j in range(_fb_L):
+                _fb_h = h[:, _fb_j : _fb_j + 1]
+                _fb_res = _fb_h
+                _fb_x, _fb_post, _fb_comb = self.attn_hc(_fb_h)
+                _fb_normed = self.attn_norm(_fb_x)
+                _fb_a = self.attn(
+                    _fb_normed,
+                    mask=(
+                        _rowseq_row_mask(_fb_normed, cache)
+                        if _VERIFY_ROWSEQ_ROWMASK
+                        else None
+                    ),
+                    cache=cache,
+                )
+                _fb_h2 = hc_expand(_fb_a, _fb_res, _fb_post, _fb_comb)
+                _fb_x2, _fb_post2, _fb_comb2 = self.ffn_hc(_fb_h2)
+                _fb_n2 = self.ffn_norm(_fb_x2)
+                _fb_rows.append((_fb_n2, _fb_h2, _fb_post2, _fb_comb2))
+            _fb_ffn = self.ffn(
+                mx.concatenate([r[0] for r in _fb_rows], axis=1), input_ids
+            )
+            _fb_out = finalize(
+                mx.concatenate(
+                    [
+                        hc_expand(
+                            _fb_ffn[:, _fb_j : _fb_j + 1],
+                            _fb_rows[_fb_j][1],
+                            _fb_rows[_fb_j][2],
+                            _fb_rows[_fb_j][3],
+                        )
+                        for _fb_j in range(_fb_L)
+                    ],
+                    axis=1,
+                )
+            )
+            if _lh_fh is not None:
+                _lh_sub("out", _fb_out)
+                _lh_fh.close()
+            return _fb_out
+
         residual = h
         with span("layer.attn_hc"):
             x, post, comb = self.attn_hc(h)
@@ -4483,6 +4554,29 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 mx.eval(_normed)
                 _ap_sys.stderr.write(f"[ACTPROBE] post_norm rms={_ap_std(_normed):.4f}\n")
                 out = finalize(_normed)
+            elif (
+                _VERIFY_ROWSEQ
+                and _VERIFY_ROWSEQ_FULLBLOCK
+                and 2 <= h.shape[1] <= _VERIFY_ROWSEQ_MAX_L
+                and h.shape[0] * h.shape[1] <= 8
+                and (
+                    _VERIFY_ROWSEQ_MIN_CTX == 0
+                    or _rowseq_ctx(cache[0]) >= _VERIFY_ROWSEQ_MIN_CTX
+                )
+            ):
+                # Per-row hc_head + final norm (see _VERIFY_ROWSEQ_FULLBLOCK):
+                # the model-level HyperHead is the same hc-op family the
+                # block-level forensics implicated; keep the logits path
+                # M=1 per row too.
+                out = finalize(
+                    mx.concatenate(
+                        [
+                            self.norm(self.hc_head(h[:, _fb_j : _fb_j + 1]))
+                            for _fb_j in range(h.shape[1])
+                        ],
+                        axis=1,
+                    )
+                )
             else:
                 out = finalize(self.norm(self.hc_head(h)))
         if _bp:
