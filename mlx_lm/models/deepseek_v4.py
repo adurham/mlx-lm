@@ -4358,13 +4358,56 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 return float(mx.sqrt(mx.mean(v * v)).item())
             mx.eval(h)
             _ap_sys.stderr.write(f"[ACTPROBE] embed rms={_ap_std(h):.4f}\n")
+
+        # EXO_DSV4_LAYER_HASH_DUMP=<path> (debug, default off): for small-L
+        # decode/verify forwards, append per-row md5 of every block output,
+        # keyed by ABSOLUTE position, so two serving configs (e.g. MTP-off
+        # vs MTP-on rowseq verify) can be row-aligned and diffed to the
+        # first infidelity layer. Also usable cross-rank: TP=2 replicates
+        # the whole block stack, so rank0/rank1 dumps of one run must match.
+        # Costs an eval per layer — debugging runs only.
+        _lhash_path = os.environ.get("EXO_DSV4_LAYER_HASH_DUMP", "")
+        _lhash_fh = None
+        _lh_base = -1
+        if _lhash_path and 1 <= h.shape[1] <= 8:
+            try:
+                _lh_c0 = cache[0]
+                _lh_c0 = _lh_c0.caches[0] if hasattr(_lh_c0, "caches") else _lh_c0
+                _lh_off = getattr(_lh_c0, "_offset", None)
+                if _lh_off is None:
+                    _lh_off = getattr(_lh_c0, "offset", -1)
+                _lh_base = int(_lh_off)
+            except Exception:
+                _lh_base = -1
+            _lh_max = int(os.environ.get("EXO_DSV4_LAYER_HASH_MAX_POS", "300"))
+            if 0 <= _lh_base < _lh_max:
+                _lhash_fh = open(_lhash_path, "a")
+
+        def _lh_dump(tag, t):
+            if _lhash_fh is None:
+                return
+            import hashlib as _lh_hashlib
+
+            import numpy as _lh_np
+
+            mx.eval(t)
+            for _lh_j in range(t.shape[1]):
+                _lh_m = _lh_hashlib.md5(
+                    _lh_np.asarray(t[:, _lh_j].astype(mx.float32)).tobytes()
+                ).hexdigest()[:12]
+                _lhash_fh.write(f"{_lh_base + _lh_j} {tag} {_lh_m}\n")
+
+        _lh_dump("embed", h)
         for _ap_i, (layer, layer_cache) in enumerate(zip(self.pipeline_layers, cache)):
             h = layer(h, mask, layer_cache, inputs)
+            _lh_dump(f"L{_ap_i:02d}", h)
             if _actprobe:
                 mx.eval(h)
                 _r = _ap_std(h)
                 _ap_sys.stderr.write(f"[ACTPROBE] layer={_ap_i:2d} rms={_r:.4f}\n")
                 _ap_sys.stderr.flush()
+        if _lhash_fh is not None:
+            _lhash_fh.close()
 
         if not _nop_pipeline and pipeline_rank != 0:
             with span("model.send"):
