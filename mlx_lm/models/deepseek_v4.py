@@ -4022,17 +4022,22 @@ class DeepseekV4Block(nn.Module):
             normed = finalize(self.attn_norm(x))
         if (
             _VERIFY_ROWSEQ
-            and normed.shape[0] == 1
             and 2 <= normed.shape[1] <= _VERIFY_ROWSEQ_MAX_L
+            # B*L caps the FFN's batched M below: qmv/qmm batch-invariance
+            # is bitwise-proven for M=1..8 only (qmm_invariance_sweep), so
+            # rowseq covers c=1 (L<=8) and c=2 at gamma<=3; larger batches
+            # keep the classic path until a wider sweep lands.
+            and normed.shape[0] * normed.shape[1] <= 8
             and (
                 _VERIFY_ROWSEQ_MIN_CTX == 0
                 or _rowseq_ctx(cache) >= _VERIFY_ROWSEQ_MIN_CTX
             )
         ):
             # Row-sequential verify attention (see gate header above):
-            # per-row L==1 decode-path calls with per-row cache updates ==
-            # bitwise-sequential attention. mask=None matches what a real
-            # single-token decode step passes.
+            # per-row (B,1) decode-path calls with per-row cache updates ==
+            # bitwise the B-stream single-token stepping path (the c>=1
+            # decode hot path). mask=None matches what a real single-token
+            # decode step passes.
             x = mx.concatenate(
                 [
                     self.attn(
