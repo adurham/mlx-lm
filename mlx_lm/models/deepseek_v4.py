@@ -4128,9 +4128,34 @@ class DeepseekV4Block(nn.Module):
                 _fb_x2, _fb_post2, _fb_comb2 = self.ffn_hc(_fb_h2)
                 _fb_n2 = self.ffn_norm(_fb_x2)
                 _fb_rows.append((_fb_n2, _fb_h2, _fb_post2, _fb_comb2))
+                if _lh_fh is not None:
+                    _lh_sub_row = _lh_b + _fb_j
+                    import hashlib as _fbh
+                    import numpy as _fbn
+                    for _fb_tag, _fb_t in (
+                        ("attn_in", _fb_normed),
+                        ("attn_out", _fb_a),
+                        ("attn_res", _fb_h2),
+                    ):
+                        mx.eval(_fb_t)
+                        _lh_fh.write(
+                            f"{_lh_sub_row} B{_lh_li:02d}.{_fb_tag} "
+                            + _fbh.md5(
+                                _fbn.asarray(
+                                    _fb_t[:, 0].astype(mx.float32)
+                                ).tobytes()
+                            ).hexdigest()[:12]
+                            + "\n"
+                        )
+            if _lh_fh is not None:
+                _lh_sub(
+                    "ffn_in", mx.concatenate([r[0] for r in _fb_rows], axis=1)
+                )
             _fb_ffn = self.ffn(
                 mx.concatenate([r[0] for r in _fb_rows], axis=1), input_ids
             )
+            if _lh_fh is not None:
+                _lh_sub("ffn_out", _fb_ffn)
             _fb_out = finalize(
                 mx.concatenate(
                     [
