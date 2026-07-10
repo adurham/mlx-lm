@@ -1308,6 +1308,13 @@ _SPARSE_VERIFY_BATCHED = (
 # (bitwise, see qmm_invariance_sweep), so batching there is safe. Costs
 # L-1 extra attention dispatches (+ their TP all_reduces) per layer.
 _VERIFY_ROWSEQ = os.environ.get("EXO_DSV4_VERIFY_ROWSEQ", "0") == "1"
+# Sub-op hash dump (debug; see DeepseekV4Block.__call__ and the model-level
+# EXO_DSV4_LAYER_HASH_DUMP): comma list of layer indices to instrument.
+_LHASH_SUBOPS_SET = {
+    int(v)
+    for v in os.environ.get("EXO_DSV4_LAYER_HASH_SUBOPS", "").split(",")
+    if v.strip().lstrip("-").isdigit()
+}
 _VERIFY_ROWSEQ_MAX_L = int(os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_MAX_L", "8"))
 # Context threshold: below it the classic batched verify runs (its drift is
 # empirically benign at short ctx — months of clean batteries — and row-seq's
@@ -4036,12 +4043,49 @@ class DeepseekV4Block(nn.Module):
         if "v4block" in _get_nop_targets():
             return h  # NOP: pass residual through unchanged
 
+        # EXO_DSV4_LAYER_HASH_SUBOPS="0,1" (debug, with _LAYER_HASH_DUMP):
+        # per-row sub-op hashes inside the listed blocks, to pin which op
+        # (attention / hc / ffn) first departs between two serving configs.
+        _lh_fh = None
+        _lh_b = -1
+        _lh_li = self.ffn.layer_idx
+        if _LHASH_SUBOPS_SET and 1 <= h.shape[1] <= 8 and _lh_li in _LHASH_SUBOPS_SET:
+            _lh_path = os.environ.get("EXO_DSV4_LAYER_HASH_DUMP", "")
+            if _lh_path:
+                try:
+                    _lh_c0 = cache.caches[0] if hasattr(cache, "caches") else cache
+                    _lh_off = getattr(_lh_c0, "_offset", None)
+                    if _lh_off is None:
+                        _lh_off = getattr(_lh_c0, "offset", -1)
+                    _lh_b = int(_lh_off)
+                except Exception:
+                    _lh_b = -1
+                if 0 <= _lh_b < int(
+                    os.environ.get("EXO_DSV4_LAYER_HASH_MAX_POS", "300")
+                ):
+                    _lh_fh = open(_lh_path, "a")
+
+        def _lh_sub(tag, t):
+            if _lh_fh is None:
+                return
+            import hashlib as _lh_hashlib
+
+            import numpy as _lh_np
+
+            mx.eval(t)
+            for _lh_j in range(t.shape[1]):
+                _lh_m = _lh_hashlib.md5(
+                    _lh_np.asarray(t[:, _lh_j].astype(mx.float32)).tobytes()
+                ).hexdigest()[:12]
+                _lh_fh.write(f"{_lh_b + _lh_j} B{_lh_li:02d}.{tag} {_lh_m}\n")
+
         residual = h
         with span("layer.attn_hc"):
             x, post, comb = self.attn_hc(h)
             finalize(x)
         with span("layer.attn_norm"):
             normed = finalize(self.attn_norm(x))
+        _lh_sub("attn_in", normed)
         if (
             _VERIFY_ROWSEQ
             and 2 <= normed.shape[1] <= _VERIFY_ROWSEQ_MAX_L
@@ -4077,8 +4121,10 @@ class DeepseekV4Block(nn.Module):
             )
         else:
             x = self.attn(normed, mask=mask, cache=cache)
+        _lh_sub("attn_out", x)
         with span("layer.attn_residual"):
             h = finalize(hc_expand(x, residual, post, comb))
+        _lh_sub("attn_res", h)
 
         residual = h
         with span("layer.ffn_hc"):
@@ -4086,9 +4132,15 @@ class DeepseekV4Block(nn.Module):
             finalize(x)
         with span("layer.ffn_norm"):
             normed = finalize(self.ffn_norm(x))
+        _lh_sub("ffn_in", normed)
         x = self.ffn(normed, input_ids)
+        _lh_sub("ffn_out", x)
         with span("layer.ffn_residual"):
-            return finalize(hc_expand(x, residual, post, comb))
+            out = finalize(hc_expand(x, residual, post, comb))
+            if _lh_fh is not None:
+                _lh_sub("out", out)
+                _lh_fh.close()
+            return out
 
 
 class DeepseekV4MTPModule(nn.Module):
