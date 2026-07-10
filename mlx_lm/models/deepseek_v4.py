@@ -1352,6 +1352,17 @@ _VERIFY_ROWSEQ_MIN_CTX = int(
 _VERIFY_ROWSEQ_FULLBLOCK = (
     os.environ.get("EXO_DSV4_ROWSEQ_FULLBLOCK", "0") == "1"
 )
+# EXO_DSV4_ROWSEQ_FULLBLOCK_MOE=1: also run the MoE ffn per row inside the
+# fullblock verify. Serving forensics (2026-07-10, L34 pos 179): with
+# everything else per-row and caches bitwise-aligned, ffn_in matched while
+# ffn_out differed — the batched M=gamma+1 MoE occasionally (~1 in 6k
+# layer-forwards) rounds differently than M=1 on real weights (the
+# tokens-per-expert / gather-kernel-boundary class). Costs expert-weight
+# bandwidth (each activated expert loaded per row instead of once per
+# verify), so gated separately from FULLBLOCK.
+_VERIFY_ROWSEQ_FULLBLOCK_MOE = (
+    os.environ.get("EXO_DSV4_ROWSEQ_FULLBLOCK_MOE", "0") == "1"
+)
 _VERIFY_ROWSEQ_ROWMASK = (
     os.environ.get("EXO_DSV4_ROWSEQ_ROWMASK", "0") == "1"
 )
@@ -4193,9 +4204,21 @@ class DeepseekV4Block(nn.Module):
                 _lh_sub(
                     "ffn_in", mx.concatenate([r[0] for r in _fb_rows], axis=1)
                 )
-            _fb_ffn = self.ffn(
-                mx.concatenate([r[0] for r in _fb_rows], axis=1), input_ids
-            )
+            if _VERIFY_ROWSEQ_FULLBLOCK_MOE:
+                _fb_ffn = mx.concatenate(
+                    [
+                        self.ffn(
+                            _fb_rows[_fb_j][0],
+                            input_ids[:, _fb_j : _fb_j + 1],
+                        )
+                        for _fb_j in range(_fb_L)
+                    ],
+                    axis=1,
+                )
+            else:
+                _fb_ffn = self.ffn(
+                    mx.concatenate([r[0] for r in _fb_rows], axis=1), input_ids
+                )
             if _lh_fh is not None:
                 _lh_sub("ffn_out", _fb_ffn)
             _fb_out = finalize(
