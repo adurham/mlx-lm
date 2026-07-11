@@ -2054,32 +2054,46 @@ class BatchPoolingCache(_BaseCache):
         flushes_committed = (rem0 + keep) // self.ratio
         return pushed, flushes_total, flushes_committed
 
+    def _spec_stream_flushes(self, snap, keep):
+        """Per-stream (flushes_total, flushes_committed) given the uniform
+        committed count ``keep`` (batch-uniform under min-acceptance)."""
+        pushed = self.spec_pushed_rows()
+        out = []
+        for rem0 in snap[1]:
+            out.append(
+                (
+                    (rem0 + pushed) // self.ratio,
+                    (rem0 + keep) // self.ratio,
+                )
+            )
+        return pushed, out
+
     def spec_can_rollback(self, snap, keep, expected_pushed):
-        if len(self.remainder) != 1:
-            return False
-        rem0 = snap[1][0]
-        pushed, flushes_total, flushes_committed = self._spec_flush_counts(
-            rem0, keep
-        )
+        pushed, per_stream = self._spec_stream_flushes(snap, keep)
         if pushed != expected_pushed or keep > pushed:
             return False
-        return flushes_committed == flushes_total or flushes_committed == 0
+        # Cache-level undo needs a batch-uniform branch: either EVERY
+        # stream keeps its flushes (trim is exact per stream — remainder/
+        # _processed decrement uniformly), or NO stream's committed prefix
+        # flushed (restore + re-accumulate cannot re-flush for any stream).
+        # Mixed flush attribution across streams -> commit-forward.
+        return all(ft == fc for ft, fc in per_stream) or all(
+            fc == 0 for _, fc in per_stream
+        )
 
     def spec_rollback(self, snap, keep):
-        rem0 = snap[1][0]
-        pushed, flushes_total, flushes_committed = self._spec_flush_counts(
-            rem0, keep
-        )
+        pushed, per_stream = self._spec_stream_flushes(snap, keep)
+        trim_branch = all(ft == fc for ft, fc in per_stream)
         if os.environ.get("EXO_DSV4_SPEC_RB_LOG") == "1":
             import sys as _srb_sys
 
             _srb_sys.stderr.write(
                 f"[SPEC-RB] pool id={id(self) % 100000} ratio={self.ratio} "
-                f"rem0={rem0} rem_now={self.remainder} keep={keep} "
-                f"pushed={pushed} fl={flushes_total}/{flushes_committed} "
-                f"branch={'trim' if flushes_committed == flushes_total else 'restore'}\n"
+                f"rem0={snap[1]} rem_now={self.remainder} keep={keep} "
+                f"pushed={pushed} fl={per_stream} "
+                f"branch={'trim' if trim_branch else 'restore'}\n"
             )
-        if flushes_committed == flushes_total:
+        if trim_branch:
             self.trim(pushed - keep)
         else:
             self.restore_meta(snap)
