@@ -1363,6 +1363,13 @@ _VERIFY_ROWSEQ_FULLBLOCK = (
 _VERIFY_ROWSEQ_FULLBLOCK_MOE = (
     os.environ.get("EXO_DSV4_ROWSEQ_FULLBLOCK_MOE", "0") == "1"
 )
+# Part-wise per-row MoE for small-L forwards (bisect/fix of the MoE
+# M-dependence; see DeepseekV4MoE.__call__). Comma list, default empty.
+_MOE_PARTS_ROWSEQ = frozenset(
+    p.strip()
+    for p in os.environ.get("EXO_DSV4_MOE_PARTS_ROWSEQ", "").split(",")
+    if p.strip()
+)
 _VERIFY_ROWSEQ_ROWMASK = (
     os.environ.get("EXO_DSV4_ROWSEQ_ROWMASK", "0") == "1"
 )
@@ -2379,13 +2386,52 @@ class DeepseekV4MoE(nn.Module):
             if self.sharding_group is not None:
                 x = sum_gradients(self.sharding_group)(x)
 
+            # EXO_DSV4_MOE_PARTS_ROWSEQ (comma list of gate|switch|shared|
+            # combine, default empty): run the listed MoE sub-ops per row
+            # for small-L verify forwards. Bisect/fix instrument for the
+            # MoE M(=L)-dependence (L34 pos-179 forensics: ffn_in matched,
+            # ffn_out differed at batched M=gamma+1 vs M=1, ~1/6k
+            # layer-forwards on real weights). gate/combine/shared are
+            # cheap per-row; switch (the expert gather) is the expensive
+            # one — if a cheap part is the culprit, losslessness stops
+            # costing expert-weight bandwidth.
+            _prs = _MOE_PARTS_ROWSEQ
+            _prs_L = x.shape[1]
+            if _prs and not (
+                2 <= _prs_L <= 8 and x.shape[0] * _prs_L <= 8
+            ):
+                _prs = frozenset()
+
             with span("moe.gate"):
-                inds, scores = self.gate(x, input_ids)
+                if "gate" in _prs:
+                    _prs_g = [
+                        self.gate(
+                            x[:, _j : _j + 1], input_ids[:, _j : _j + 1]
+                        )
+                        for _j in range(_prs_L)
+                    ]
+                    inds = mx.concatenate([g[0] for g in _prs_g], axis=1)
+                    scores = mx.concatenate([g[1] for g in _prs_g], axis=1)
+                else:
+                    inds, scores = self.gate(x, input_ids)
                 finalize(inds)
                 finalize(scores)
 
             with span("moe.switch_mlp"):
-                y = finalize(self.switch_mlp(x, inds))
+                if "switch" in _prs:
+                    y = finalize(
+                        mx.concatenate(
+                            [
+                                self.switch_mlp(
+                                    x[:, _j : _j + 1], inds[:, _j : _j + 1]
+                                )
+                                for _j in range(_prs_L)
+                            ],
+                            axis=1,
+                        )
+                    )
+                else:
+                    y = finalize(self.switch_mlp(x, inds))
 
             with span("moe.post_combine"):
                 # Phase H: fused weighted_reduce + shared_experts add via
@@ -2393,8 +2439,32 @@ class DeepseekV4MoE(nn.Module):
                 # before. shared_experts forward (the matmul itself) stays
                 # separate; we fuse only the y-side combine, which is
                 # the elementwise + sum + add path.
-                shared_out = self.shared_experts(x)
-                y = finalize(_moe_post_combine(y, scores, shared_out))
+                if "shared" in _prs:
+                    shared_out = mx.concatenate(
+                        [
+                            self.shared_experts(x[:, _j : _j + 1])
+                            for _j in range(_prs_L)
+                        ],
+                        axis=1,
+                    )
+                else:
+                    shared_out = self.shared_experts(x)
+                if "combine" in _prs:
+                    y = finalize(
+                        mx.concatenate(
+                            [
+                                _moe_post_combine(
+                                    y[:, _j : _j + 1],
+                                    scores[:, _j : _j + 1],
+                                    shared_out[:, _j : _j + 1],
+                                )
+                                for _j in range(_prs_L)
+                            ],
+                            axis=1,
+                        )
+                    )
+                else:
+                    y = finalize(_moe_post_combine(y, scores, shared_out))
 
             if self.sharding_group is not None:
                 with span("moe.all_sum"):
