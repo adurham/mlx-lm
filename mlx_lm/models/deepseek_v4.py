@@ -1382,6 +1382,16 @@ def _rowseq_row_mask(row_h: Any, cache: Any):
     return create_attention_mask(row_h, mask_cache, return_array=True)
 
 
+def _rowseq_min_ctx(batch_size: int) -> int:
+    """Effective rowseq context threshold. The B=1 losslessness stack runs
+    rowseq at ALL contexts (env default 0 after the 2026-07-10 flip); B>=2
+    keeps the previously-validated behavior (rowseq only at >=32K), so the
+    c>=2 serving path is bitwise-unchanged by the flip."""
+    if batch_size == 1:
+        return _VERIFY_ROWSEQ_MIN_CTX
+    return max(_VERIFY_ROWSEQ_MIN_CTX, 32768)
+
+
 def _rowseq_ctx(cache: Any) -> int:
     """Best-effort current offset of a layer cache (CacheList or raw)."""
     subs = cache.caches if hasattr(cache, "caches") else [cache]
@@ -2398,8 +2408,10 @@ class DeepseekV4MoE(nn.Module):
             _prs = _MOE_PARTS_ROWSEQ
             _prs_L = x.shape[1]
             if _prs and not (
-                2 <= _prs_L <= 8 and x.shape[0] * _prs_L <= 8
+                x.shape[0] == 1 and 2 <= _prs_L <= 8
             ):
+                # B=1 losslessness stack only — c>=2 keeps its
+                # previously-validated batched MoE path.
                 _prs = frozenset()
 
             with span("moe.gate"):
@@ -4221,11 +4233,12 @@ class DeepseekV4Block(nn.Module):
         if (
             _VERIFY_ROWSEQ
             and _VERIFY_ROWSEQ_FULLBLOCK
+            and h.shape[0] == 1  # B=1 losslessness stack only (c>=2
+            # keeps its previously-validated path — see _rowseq_min_ctx)
             and 2 <= h.shape[1] <= _VERIFY_ROWSEQ_MAX_L
-            and h.shape[0] * h.shape[1] <= 8
             and (
-                _VERIFY_ROWSEQ_MIN_CTX == 0
-                or _rowseq_ctx(cache) >= _VERIFY_ROWSEQ_MIN_CTX
+                _rowseq_min_ctx(h.shape[0]) == 0
+                or _rowseq_ctx(cache) >= _rowseq_min_ctx(h.shape[0])
             )
         ):
             # Full per-row block (see _VERIFY_ROWSEQ_FULLBLOCK): everything
@@ -4326,8 +4339,8 @@ class DeepseekV4Block(nn.Module):
             # keep the classic path until a wider sweep lands.
             and normed.shape[0] * normed.shape[1] <= 8
             and (
-                _VERIFY_ROWSEQ_MIN_CTX == 0
-                or _rowseq_ctx(cache) >= _VERIFY_ROWSEQ_MIN_CTX
+                _rowseq_min_ctx(normed.shape[0]) == 0
+                or _rowseq_ctx(cache) >= _rowseq_min_ctx(normed.shape[0])
             )
         ):
             # Row-sequential verify attention (see gate header above):
@@ -4341,7 +4354,9 @@ class DeepseekV4Block(nn.Module):
                         normed[:, _j : _j + 1],
                         mask=(
                             _rowseq_row_mask(normed[:, _j : _j + 1], cache)
-                            if _VERIFY_ROWSEQ_ROWMASK
+                            # B=1 only: the c>=2 rowseq path was validated
+                            # with mask=None rows; keep it bitwise-unchanged.
+                            if _VERIFY_ROWSEQ_ROWMASK and normed.shape[0] == 1
                             else None
                         ),
                         cache=cache,
@@ -4717,11 +4732,11 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             elif (
                 _VERIFY_ROWSEQ
                 and _VERIFY_ROWSEQ_FULLBLOCK
+                and h.shape[0] == 1
                 and 2 <= h.shape[1] <= _VERIFY_ROWSEQ_MAX_L
-                and h.shape[0] * h.shape[1] <= 8
                 and (
-                    _VERIFY_ROWSEQ_MIN_CTX == 0
-                    or _rowseq_ctx(cache[0]) >= _VERIFY_ROWSEQ_MIN_CTX
+                    _rowseq_min_ctx(h.shape[0]) == 0
+                    or _rowseq_ctx(cache[0]) >= _rowseq_min_ctx(h.shape[0])
                 )
             ):
                 # Per-row hc_head (see _VERIFY_ROWSEQ_FULLBLOCK): the
