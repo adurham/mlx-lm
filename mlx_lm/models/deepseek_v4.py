@@ -741,7 +741,13 @@ def _op_probe_report() -> str:
     return " ".join(parts)
 
 
-from .cache import CacheList, PoolingCache, RotatingKVCache
+from .cache import (
+    BatchPoolingCache,
+    BatchRotatingKVCache,
+    CacheList,
+    PoolingCache,
+    RotatingKVCache,
+)
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
@@ -4589,14 +4595,44 @@ def _rowseq_vec_slot_map(idx0: int, keep: int, max_size: int, L: int):
 
 
 def _rowseq_vec_ring_ok(local_cache: Any) -> bool:
-    """Steady-state plain-ring precondition shared by the vec paths."""
-    return (
-        isinstance(local_cache, RotatingKVCache)
-        and local_cache.keys is not None
-        and local_cache.offset >= local_cache.max_size
-        and local_cache.keys.shape[2] == local_cache.max_size
-        and local_cache.keys.shape[0] == 1
-    )
+    """Steady-state ring precondition shared by the vec paths.
+
+    Serving converts rings to BatchRotatingKVCache at insert
+    (generate._make_cache), so the vec paths must accept BOTH classes —
+    the plain-only gate made vec silently no-op in serving (increment 4,
+    2026-07-12). Batch rings additionally require B == 1 and finalized
+    lengths (the B=1 losslessness stack; c >= 2 keeps the loop)."""
+    if isinstance(local_cache, RotatingKVCache):
+        return (
+            local_cache.keys is not None
+            and local_cache.offset >= local_cache.max_size
+            and local_cache.keys.shape[2] == local_cache.max_size
+            and local_cache.keys.shape[0] == 1
+        )
+    if isinstance(local_cache, BatchRotatingKVCache):
+        return (
+            local_cache.keys is not None
+            and local_cache.keys.shape[0] == 1
+            and local_cache.keys.shape[2] == local_cache.max_size
+            and local_cache._offset >= local_cache.max_size
+            and local_cache._lengths is None
+        )
+    return False
+
+
+def _rowseq_vec_ring_mask(local_cache: Any):
+    """The local_mask the LOOP path would pass for these rows.
+
+    Plain rings: create_attention_mask -> RotatingKVCache.make_mask(N=1,
+    full window) -> None. Batch rings: an ARRAY decode mask at every N
+    including 1 (window + left_padding validity, rolled by _idx) — at the
+    vec steady-state precondition its content is all-true, but the sdpa
+    KERNEL CLASS must match the per-row loop calls (mask-array vs
+    mask=None specializations differ). Built from PRE-WRITE state, same
+    as loop row 0; rows 1+ differ only by a roll of an all-true mask."""
+    if isinstance(local_cache, BatchRotatingKVCache):
+        return local_cache.make_mask(1, return_array=True)
+    return None
 
 
 def _rowseq_vec_ring_apply(cache: Any, kv: mx.array) -> mx.array:
@@ -4611,19 +4647,47 @@ def _rowseq_vec_ring_apply(cache: Any, kv: mx.array) -> mx.array:
     L = kv.shape[2]
     max_size = cache.max_size
     pre_keys = cache.keys
-    slots, gmap = _rowseq_vec_slot_map(cache._idx, cache.keep, max_size, L)
+    _is_batch = isinstance(cache, BatchRotatingKVCache)
+    _keep = 0 if _is_batch else cache.keep
+    slots, gmap = _rowseq_vec_slot_map(cache._idx, _keep, max_size, L)
     gather = mx.array(gmap, dtype=mx.int32)  # (L, max_size)
     combined = mx.concatenate([pre_keys[0, 0], kv[0, 0]], axis=0)
     views = combined[gather][:, None, :, :]  # (L, 1, max_size, D)
+
+    # Cache-level spec-rollback compat (increment 4): the manual write
+    # below bypasses update_and_fetch, whose stash feed the rollback
+    # depends on — without this every vec-engaged rejection refused
+    # cache-level rollback and paid the commit-forward. One L-row entry;
+    # rollback_spec_write re-pushes row by row. Ring values are the
+    # zero-width dummies (_zero_values) throughout DSv4.
+    if getattr(cache, "_spec_stash_armed", False):
+        cache._spec_pushed.append(
+            (kv, mx.zeros((*kv.shape[:2], L, 0), dtype=kv.dtype))
+        )
 
     _s0 = slots[0]
     _run1 = min(L, max_size - _s0)
     cache.keys[..., _s0 : _s0 + _run1, :] = kv[..., :_run1, :]
     if _run1 < L:
-        _k2 = cache.keep
+        _k2 = _keep
         cache.keys[..., _k2 : _k2 + (L - _run1), :] = kv[..., _run1:, :]
-    cache.offset += L
-    cache._idx = slots[-1] + 1
+    if _is_batch:
+        # Mirror BatchRotatingKVCache._update_in_place bookkeeping for L
+        # steady-state writes: the ring is full and rotated, so every
+        # write decrements left_padding; offset is the per-stream mx
+        # array, _offset the python total; keys carry the same depends
+        # binding the loop path leaves.
+        cache.rotated = True
+        cache.left_padding -= L
+        cache.offset += L
+        cache._offset += L
+        cache._idx = slots[-1] + 1
+        cache.keys = mx.depends(
+            cache.keys, (cache.left_padding, cache.offset)
+        )
+    else:
+        cache.offset += L
+        cache._idx = slots[-1] + 1
     return views
 
 
@@ -4648,6 +4712,13 @@ class _RowseqVecMixin:
     def rowseq_vec(self, x: mx.array, cache: Any) -> mx.array:
         B, L, _ = x.shape
         offset = cache.offset
+        # Batch rings carry offset as an mx array MUTATED IN PLACE by the
+        # ring apply's `offset += L` — any graph node built AFTER the
+        # apply (the inverse rope) would capture the post-push value and
+        # rope at offset+L (the increment-4 batch-ring drift; plain rings
+        # are immune, their offset is an immutable int). Same defensive
+        # copy as LocalAttention.__call__.
+        offset = mx.array(offset) if isinstance(offset, mx.array) else offset
         max_size = cache.max_size
 
         q_lora, kv_pre = self._project_qa_kv(x)
@@ -4662,10 +4733,11 @@ class _RowseqVecMixin:
         if _FP32_ACT and kv.dtype == mx.float32:
             kv = kv.astype(mx.bfloat16)
 
+        _ring_mask = _rowseq_vec_ring_mask(cache)  # pre-write, loop parity
         views = _rowseq_vec_ring_apply(cache, kv)
 
         # Batched fold-path sdpa: row j is bitwise the S=1 decode call
-        # (mask=None, full window, same slot order) under steel-BI.
+        # (loop-parity mask, full window, same slot order) under steel-BI.
         q_rows = mx.contiguous(q.transpose(0, 2, 1, 3).reshape(
             L, self.n_heads, 1, self.head_dim
         ))
@@ -4675,7 +4747,7 @@ class _RowseqVecMixin:
             views,
             cache=cache,
             scale=self.scale,
-            mask=None,
+            mask=_ring_mask,
             sinks=_cached_sinks(self, q_rows.dtype),
         )  # (L, H, 1, D)
         out = out.reshape(1, L, self.n_heads, self.head_dim).transpose(
@@ -4701,7 +4773,10 @@ def _compressed_rowseq_vec_supported(self: Any, cache: Any) -> bool:
     local_cache, pool_cache = cache[0], cache[1]
     return (
         _rowseq_vec_ring_ok(local_cache)
-        and isinstance(pool_cache, PoolingCache)
+        # BatchPoolingCache accepted since increment 4 (serving converts
+        # pools at insert); the per-row compressor calls are
+        # class-generic, and B == 1 is enforced by the ring gate.
+        and isinstance(pool_cache, (PoolingCache, BatchPoolingCache))
         # Tree/freeze contexts change compressor semantics; the real
         # per-row compressor calls below handle them identically, but the
         # loop path is the validated owner of those modes — stay out.
@@ -4727,12 +4802,21 @@ def _compressed_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
     local_cache, pool_cache = cache[0], cache[1]
     B, L, _ = x.shape
     offset0 = local_cache.offset
+    # In-place-mutation defense for batch rings (see _RowseqVecMixin).
+    offset0 = mx.array(offset0) if isinstance(offset0, mx.array) else offset0
 
-    # 1. Per-row pool bookkeeping + visible pooled views (real calls).
-    pooled_rows = [
-        self.compressor(x[:, _i : _i + 1], pool_cache, offset0 + _i)
-        for _i in range(L)
-    ]
+    # 1. Per-row pool bookkeeping + visible pooled views (real calls),
+    #    capturing each row's pmask at its own state — the loop builds
+    #    the pool mask AFTER the row's compressor call (deferred-slot
+    #    invisibility on the batch pool's donation path lives in the
+    #    MASK, not the returned tensor, unlike the plain class).
+    pooled_rows = []
+    pmask_rows = []
+    for _i in range(L):
+        pooled_rows.append(
+            self.compressor(x[:, _i : _i + 1], pool_cache, offset0 + _i)
+        )
+        pmask_rows.append(_dispatch_pmask(pool_cache, 1, offset0 + _i))
     widths = [int(p.shape[1]) for p in pooled_rows]
 
     # 2. Batched projections + rope (row-bitexact under the BI folds).
@@ -4749,10 +4833,16 @@ def _compressed_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
         kv = kv.astype(mx.bfloat16)
 
     # 3. Ring views + manual end-state write (shared increment-1 core).
+    _ring_mask = _rowseq_vec_ring_mask(local_cache)  # pre-write, loop parity
     views = _rowseq_vec_ring_apply(local_cache, kv)  # (L, 1, W, D)
 
     # 4. Width-grouped sdpa: rows with equal visible width share the same
-    #    pooled prefix (pool storage is append-only within the pass).
+    #    pooled prefix (pool storage is append-only within the pass) and
+    #    the same pmask. Loop-parity mask: the loop's L=1 call runs
+    #    _extend_mask(ring_mask, pmask, width) — None on plain classes
+    #    (_extend_mask(None, ·) is None), the concatenated array on batch
+    #    classes (whose donation path relies on the MASK to hide the
+    #    pool's deferred slot, unlike the plain class's sliced view).
     q_rows = mx.contiguous(
         q.transpose(0, 2, 1, 3).reshape(L, self.n_heads, 1, self.head_dim)
     )
@@ -4768,17 +4858,40 @@ def _compressed_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
             kv_g = mx.concatenate([vg, pg], axis=2)
         else:
             kv_g = vg
-        out_g = scaled_dot_product_attention(
-            q_rows[mx.array(rows, dtype=mx.int32)],
-            kv_g,
-            kv_g,
-            cache=local_cache,
-            scale=self.scale,
-            mask=None,
-            sinks=_cached_sinks(self, q_rows.dtype),
-        )  # (g, H, 1, D)
-        for _gi, _row in enumerate(rows):
-            outs[_row] = out_g[_gi : _gi + 1]
+        if pmask_rows[rows[0]] is not None:
+            # A non-None pmask means the mask carries a real False column
+            # (the batch pool's deferred slot). Masked sdpa with actual
+            # masking is NOT batch-invariant (probe: batched-vs-single
+            # DIFF ~1e-3 even under steel-BI) — run these rows per-row,
+            # the loop's exact L=1 call. Only flush rows qualify
+            # (~1 per compress_ratio), so the cost is negligible.
+            for _gi, _row in enumerate(rows):
+                outs[_row] = scaled_dot_product_attention(
+                    q_rows[_row : _row + 1],
+                    kv_g[_gi : _gi + 1],
+                    kv_g[_gi : _gi + 1],
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=_extend_mask(
+                        _ring_mask, pmask_rows[_row], int(kv_g.shape[2])
+                    ),
+                    sinks=_cached_sinks(self, q_rows.dtype),
+                )
+        else:
+            _mask_g = _extend_mask(
+                _ring_mask, None, int(kv_g.shape[2])
+            )
+            out_g = scaled_dot_product_attention(
+                q_rows[mx.array(rows, dtype=mx.int32)],
+                kv_g,
+                kv_g,
+                cache=local_cache,
+                scale=self.scale,
+                mask=_mask_g,
+                sinks=_cached_sinks(self, q_rows.dtype),
+            )  # (g, H, 1, D)
+            for _gi, _row in enumerate(rows):
+                outs[_row] = out_g[_gi : _gi + 1]
 
     out = mx.concatenate(outs, axis=0)  # (L, H, 1, D)
     out = out.reshape(1, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -4823,6 +4936,8 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
     local_cache, comp_cache, idx_cache = cache[0], cache[1], cache[2]
     B, L, _ = x.shape
     offset0 = local_cache.offset
+    # In-place-mutation defense for batch rings (see _RowseqVecMixin).
+    offset0 = mx.array(offset0) if isinstance(offset0, mx.array) else offset0
 
     # 1. Batched projections (+ q_residual rows feed the per-row indexer).
     q_lora, kv_pre = self._project_qa_kv(x)
@@ -4862,6 +4977,7 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
     topk_k = self.indexer.index_topk
 
     # 3. Ring views + manual end-state write.
+    _ring_mask = _rowseq_vec_ring_mask(local_cache)  # pre-write, loop parity
     views = _rowseq_vec_ring_apply(local_cache, kv)  # (L, 1, W, D)
     q_rows = mx.contiguous(
         q.transpose(0, 2, 1, 3).reshape(L, self.n_heads, 1, self.head_dim)
@@ -4872,31 +4988,47 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
     #    (width > index_topk); handle the compressed/local modes by width
     #    groups for completeness (short-context chains in the harness).
     if min(widths) > topk_k:
-        p_widest = pooled_rows[max(range(L), key=lambda i: widths[i])]
-        pooled_b = mx.broadcast_to(
-            p_widest, (L,) + tuple(p_widest.shape[1:])
-        )
-        topk_stack = mx.concatenate(topk_rows, axis=0)  # (L, 1, k)
-        sparse_mask = None
-        if pmask_rows[0] is not None:
-            _sm_rows = []
-            for _i in range(L):
-                _pm = pmask_rows[_i]
-                _pm = _pm[None] if _pm.ndim == 2 else _pm
-                _sm_rows.append(
-                    mx.take_along_axis(_pm, topk_rows[_i], axis=2)[:, None]
-                )
-            sparse_mask = mx.concatenate(_sm_rows, axis=0)
-        out = _sparse_pooled_attention(
-            q_rows,
-            views,
-            pooled_b,
-            topk_stack,
-            None,
-            sparse_mask,
-            self.scale,
-            sinks,
-        )  # (L, H, 1, D)
+        # Rows whose pmask is non-None carry real False entries (the
+        # batch pool's deferred slot) — masked sdpa with actual masking
+        # is NOT batch-invariant (probe: ~1e-3 batched-vs-single even
+        # under steel-BI). Run those rows per-row (the loop's exact L=1
+        # call, ~1 per compress_ratio); batch the clean rows.
+        _clean = [i for i in range(L) if pmask_rows[i] is None]
+        _flush = [i for i in range(L) if pmask_rows[i] is not None]
+        row_outs: list = [None] * L
+        if _clean:
+            _ci = mx.array(_clean, dtype=mx.int32)
+            p_widest = pooled_rows[max(_clean, key=lambda i: widths[i])]
+            pooled_b = mx.broadcast_to(
+                p_widest, (len(_clean),) + tuple(p_widest.shape[1:])
+            )
+            out_c = _sparse_pooled_attention(
+                q_rows[_ci],
+                views[_ci],
+                pooled_b,
+                mx.concatenate([topk_rows[i] for i in _clean], axis=0),
+                _ring_mask,
+                None,
+                self.scale,
+                sinks,
+            )
+            for _gi, _row in enumerate(_clean):
+                row_outs[_row] = out_c[_gi : _gi + 1]
+        for _row in _flush:
+            _pm = pmask_rows[_row]
+            _pm = _pm[None] if _pm.ndim == 2 else _pm
+            _sm = mx.take_along_axis(_pm, topk_rows[_row], axis=2)[:, None]
+            row_outs[_row] = _sparse_pooled_attention(
+                q_rows[_row : _row + 1],
+                views[_row : _row + 1],
+                pooled_rows[_row],
+                topk_rows[_row],
+                _ring_mask,
+                _sm,
+                self.scale,
+                sinks,
+            )
+        out = mx.concatenate(row_outs, axis=0)  # (L, H, 1, D)
     else:
         # Width straddles the local/compressed/sparse mode boundaries
         # (short-context chains; the once-per-stream P==index_topk
@@ -4913,21 +5045,34 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
                     (len(rows),) + tuple(pooled_rows[rows[0]].shape[1:]),
                 )
                 tg = mx.concatenate([topk_rows[i] for i in rows], axis=0)
-                sm = None
                 if pmask_rows[rows[0]] is not None:
-                    _sm_rows = []
+                    # Real False mask entries -> per-row (masked-sdpa
+                    # BI gap; see the main sparse branch).
+                    _pr_outs = []
                     for _i in rows:
                         _pm = pmask_rows[_i]
                         _pm = _pm[None] if _pm.ndim == 2 else _pm
-                        _sm_rows.append(
-                            mx.take_along_axis(_pm, topk_rows[_i], axis=2)[
-                                :, None
-                            ]
+                        _sm_i = mx.take_along_axis(
+                            _pm, topk_rows[_i], axis=2
+                        )[:, None]
+                        _pr_outs.append(
+                            _sparse_pooled_attention(
+                                q_rows[_i : _i + 1],
+                                views[_i : _i + 1],
+                                pooled_rows[_i],
+                                topk_rows[_i],
+                                _ring_mask,
+                                _sm_i,
+                                self.scale,
+                                sinks,
+                            )
                         )
-                    sm = mx.concatenate(_sm_rows, axis=0)
-                out_g = _sparse_pooled_attention(
-                    q_rows[ridx], vg, pg, tg, None, sm, self.scale, sinks
-                )
+                    out_g = mx.concatenate(_pr_outs, axis=0)
+                else:
+                    out_g = _sparse_pooled_attention(
+                        q_rows[ridx], vg, pg, tg, _ring_mask, None,
+                        self.scale, sinks,
+                    )
             else:
                 if _w > 0:
                     pg = mx.broadcast_to(
@@ -4943,7 +5088,12 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
                     kv_g,
                     cache=local_cache,
                     scale=self.scale,
-                    mask=None,
+                    # Loop parity: compressed mode extends the ring mask
+                    # over pooled columns; local mode passes it straight
+                    # (zero-width extension is value-identical).
+                    mask=_extend_mask(
+                        _ring_mask, pmask_rows[rows[0]], int(kv_g.shape[2])
+                    ),
                     sinks=sinks,
                 )
             for _gi, _row in enumerate(rows):
