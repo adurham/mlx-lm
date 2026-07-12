@@ -4378,23 +4378,35 @@ class DeepseekV4Block(nn.Module):
             # bitwise the B-stream single-token stepping path (the c>=1
             # decode hot path). mask=None matches what a real single-token
             # decode step passes.
-            x = mx.concatenate(
-                [
-                    self.attn(
-                        normed[:, _j : _j + 1],
-                        mask=(
-                            _rowseq_row_mask(normed[:, _j : _j + 1], cache)
-                            # B=1 only: the c>=2 rowseq path was validated
-                            # with mask=None rows; keep it bitwise-unchanged.
-                            if _VERIFY_ROWSEQ_ROWMASK and normed.shape[0] == 1
-                            else None
-                        ),
-                        cache=cache,
-                    )
-                    for _j in range(normed.shape[1])
-                ],
-                axis=1,
-            )
+            #
+            # Vectorized variant (EXO_DSV4_VERIFY_ROWSEQ_VEC, task #23):
+            # plain-ring layers in steady-state rotation take ONE gathered
+            # per-row-view batched sdpa instead of L attention dispatches —
+            # bitwise-equal under MLX_STEEL_BATCH_INVARIANT.
+            if (
+                getattr(self.attn, "rowseq_vec_supported", None) is not None
+                and self.attn.rowseq_vec_supported(cache)
+            ):
+                x = self.attn.rowseq_vec(normed, cache)
+            else:
+                x = mx.concatenate(
+                    [
+                        self.attn(
+                            normed[:, _j : _j + 1],
+                            mask=(
+                                _rowseq_row_mask(normed[:, _j : _j + 1], cache)
+                                # B=1 only: the c>=2 rowseq path was validated
+                                # with mask=None rows; keep it bitwise-unchanged.
+                                if _VERIFY_ROWSEQ_ROWMASK
+                                and normed.shape[0] == 1
+                                else None
+                            ),
+                            cache=cache,
+                        )
+                        for _j in range(normed.shape[1])
+                    ],
+                    axis=1,
+                )
         else:
             x = self.attn(normed, mask=mask, cache=cache)
         _lh_sub("attn_out", x)
@@ -4546,6 +4558,117 @@ class DeepseekV4MTPModule(nn.Module):
         if return_hidden:
             return logits, pre_norm_out
         return logits
+
+
+_VERIFY_ROWSEQ_VEC = os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_VEC", "0") == "1"
+
+
+def _rowseq_vec_slot_map(idx0: int, keep: int, max_size: int, L: int):
+    """Slot sequence for L sequential _update_in_place writes.
+
+    Reproduces RotatingKVCache's steady-state rotation exactly: assign at
+    _idx, advance, wrap to ``keep`` when _idx hits max_size. Returns
+    (slots list, gather map (L, max_size) int32): row j's view selects, for
+    each slot s, the LATEST new row i<=j written at s (index max_size+i in
+    the concat [pre_buffer; new_rows]) else the pre-write slot s.
+    """
+    slots = []
+    idx = idx0
+    for _ in range(L):
+        if idx == max_size:
+            idx = keep
+        slots.append(idx)
+        idx += 1
+    base = list(range(max_size))
+    rows = []
+    cur = list(base)
+    for j in range(L):
+        cur[slots[j]] = max_size + j
+        rows.append(list(cur))
+    return slots, rows
+
+
+class _RowseqVecMixin:
+    """Vectorized bitwise-sequential verify attention (task #23, inc. 1).
+
+    Replaces the per-row rowseq attention loop for the plain rotating-ring
+    (LocalAttention) layers when the ring is in steady-state rotation:
+    per-row ring views are built with ONE gather over
+    ``[pre-write buffer; new rows]`` using the exact _update_in_place slot
+    sequence — same contents in the same slot order as L sequential decode
+    steps — then a single batched sdpa runs through the (L,H,1,D)x(L,1,W,D)
+    fold path. REQUIRES MLX_STEEL_BATCH_INVARIANT=1 for per-row
+    bitexactness of the batched call vs the sequential S=1 call. The
+    short-context growth phase (buffer not full) keeps the per-row loop —
+    at those lengths it is cheap anyway.
+    """
+
+    def rowseq_vec_supported(self, cache: Any) -> bool:
+        return (
+            _VERIFY_ROWSEQ_VEC
+            and isinstance(cache, RotatingKVCache)
+            and cache.keys is not None
+            and cache.offset >= cache.max_size
+            and cache.keys.shape[2] == cache.max_size
+            and cache.keys.shape[0] == 1
+        )
+
+    def rowseq_vec(self, x: mx.array, cache: Any) -> mx.array:
+        B, L, _ = x.shape
+        offset = cache.offset
+        max_size = cache.max_size
+
+        q_lora, kv_pre = self._project_qa_kv(x)
+        q = _q_finalize(
+            self.wq_b(self.q_norm(q_lora)),
+            B, L, self.n_heads, self.head_dim,
+            self.config.rms_norm_eps,
+        )
+        kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+        q = _rope_dispatch(self.rope, q, offset)
+        kv = _rope_dispatch(self.rope, kv, offset)
+        if _FP32_ACT and kv.dtype == mx.float32:
+            kv = kv.astype(mx.bfloat16)
+
+        # Per-row views from the PRE-write buffer + new rows, then the real
+        # batch write so the cache lands in the sequential end-state.
+        pre_keys = cache.keys
+        _, gmap = _rowseq_vec_slot_map(cache._idx, cache.keep, max_size, L)
+        gather = mx.array(gmap, dtype=mx.int32)  # (L, max_size)
+        combined = mx.concatenate([pre_keys[0, 0], kv[0, 0]], axis=0)
+        views = combined[gather]  # (L, max_size, D)
+        views = views[:, None, :, :]  # (L, 1, max_size, D)
+        cache.update_and_fetch(kv, _zero_values(B, L))
+
+        # Batched fold-path sdpa: row j is bitwise the S=1 decode call
+        # (mask=None, full window, same slot order) under steel-BI.
+        q_rows = mx.contiguous(q.transpose(0, 2, 1, 3).reshape(
+            L, self.n_heads, 1, self.head_dim
+        ))
+        out = scaled_dot_product_attention(
+            q_rows,
+            views,
+            views,
+            cache=cache,
+            scale=self.scale,
+            mask=None,
+            sinks=_cached_sinks(self, q_rows.dtype),
+        )  # (L, H, 1, D)
+        out = out.reshape(1, L, self.n_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        out = _rope_dispatch(self.rope, out, offset, inverse=True)
+        out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+        out = self.wo_a(out)
+        out = _o_pre_b(out)
+        return self.wo_b(out)
+
+
+# Attach the vec entry points to LocalAttention (mixin is defined below the
+# class for file-ordering reasons; explicit attachment mirrors the file's
+# existing patch idiom).
+LocalAttention.rowseq_vec_supported = _RowseqVecMixin.rowseq_vec_supported
+LocalAttention.rowseq_vec = _RowseqVecMixin.rowseq_vec
 
 
 class DSparkLocalAttention(LocalAttention):
