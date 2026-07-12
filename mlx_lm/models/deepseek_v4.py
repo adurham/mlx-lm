@@ -4793,6 +4793,175 @@ CompressedAttention.rowseq_vec_supported = _compressed_rowseq_vec_supported
 CompressedAttention.rowseq_vec = _compressed_rowseq_vec
 
 
+def _sparse_rowseq_vec_supported(self: Any, cache: Any) -> bool:
+    if not (_VERIFY_ROWSEQ_VEC and isinstance(cache, CacheList)):
+        return False
+    if len(cache.caches) < 3:
+        return False
+    return (
+        _rowseq_vec_ring_ok(cache[0])
+        and _TREE_VERIFY_CTX.get("positions") is None
+        and not _POOL_FREEZE
+    )
+
+
+def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
+    """Vectorized bitwise-sequential verify for SparseCompressedAttention
+    (task #23, increment 3).
+
+    Stateful sub-modules (compressor pool, indexer cache) run their REAL
+    per-row calls — identical state evolution and per-row top-k selection —
+    while the heavy work is batched: q/wq_b/wkv projections, ring views,
+    and ONE fold-shape call into _sparse_pooled_attention's L_q=1 fast
+    path (explicitly B-general): q (L,H,1,D), per-row ring views
+    (L,1,W,D), shared append-only pooled storage, stacked per-row topk
+    (L,1,k). Per-row pooled VISIBILITY is enforced by the indices
+    themselves (row i's topk was computed against its own visible prefix;
+    storage is append-only, so gathered values are bitwise the sequential
+    ones). Sparse masks are the per-row pmask gathers, stacked.
+    """
+    local_cache, comp_cache, idx_cache = cache[0], cache[1], cache[2]
+    B, L, _ = x.shape
+    offset0 = local_cache.offset
+
+    # 1. Batched projections (+ q_residual rows feed the per-row indexer).
+    q_lora, kv_pre = self._project_qa_kv(x)
+    q_residual = self.q_norm(q_lora)
+    q = _q_finalize(
+        self.wq_b(q_residual),
+        B, L, self.n_heads, self.head_dim,
+        self.config.rms_norm_eps,
+    )
+    kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+    q = _rope_dispatch(self.rope, q, offset0)
+    kv = _rope_dispatch(self.rope, kv, offset0)
+    if _FP32_ACT and kv.dtype == mx.float32:
+        kv = kv.astype(mx.bfloat16)
+
+    # 2. Per-row stateful calls in sequential order.
+    pooled_rows: list = []
+    topk_rows: list = []
+    pmask_rows: list = []
+    for _i in range(L):
+        _xi = x[:, _i : _i + 1]
+        pooled_rows.append(
+            self.compressor(_xi, comp_cache, offset0 + _i)
+        )
+        topk_rows.append(
+            self.indexer(
+                _xi,
+                q_residual[:, _i : _i + 1],
+                self.rope,
+                idx_cache,
+                offset0 + _i,
+            )
+        )
+        pmask_rows.append(_dispatch_pmask(comp_cache, 1, offset0 + _i))
+
+    widths = [int(p.shape[1]) for p in pooled_rows]
+    topk_k = self.indexer.index_topk
+
+    # 3. Ring views + manual end-state write.
+    views = _rowseq_vec_ring_apply(local_cache, kv)  # (L, 1, W, D)
+    q_rows = mx.contiguous(
+        q.transpose(0, 2, 1, 3).reshape(L, self.n_heads, 1, self.head_dim)
+    )
+    sinks = _cached_sinks(self, q_rows.dtype)
+
+    # 4. Mode dispatch. Serving contexts put every row in SPARSE mode
+    #    (width > index_topk); handle the compressed/local modes by width
+    #    groups for completeness (short-context chains in the harness).
+    if min(widths) > topk_k:
+        p_widest = pooled_rows[max(range(L), key=lambda i: widths[i])]
+        pooled_b = mx.broadcast_to(
+            p_widest, (L,) + tuple(p_widest.shape[1:])
+        )
+        topk_stack = mx.concatenate(topk_rows, axis=0)  # (L, 1, k)
+        sparse_mask = None
+        if pmask_rows[0] is not None:
+            _sm_rows = []
+            for _i in range(L):
+                _pm = pmask_rows[_i]
+                _pm = _pm[None] if _pm.ndim == 2 else _pm
+                _sm_rows.append(
+                    mx.take_along_axis(_pm, topk_rows[_i], axis=2)[:, None]
+                )
+            sparse_mask = mx.concatenate(_sm_rows, axis=0)
+        out = _sparse_pooled_attention(
+            q_rows,
+            views,
+            pooled_b,
+            topk_stack,
+            None,
+            sparse_mask,
+            self.scale,
+            sinks,
+        )  # (L, H, 1, D)
+    else:
+        # Width straddles the local/compressed/sparse mode boundaries
+        # (short-context chains; the once-per-stream P==index_topk
+        # crossing). Route each width group through the SAME branch its
+        # sequential L=1 call takes.
+        outs: list = [None] * L
+        for _w in sorted(set(widths)):
+            rows = [i for i in range(L) if widths[i] == _w]
+            ridx = mx.array(rows, dtype=mx.int32)
+            vg = views[ridx]
+            if _w > topk_k:
+                pg = mx.broadcast_to(
+                    pooled_rows[rows[0]],
+                    (len(rows),) + tuple(pooled_rows[rows[0]].shape[1:]),
+                )
+                tg = mx.concatenate([topk_rows[i] for i in rows], axis=0)
+                sm = None
+                if pmask_rows[rows[0]] is not None:
+                    _sm_rows = []
+                    for _i in rows:
+                        _pm = pmask_rows[_i]
+                        _pm = _pm[None] if _pm.ndim == 2 else _pm
+                        _sm_rows.append(
+                            mx.take_along_axis(_pm, topk_rows[_i], axis=2)[
+                                :, None
+                            ]
+                        )
+                    sm = mx.concatenate(_sm_rows, axis=0)
+                out_g = _sparse_pooled_attention(
+                    q_rows[ridx], vg, pg, tg, None, sm, self.scale, sinks
+                )
+            else:
+                if _w > 0:
+                    pg = mx.broadcast_to(
+                        pooled_rows[rows[0]][:, None],
+                        (len(rows), 1, _w, self.head_dim),
+                    )
+                    kv_g = mx.concatenate([vg, pg], axis=2)
+                else:
+                    kv_g = vg
+                out_g = scaled_dot_product_attention(
+                    q_rows[ridx],
+                    kv_g,
+                    kv_g,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=None,
+                    sinks=sinks,
+                )
+            for _gi, _row in enumerate(rows):
+                outs[_row] = out_g[_gi : _gi + 1]
+        out = mx.concatenate(outs, axis=0)
+
+    out = out.reshape(1, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+    out = _rope_dispatch(self.rope, out, offset0, inverse=True)
+    out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+    out = self.wo_a(out)
+    out = _o_pre_b(out)
+    return self.wo_b(out)
+
+
+SparseCompressedAttention.rowseq_vec_supported = _sparse_rowseq_vec_supported
+SparseCompressedAttention.rowseq_vec = _sparse_rowseq_vec
+
+
 class DSparkLocalAttention(LocalAttention):
     """LocalAttention with the two DSpark entry points.
 
