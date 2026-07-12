@@ -4577,9 +4577,74 @@ _VERIFY_ROWSEQ_VEC = os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_VEC", "0") == "1"
 # kernel class (~1 flip per ~6k layer-forwards) that the random-weight
 # ldiff harness is statistically blind to. Only meaningful with
 # EXO_DSV4_VERIFY_ROWSEQ_VEC=1.
-_VERIFY_ROWSEQ_VEC_ROWSDPA = (
-    os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_VEC_ROWSDPA", "0") == "1"
-)
+#
+# Levels: 1 = per-row attention only (still fails the serving gold gate
+# 0/3 — same coherent near-tie drift ~150 tokens in as the fully batched
+# vec, which localizes the residual to the batched q/kv projections and
+# o-proj tail: quantized matmuls at M=L vs the loop's M=1, bitwise-proven
+# at probe values for M=1..8 but value-suspect at real weights, the
+# FULLBLOCK lesson). 2 = ALSO run projections/norms/rope-in and the
+# inverse-rope + o-proj tail per row — the only remaining batched piece
+# is the gathered ring view + single manual write, bitwise-proven by the
+# increment 1-4 harnesses.
+try:
+    _VERIFY_ROWSEQ_VEC_ROWSDPA = int(
+        os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_VEC_ROWSDPA", "0") or "0"
+    )
+except ValueError:
+    _VERIFY_ROWSEQ_VEC_ROWSDPA = 0
+_ROWSDPA_ROWPROJ = _VERIFY_ROWSEQ_VEC_ROWSDPA >= 2
+
+
+def _rowsdpa_project_rows(self: Any, x: mx.array, offset0):
+    """Loop-exact per-row q/kv projection + rope (ROWSDPA level 2).
+
+    Runs the loop's L=1 projection/norm/rope-in calls once per row —
+    quantized matmuls and norms at M=1, the loop's exact kernel class —
+    and stacks the results into the vec path's batched layout. Returns
+    (q (B,H,L,D), kv (B,1,L,D), q_residual rows for the sparse indexer).
+    """
+    B, L, _ = x.shape
+    q_parts: list = []
+    kv_parts: list = []
+    q_res_rows: list = []
+    for _i in range(L):
+        q_lora_i, kv_pre_i = self._project_qa_kv(x[:, _i : _i + 1])
+        q_res_i = self.q_norm(q_lora_i)
+        q_i = _q_finalize(
+            self.wq_b(q_res_i),
+            B, 1, self.n_heads, self.head_dim,
+            self.config.rms_norm_eps,
+        )
+        kv_i = self.kv_norm(kv_pre_i).reshape(B, 1, 1, self.head_dim)
+        q_parts.append(_rope_dispatch(self.rope, q_i, offset0 + _i))
+        kv_parts.append(_rope_dispatch(self.rope, kv_i, offset0 + _i))
+        q_res_rows.append(q_res_i)
+    return (
+        mx.concatenate(q_parts, axis=2),
+        mx.concatenate(kv_parts, axis=2),
+        q_res_rows,
+    )
+
+
+def _rowsdpa_oproj_rows(self: Any, out_rows: mx.array, offset0) -> mx.array:
+    """Loop-exact per-row inverse-rope + o-proj tail (ROWSDPA level 2).
+
+    out_rows: (L, H, 1, D) per-row sdpa outputs. Each row runs the loop's
+    exact L=1 tail (inverse rope at its own offset, _o_pre_a/wo_a/
+    _o_pre_b/wo_b at M=1); rows concatenate on the sequence axis exactly
+    like the per-row attention loop's outputs.
+    """
+    L = out_rows.shape[0]
+    outs: list = []
+    for _i in range(L):
+        o_i = out_rows[_i : _i + 1]  # (1, H, 1, D)
+        o_i = _rope_dispatch(self.rope, o_i, offset0 + _i, inverse=True)
+        o_i = _o_pre_a(o_i, 1, self.o_groups, 1, self.head_dim)
+        o_i = self.wo_a(o_i)
+        o_i = _o_pre_b(o_i)
+        outs.append(self.wo_b(o_i))
+    return mx.concatenate(outs, axis=1)
 
 
 def _rowseq_vec_slot_map(idx0: int, keep: int, max_size: int, L: int):
@@ -4734,15 +4799,18 @@ class _RowseqVecMixin:
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
         max_size = cache.max_size
 
-        q_lora, kv_pre = self._project_qa_kv(x)
-        q = _q_finalize(
-            self.wq_b(self.q_norm(q_lora)),
-            B, L, self.n_heads, self.head_dim,
-            self.config.rms_norm_eps,
-        )
-        kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-        q = _rope_dispatch(self.rope, q, offset)
-        kv = _rope_dispatch(self.rope, kv, offset)
+        if _ROWSDPA_ROWPROJ:
+            q, kv, _ = _rowsdpa_project_rows(self, x, offset)
+        else:
+            q_lora, kv_pre = self._project_qa_kv(x)
+            q = _q_finalize(
+                self.wq_b(self.q_norm(q_lora)),
+                B, L, self.n_heads, self.head_dim,
+                self.config.rms_norm_eps,
+            )
+            kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+            q = _rope_dispatch(self.rope, q, offset)
+            kv = _rope_dispatch(self.rope, kv, offset)
         if _FP32_ACT and kv.dtype == mx.float32:
             kv = kv.astype(mx.bfloat16)
 
@@ -4783,6 +4851,8 @@ class _RowseqVecMixin:
                 mask=_ring_mask,
                 sinks=_cached_sinks(self, q_rows.dtype),
             )  # (L, H, 1, D)
+        if _ROWSDPA_ROWPROJ:
+            return _rowsdpa_oproj_rows(self, out, offset)
         out = out.reshape(1, L, self.n_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
@@ -4852,16 +4922,20 @@ def _compressed_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
         pmask_rows.append(_dispatch_pmask(pool_cache, 1, offset0 + _i))
     widths = [int(p.shape[1]) for p in pooled_rows]
 
-    # 2. Batched projections + rope (row-bitexact under the BI folds).
-    q_lora, kv_pre = self._project_qa_kv(x)
-    q = _q_finalize(
-        self.wq_b(self.q_norm(q_lora)),
-        B, L, self.n_heads, self.head_dim,
-        self.config.rms_norm_eps,
-    )
-    kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-    q = _rope_dispatch(self.rope, q, offset0)
-    kv = _rope_dispatch(self.rope, kv, offset0)
+    # 2. Batched projections + rope (row-bitexact under the BI folds);
+    #    per-row at ROWSDPA level 2 (loop-exact M=1 kernel class).
+    if _ROWSDPA_ROWPROJ:
+        q, kv, _ = _rowsdpa_project_rows(self, x, offset0)
+    else:
+        q_lora, kv_pre = self._project_qa_kv(x)
+        q = _q_finalize(
+            self.wq_b(self.q_norm(q_lora)),
+            B, L, self.n_heads, self.head_dim,
+            self.config.rms_norm_eps,
+        )
+        kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+        q = _rope_dispatch(self.rope, q, offset0)
+        kv = _rope_dispatch(self.rope, kv, offset0)
     if _FP32_ACT and kv.dtype == mx.float32:
         kv = kv.astype(mx.bfloat16)
 
@@ -4930,6 +5004,8 @@ def _compressed_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
                 outs[_row] = out_g[_gi : _gi + 1]
 
     out = mx.concatenate(outs, axis=0)  # (L, H, 1, D)
+    if _ROWSDPA_ROWPROJ:
+        return _rowsdpa_oproj_rows(self, out, offset0)
     out = out.reshape(1, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
     out = _rope_dispatch(self.rope, out, offset0, inverse=True)
     out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
@@ -4975,17 +5051,25 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
     # In-place-mutation defense for batch rings (see _RowseqVecMixin).
     offset0 = mx.array(offset0) if isinstance(offset0, mx.array) else offset0
 
-    # 1. Batched projections (+ q_residual rows feed the per-row indexer).
-    q_lora, kv_pre = self._project_qa_kv(x)
-    q_residual = self.q_norm(q_lora)
-    q = _q_finalize(
-        self.wq_b(q_residual),
-        B, L, self.n_heads, self.head_dim,
-        self.config.rms_norm_eps,
-    )
-    kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
-    q = _rope_dispatch(self.rope, q, offset0)
-    kv = _rope_dispatch(self.rope, kv, offset0)
+    # 1. Batched projections (+ q_residual rows feed the per-row indexer);
+    #    per-row at ROWSDPA level 2 — the batched q_residual feeding the
+    #    per-row indexer top-k is itself a value-suspect batched-vs-single
+    #    surface (ulp flips can move topk indices), so level 2 computes it
+    #    with the loop's exact M=1 calls.
+    if _ROWSDPA_ROWPROJ:
+        q, kv, _q_res_rows = _rowsdpa_project_rows(self, x, offset0)
+    else:
+        q_lora, kv_pre = self._project_qa_kv(x)
+        q_residual = self.q_norm(q_lora)
+        _q_res_rows = None
+        q = _q_finalize(
+            self.wq_b(q_residual),
+            B, L, self.n_heads, self.head_dim,
+            self.config.rms_norm_eps,
+        )
+        kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+        q = _rope_dispatch(self.rope, q, offset0)
+        kv = _rope_dispatch(self.rope, kv, offset0)
     if _FP32_ACT and kv.dtype == mx.float32:
         kv = kv.astype(mx.bfloat16)
 
@@ -5001,7 +5085,11 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
         topk_rows.append(
             self.indexer(
                 _xi,
-                q_residual[:, _i : _i + 1],
+                (
+                    _q_res_rows[_i]
+                    if _q_res_rows is not None
+                    else q_residual[:, _i : _i + 1]
+                ),
                 self.rope,
                 idx_cache,
                 offset0 + _i,
@@ -5180,6 +5268,8 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
                 outs[_row] = out_g[_gi : _gi + 1]
         out = mx.concatenate(outs, axis=0)
 
+    if _ROWSDPA_ROWPROJ:
+        return _rowsdpa_oproj_rows(self, out, offset0)
     out = out.reshape(1, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
     out = _rope_dispatch(self.rope, out, offset0, inverse=True)
     out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
