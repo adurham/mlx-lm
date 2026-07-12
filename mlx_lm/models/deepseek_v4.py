@@ -529,6 +529,36 @@ def _set_tree_verify_ctx(mask: Optional[mx.array],
 # bit-exact with the prior hard-embed path. See Phase 14 plan B.2.
 _EAGLE_CTX: Dict[str, Any] = {"soft_emb": None}
 
+# DSpark side channel (EXO_DSV4_DSPARK=1). "taps" = target layer ids whose
+# hc-MEAN hiddens are captured during any target forward (the reference's
+# `h.mean(dim=2)` at dspark_target_layer_ids); "hiddens" = {layer_id:
+# (B, L, hidden)} from the most recent forward. The speculative layer /
+# prefill hook consumes them via get_dspark_ctx() and feeds
+# DeepseekV4DSparkModule.append_ctx.
+_DSPARK_CTX: Dict[str, Any] = {
+    "enabled": os.environ.get("EXO_DSV4_DSPARK", "0") == "1",
+    "taps": frozenset(),
+    "hiddens": {},
+}
+
+
+def set_dspark_taps(layer_ids: Any) -> None:
+    _DSPARK_CTX["taps"] = frozenset(int(i) for i in layer_ids)
+    _DSPARK_CTX["enabled"] = bool(_DSPARK_CTX["taps"]) and (
+        os.environ.get("EXO_DSV4_DSPARK", "0") == "1"
+    )
+
+
+def get_dspark_ctx(order: Any) -> Optional[mx.array]:
+    """Concat the captured per-layer hc-means in ``order``; None if any
+    tap is missing (e.g. capture disabled or pre-tap pipeline rank)."""
+    hid = _DSPARK_CTX["hiddens"]
+    try:
+        parts = [hid[int(i)] for i in order]
+    except KeyError:
+        return None
+    return mx.concatenate(parts, axis=-1)
+
 
 def _set_eagle_soft_emb(soft_emb: Optional[mx.array]) -> None:
     """Caller-side helper: install or clear the Eagle soft-embedding."""
@@ -4920,8 +4950,19 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 _lhash_fh.write(f"{_lh_base + _lh_j} {tag} {_lh_m}\n")
 
         _lh_dump("embed", h)
+        # DSpark context capture (EXO_DSV4_DSPARK=1): stash the hc-MEAN
+        # hidden at each dspark_target_layer_id so the speculative layer can
+        # feed the draft module's rotating ctx-KV window (append_ctx). The
+        # reference target forward does exactly `h.mean(dim=2)` after the
+        # tapped layers. Storage is a module-level side channel keyed per
+        # forward; the consumer (dsv4_mtp / prefill hook) pops it.
+        _dspark_tap = _DSPARK_CTX["taps"] if _DSPARK_CTX["enabled"] else None
+        if _dspark_tap is not None:
+            _DSPARK_CTX["hiddens"] = {}
         for _ap_i, (layer, layer_cache) in enumerate(zip(self.pipeline_layers, cache)):
             h = layer(h, mask, layer_cache, inputs)
+            if _dspark_tap is not None and _ap_i in _dspark_tap:
+                _DSPARK_CTX["hiddens"][_ap_i] = h.mean(axis=2)
             _lh_dump(f"L{_ap_i:02d}", h)
             if _actprobe:
                 mx.eval(h)
