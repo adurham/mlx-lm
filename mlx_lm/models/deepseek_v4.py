@@ -4630,15 +4630,30 @@ class _RowseqVecMixin:
         if _FP32_ACT and kv.dtype == mx.float32:
             kv = kv.astype(mx.bfloat16)
 
-        # Per-row views from the PRE-write buffer + new rows, then the real
-        # batch write so the cache lands in the sequential end-state.
+        # Per-row views from the PRE-write buffer + new rows.
         pre_keys = cache.keys
-        _, gmap = _rowseq_vec_slot_map(cache._idx, cache.keep, max_size, L)
+        slots, gmap = _rowseq_vec_slot_map(cache._idx, cache.keep, max_size, L)
         gather = mx.array(gmap, dtype=mx.int32)  # (L, max_size)
         combined = mx.concatenate([pre_keys[0, 0], kv[0, 0]], axis=0)
         views = combined[gather]  # (L, max_size, D)
         views = views[:, None, :, :]  # (L, 1, max_size, D)
-        cache.update_and_fetch(kv, _zero_values(B, L))
+
+        # Manual in-place end-state write. An S=L update_and_fetch would
+        # take _update_concat (temporal reorder + buffer grown to
+        # max_size+S-1) — a DIFFERENT algorithm from L sequential
+        # _update_in_place steps, and every subsequent read (next cycle,
+        # rollback trims) diverges. Harness-caught (ldiff DRIFT at seq pos
+        # 1, first vec attempt). Sequential slots are consecutive with at
+        # most one wrap: two slice assignments reproduce the end state
+        # exactly; values are the zero-width placeholder (nothing to write).
+        _s0 = slots[0]
+        _run1 = min(L, max_size - _s0)
+        cache.keys[..., _s0 : _s0 + _run1, :] = kv[..., :_run1, :]
+        if _run1 < L:
+            _k2 = cache.keep
+            cache.keys[..., _k2 : _k2 + (L - _run1), :] = kv[..., _run1:, :]
+        cache.offset += L
+        cache._idx = slots[-1] + 1
 
         # Batched fold-path sdpa: row j is bitwise the S=1 decode call
         # (mask=None, full window, same slot order) under steel-BI.
