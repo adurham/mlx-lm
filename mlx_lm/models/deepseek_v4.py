@@ -4588,6 +4588,45 @@ def _rowseq_vec_slot_map(idx0: int, keep: int, max_size: int, L: int):
     return slots, rows
 
 
+def _rowseq_vec_ring_ok(local_cache: Any) -> bool:
+    """Steady-state plain-ring precondition shared by the vec paths."""
+    return (
+        isinstance(local_cache, RotatingKVCache)
+        and local_cache.keys is not None
+        and local_cache.offset >= local_cache.max_size
+        and local_cache.keys.shape[2] == local_cache.max_size
+        and local_cache.keys.shape[0] == 1
+    )
+
+
+def _rowseq_vec_ring_apply(cache: Any, kv: mx.array) -> mx.array:
+    """Per-row ring views + manual in-place end-state write (shared core).
+
+    kv: (1, 1, L, D) roped new rows. Returns views (L, 1, max_size, D) in
+    raw slot order, each bitwise the buffer a sequential S=1
+    _update_in_place step would present to its row. The end-state write is
+    the manual two-segment slot scatter — an S=L update_and_fetch would
+    take _update_concat (different algorithm; harness-caught drift).
+    """
+    L = kv.shape[2]
+    max_size = cache.max_size
+    pre_keys = cache.keys
+    slots, gmap = _rowseq_vec_slot_map(cache._idx, cache.keep, max_size, L)
+    gather = mx.array(gmap, dtype=mx.int32)  # (L, max_size)
+    combined = mx.concatenate([pre_keys[0, 0], kv[0, 0]], axis=0)
+    views = combined[gather][:, None, :, :]  # (L, 1, max_size, D)
+
+    _s0 = slots[0]
+    _run1 = min(L, max_size - _s0)
+    cache.keys[..., _s0 : _s0 + _run1, :] = kv[..., :_run1, :]
+    if _run1 < L:
+        _k2 = cache.keep
+        cache.keys[..., _k2 : _k2 + (L - _run1), :] = kv[..., _run1:, :]
+    cache.offset += L
+    cache._idx = slots[-1] + 1
+    return views
+
+
 class _RowseqVecMixin:
     """Vectorized bitwise-sequential verify attention (task #23, inc. 1).
 
@@ -4604,14 +4643,7 @@ class _RowseqVecMixin:
     """
 
     def rowseq_vec_supported(self, cache: Any) -> bool:
-        return (
-            _VERIFY_ROWSEQ_VEC
-            and isinstance(cache, RotatingKVCache)
-            and cache.keys is not None
-            and cache.offset >= cache.max_size
-            and cache.keys.shape[2] == cache.max_size
-            and cache.keys.shape[0] == 1
-        )
+        return _VERIFY_ROWSEQ_VEC and _rowseq_vec_ring_ok(cache)
 
     def rowseq_vec(self, x: mx.array, cache: Any) -> mx.array:
         B, L, _ = x.shape
@@ -4630,30 +4662,7 @@ class _RowseqVecMixin:
         if _FP32_ACT and kv.dtype == mx.float32:
             kv = kv.astype(mx.bfloat16)
 
-        # Per-row views from the PRE-write buffer + new rows.
-        pre_keys = cache.keys
-        slots, gmap = _rowseq_vec_slot_map(cache._idx, cache.keep, max_size, L)
-        gather = mx.array(gmap, dtype=mx.int32)  # (L, max_size)
-        combined = mx.concatenate([pre_keys[0, 0], kv[0, 0]], axis=0)
-        views = combined[gather]  # (L, max_size, D)
-        views = views[:, None, :, :]  # (L, 1, max_size, D)
-
-        # Manual in-place end-state write. An S=L update_and_fetch would
-        # take _update_concat (temporal reorder + buffer grown to
-        # max_size+S-1) — a DIFFERENT algorithm from L sequential
-        # _update_in_place steps, and every subsequent read (next cycle,
-        # rollback trims) diverges. Harness-caught (ldiff DRIFT at seq pos
-        # 1, first vec attempt). Sequential slots are consecutive with at
-        # most one wrap: two slice assignments reproduce the end state
-        # exactly; values are the zero-width placeholder (nothing to write).
-        _s0 = slots[0]
-        _run1 = min(L, max_size - _s0)
-        cache.keys[..., _s0 : _s0 + _run1, :] = kv[..., :_run1, :]
-        if _run1 < L:
-            _k2 = cache.keep
-            cache.keys[..., _k2 : _k2 + (L - _run1), :] = kv[..., _run1:, :]
-        cache.offset += L
-        cache._idx = slots[-1] + 1
+        views = _rowseq_vec_ring_apply(cache, kv)
 
         # Batched fold-path sdpa: row j is bitwise the S=1 decode call
         # (mask=None, full window, same slot order) under steel-BI.
@@ -4684,6 +4693,104 @@ class _RowseqVecMixin:
 # existing patch idiom).
 LocalAttention.rowseq_vec_supported = _RowseqVecMixin.rowseq_vec_supported
 LocalAttention.rowseq_vec = _RowseqVecMixin.rowseq_vec
+
+
+def _compressed_rowseq_vec_supported(self: Any, cache: Any) -> bool:
+    if not (_VERIFY_ROWSEQ_VEC and isinstance(cache, CacheList)):
+        return False
+    local_cache, pool_cache = cache[0], cache[1]
+    return (
+        _rowseq_vec_ring_ok(local_cache)
+        and isinstance(pool_cache, PoolingCache)
+        # Tree/freeze contexts change compressor semantics; the real
+        # per-row compressor calls below handle them identically, but the
+        # loop path is the validated owner of those modes — stay out.
+        and _TREE_VERIFY_CTX.get("positions") is None
+        and not _POOL_FREEZE
+    )
+
+
+def _compressed_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
+    """Vectorized bitwise-sequential verify for CompressedAttention
+    (task #23, increment 2).
+
+    Pool bookkeeping runs through the REAL per-row Compressor calls —
+    identical state transitions (deferred bumps, remainder buffer, spec
+    stash entries, flush compress) at negligible cost — while the
+    expensive work (q/wq_b/wkv projections, attention, o-proj) is batched.
+    Rows are grouped by visible pooled width (a flush mid-verify gives at
+    most a few groups); each group runs ONE fold-path sdpa over
+    [per-row ring view; shared pooled prefix] with mask=None — exactly the
+    L=1 decode call configuration (visibility is encoded by cache
+    contents; _extend_mask(None, ...) is None).
+    """
+    local_cache, pool_cache = cache[0], cache[1]
+    B, L, _ = x.shape
+    offset0 = local_cache.offset
+
+    # 1. Per-row pool bookkeeping + visible pooled views (real calls).
+    pooled_rows = [
+        self.compressor(x[:, _i : _i + 1], pool_cache, offset0 + _i)
+        for _i in range(L)
+    ]
+    widths = [int(p.shape[1]) for p in pooled_rows]
+
+    # 2. Batched projections + rope (row-bitexact under the BI folds).
+    q_lora, kv_pre = self._project_qa_kv(x)
+    q = _q_finalize(
+        self.wq_b(self.q_norm(q_lora)),
+        B, L, self.n_heads, self.head_dim,
+        self.config.rms_norm_eps,
+    )
+    kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+    q = _rope_dispatch(self.rope, q, offset0)
+    kv = _rope_dispatch(self.rope, kv, offset0)
+    if _FP32_ACT and kv.dtype == mx.float32:
+        kv = kv.astype(mx.bfloat16)
+
+    # 3. Ring views + manual end-state write (shared increment-1 core).
+    views = _rowseq_vec_ring_apply(local_cache, kv)  # (L, 1, W, D)
+
+    # 4. Width-grouped sdpa: rows with equal visible width share the same
+    #    pooled prefix (pool storage is append-only within the pass).
+    q_rows = mx.contiguous(
+        q.transpose(0, 2, 1, 3).reshape(L, self.n_heads, 1, self.head_dim)
+    )
+    outs: list = [None] * L
+    for _w in sorted(set(widths)):
+        rows = [i for i in range(L) if widths[i] == _w]
+        vg = views[mx.array(rows, dtype=mx.int32)]  # (g, 1, W, D)
+        if _w > 0:
+            pg = mx.broadcast_to(
+                pooled_rows[rows[0]][:, None],
+                (len(rows), 1, _w, self.head_dim),
+            )
+            kv_g = mx.concatenate([vg, pg], axis=2)
+        else:
+            kv_g = vg
+        out_g = scaled_dot_product_attention(
+            q_rows[mx.array(rows, dtype=mx.int32)],
+            kv_g,
+            kv_g,
+            cache=local_cache,
+            scale=self.scale,
+            mask=None,
+            sinks=_cached_sinks(self, q_rows.dtype),
+        )  # (g, H, 1, D)
+        for _gi, _row in enumerate(rows):
+            outs[_row] = out_g[_gi : _gi + 1]
+
+    out = mx.concatenate(outs, axis=0)  # (L, H, 1, D)
+    out = out.reshape(1, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+    out = _rope_dispatch(self.rope, out, offset0, inverse=True)
+    out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+    out = self.wo_a(out)
+    out = _o_pre_b(out)
+    return self.wo_b(out)
+
+
+CompressedAttention.rowseq_vec_supported = _compressed_rowseq_vec_supported
+CompressedAttention.rowseq_vec = _compressed_rowseq_vec
 
 
 class DSparkLocalAttention(LocalAttention):
