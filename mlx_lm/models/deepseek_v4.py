@@ -4568,6 +4568,19 @@ class DeepseekV4MTPModule(nn.Module):
 
 _VERIFY_ROWSEQ_VEC = os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_VEC", "0") == "1"
 
+# Per-row-sdpa vec variant (lossless-34 campaign, 2026-07-12): keep the
+# batched projections + gathered ring views (the cheap bulk of the vec win)
+# but issue every sdpa / fused-kernel call PER ROW — kernel class AND batch
+# size identical to the loop's L=1 calls, bitwise by construction, no
+# dependence on kernel batch-invariance. Motivated by the serving gold-gate
+# failure of the fully batched vec: the value-dependent batched-vs-single
+# kernel class (~1 flip per ~6k layer-forwards) that the random-weight
+# ldiff harness is statistically blind to. Only meaningful with
+# EXO_DSV4_VERIFY_ROWSEQ_VEC=1.
+_VERIFY_ROWSEQ_VEC_ROWSDPA = (
+    os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_VEC_ROWSDPA", "0") == "1"
+)
+
 
 def _rowseq_vec_slot_map(idx0: int, keep: int, max_size: int, L: int):
     """Slot sequence for L sequential _update_in_place writes.
@@ -4741,15 +4754,35 @@ class _RowseqVecMixin:
         q_rows = mx.contiguous(q.transpose(0, 2, 1, 3).reshape(
             L, self.n_heads, 1, self.head_dim
         ))
-        out = scaled_dot_product_attention(
-            q_rows,
-            views,
-            views,
-            cache=cache,
-            scale=self.scale,
-            mask=_ring_mask,
-            sinks=_cached_sinks(self, q_rows.dtype),
-        )  # (L, H, 1, D)
+        if _VERIFY_ROWSEQ_VEC_ROWSDPA:
+            # Per-row sdpa over the SAME q_rows/views/mask: each call is
+            # the loop's exact L=1 kernel class and batch size — bitwise
+            # by construction, no kernel-BI dependence.
+            out = mx.concatenate(
+                [
+                    scaled_dot_product_attention(
+                        q_rows[_i : _i + 1],
+                        views[_i : _i + 1],
+                        views[_i : _i + 1],
+                        cache=cache,
+                        scale=self.scale,
+                        mask=_ring_mask,
+                        sinks=_cached_sinks(self, q_rows.dtype),
+                    )
+                    for _i in range(L)
+                ],
+                axis=0,
+            )  # (L, H, 1, D)
+        else:
+            out = scaled_dot_product_attention(
+                q_rows,
+                views,
+                views,
+                cache=cache,
+                scale=self.scale,
+                mask=_ring_mask,
+                sinks=_cached_sinks(self, q_rows.dtype),
+            )  # (L, H, 1, D)
         out = out.reshape(1, L, self.n_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
@@ -4858,13 +4891,16 @@ def _compressed_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
             kv_g = mx.concatenate([vg, pg], axis=2)
         else:
             kv_g = vg
-        if pmask_rows[rows[0]] is not None:
+        if pmask_rows[rows[0]] is not None or _VERIFY_ROWSEQ_VEC_ROWSDPA:
             # A non-None pmask means the mask carries a real False column
             # (the batch pool's deferred slot). Masked sdpa with actual
             # masking is NOT batch-invariant (probe: batched-vs-single
             # DIFF ~1e-3 even under steel-BI) — run these rows per-row,
             # the loop's exact L=1 call. Only flush rows qualify
             # (~1 per compress_ratio), so the cost is negligible.
+            # Under ROWSDPA every row takes this branch: L=1 kernel class
+            # and batch size identical to the loop, bitwise by
+            # construction (no kernel-BI dependence).
             for _gi, _row in enumerate(rows):
                 outs[_row] = scaled_dot_product_attention(
                     q_rows[_row : _row + 1],
@@ -4993,8 +5029,16 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
         # is NOT batch-invariant (probe: ~1e-3 batched-vs-single even
         # under steel-BI). Run those rows per-row (the loop's exact L=1
         # call, ~1 per compress_ratio); batch the clean rows.
-        _clean = [i for i in range(L) if pmask_rows[i] is None]
-        _flush = [i for i in range(L) if pmask_rows[i] is not None]
+        # Under ROWSDPA every row runs per-row — the loop's exact L=1
+        # kernel class and batch size (each row keeps its OWN pooled
+        # view, exactly like the sequential call), bitwise by
+        # construction with no kernel-BI dependence.
+        if _VERIFY_ROWSEQ_VEC_ROWSDPA:
+            _clean = []
+            _flush = list(range(L))
+        else:
+            _clean = [i for i in range(L) if pmask_rows[i] is None]
+            _flush = [i for i in range(L) if pmask_rows[i] is not None]
         row_outs: list = [None] * L
         if _clean:
             _ci = mx.array(_clean, dtype=mx.int32)
@@ -5016,8 +5060,13 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
                 row_outs[_row] = out_c[_gi : _gi + 1]
         for _row in _flush:
             _pm = pmask_rows[_row]
-            _pm = _pm[None] if _pm.ndim == 2 else _pm
-            _sm = mx.take_along_axis(_pm, topk_rows[_row], axis=2)[:, None]
+            if _pm is None:
+                # Clean row routed per-row by ROWSDPA: the loop's L=1
+                # call passes no sparse mask.
+                _sm = None
+            else:
+                _pm = _pm[None] if _pm.ndim == 2 else _pm
+                _sm = mx.take_along_axis(_pm, topk_rows[_row], axis=2)[:, None]
             row_outs[_row] = _sparse_pooled_attention(
                 q_rows[_row : _row + 1],
                 views[_row : _row + 1],
@@ -5045,16 +5094,23 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
                     (len(rows),) + tuple(pooled_rows[rows[0]].shape[1:]),
                 )
                 tg = mx.concatenate([topk_rows[i] for i in rows], axis=0)
-                if pmask_rows[rows[0]] is not None:
+                if (
+                    pmask_rows[rows[0]] is not None
+                    or _VERIFY_ROWSEQ_VEC_ROWSDPA
+                ):
                     # Real False mask entries -> per-row (masked-sdpa
-                    # BI gap; see the main sparse branch).
+                    # BI gap; see the main sparse branch). ROWSDPA routes
+                    # every row here (loop-exact L=1 calls).
                     _pr_outs = []
                     for _i in rows:
                         _pm = pmask_rows[_i]
-                        _pm = _pm[None] if _pm.ndim == 2 else _pm
-                        _sm_i = mx.take_along_axis(
-                            _pm, topk_rows[_i], axis=2
-                        )[:, None]
+                        if _pm is None:
+                            _sm_i = None
+                        else:
+                            _pm = _pm[None] if _pm.ndim == 2 else _pm
+                            _sm_i = mx.take_along_axis(
+                                _pm, topk_rows[_i], axis=2
+                            )[:, None]
                         _pr_outs.append(
                             _sparse_pooled_attention(
                                 q_rows[_i : _i + 1],
@@ -5082,20 +5138,44 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
                     kv_g = mx.concatenate([vg, pg], axis=2)
                 else:
                     kv_g = vg
-                out_g = scaled_dot_product_attention(
-                    q_rows[ridx],
-                    kv_g,
-                    kv_g,
-                    cache=local_cache,
-                    scale=self.scale,
-                    # Loop parity: compressed mode extends the ring mask
-                    # over pooled columns; local mode passes it straight
-                    # (zero-width extension is value-identical).
-                    mask=_extend_mask(
-                        _ring_mask, pmask_rows[rows[0]], int(kv_g.shape[2])
-                    ),
-                    sinks=sinks,
-                )
+                if _VERIFY_ROWSEQ_VEC_ROWSDPA:
+                    # Per-row loop-exact L=1 calls (each row's OWN pmask,
+                    # like the sequential path); see the vec ROWSDPA gate.
+                    out_g = mx.concatenate(
+                        [
+                            scaled_dot_product_attention(
+                                q_rows[_i : _i + 1],
+                                kv_g[_gi : _gi + 1],
+                                kv_g[_gi : _gi + 1],
+                                cache=local_cache,
+                                scale=self.scale,
+                                mask=_extend_mask(
+                                    _ring_mask,
+                                    pmask_rows[_i],
+                                    int(kv_g.shape[2]),
+                                ),
+                                sinks=sinks,
+                            )
+                            for _gi, _i in enumerate(rows)
+                        ],
+                        axis=0,
+                    )
+                else:
+                    out_g = scaled_dot_product_attention(
+                        q_rows[ridx],
+                        kv_g,
+                        kv_g,
+                        cache=local_cache,
+                        scale=self.scale,
+                        # Loop parity: compressed mode extends the ring
+                        # mask over pooled columns; local mode passes it
+                        # straight (zero-width extension is
+                        # value-identical).
+                        mask=_extend_mask(
+                            _ring_mask, pmask_rows[rows[0]], int(kv_g.shape[2])
+                        ),
+                        sinks=sinks,
+                    )
             for _gi, _row in enumerate(rows):
                 outs[_row] = out_g[_gi : _gi + 1]
         out = mx.concatenate(outs, axis=0)
