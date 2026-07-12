@@ -1626,11 +1626,18 @@ class PoolingCache(_BaseCache):
         )
         if pushed != expected_pushed or keep > pushed:
             return False
-        # Re-accumulating the committed prefix must not itself flush; when
-        # the committed prefix contains a flush AND a rejected token caused
-        # a later one (multi-flush, only possible at gamma+1 > ratio), fall
-        # back to the commit-forward.
-        return flushes_committed == flushes_total or flushes_committed == 0
+        if flushes_committed == flushes_total or flushes_committed == 0:
+            return True
+        # MIXED attribution (a flush inside the committed prefix AND a
+        # later one caused by a rejected row — only possible at
+        # gamma+1 > ratio): cache-level partial restore is exact ONLY
+        # when every stashed push is a single row (the rowseq per-row
+        # decode path) — then each committed flush's pooled entry was
+        # computed row-sequentially by the verify and is bitwise equal
+        # to sequential decode's, so it can simply be KEPT. A batched
+        # prompt-mode push computes pooled entries with different
+        # numerics; those verifies keep the commit-forward fallback.
+        return all(kv.shape[1] == 1 for kv, _, _ in self._spec_pushed or [])
 
     def spec_rollback(self, snap, keep):
         rem0 = snap[2]
@@ -1639,7 +1646,7 @@ class PoolingCache(_BaseCache):
         )
         if flushes_committed == flushes_total:
             self.trim(pushed - keep)
-        else:
+        elif flushes_committed == 0:
             self.restore_meta(snap)
             done = 0
             for kv, gate, offset in self._spec_pushed or []:
@@ -1651,6 +1658,47 @@ class PoolingCache(_BaseCache):
                 )
                 assert r_kv.shape[1] == 0, "spec_rollback re-push flushed"
                 done += take
+        else:
+            # MIXED: keep the committed-prefix flushes, drop the
+            # rejected-row flushes, rebuild the remainder from the
+            # stashed committed tail. No model forward, no compress.
+            #
+            # Slot layout: under per-row pushes every prior pending bump
+            # is committed by the next row's commit_pending before that
+            # row's flush writes, so flush i wrote storage slot
+            # total0 + (i-1). The first flushes_committed entries are
+            # therefore in place and bitwise-sequential; rewinding the
+            # visible+pending total to total0 + flushes_committed hides
+            # exactly the rejected-row entries (their slots are
+            # overwritten by future flushes, as usual for the deferred
+            # write path). Distributing the total entirely into
+            # _pool_offset is safe: every pool-state reader commits
+            # pending first (Compressor.__call__ top), so only the sum
+            # is observable.
+            pool_offset0, pending0 = snap[0], snap[1]
+            self._pool_offset = pool_offset0 + pending0 + flushes_committed
+            self._pending_offset_bump = 0
+            # New remainder = committed rows past the last committed
+            # flush boundary. In the mixed case rem0 < ratio <=
+            # flushes_committed * ratio, so these rows are all stashed
+            # verify rows (the last new_rem of the keep committed rows).
+            new_rem = (rem0 + keep) % self.ratio
+            if new_rem > 0:
+                rows_kv = []
+                rows_gate = []
+                done = 0
+                for kv, gate, _offset in self._spec_pushed or []:
+                    if done == keep:
+                        break
+                    take = min(keep - done, kv.shape[1])
+                    rows_kv.append(kv[:, :take])
+                    rows_gate.append(gate[:, :take])
+                    done += take
+                tail_kv = mx.concatenate(rows_kv, axis=1)[:, -new_rem:]
+                tail_gate = mx.concatenate(rows_gate, axis=1)[:, -new_rem:]
+                self.buf_kv[:, :new_rem] = tail_kv
+                self.buf_gate[:, :new_rem] = tail_gate
+            self.remainder = new_rem
         self._spec_pushed = None
 
     def size(self):
@@ -2076,26 +2124,42 @@ class BatchPoolingCache(_BaseCache):
         # stream keeps its flushes (trim is exact per stream — remainder/
         # _processed decrement uniformly), or NO stream's committed prefix
         # flushed (restore + re-accumulate cannot re-flush for any stream).
-        # Mixed flush attribution across streams -> commit-forward.
-        return all(ft == fc for ft, fc in per_stream) or all(
+        if all(ft == fc for ft, fc in per_stream) or all(
             fc == 0 for _, fc in per_stream
+        ):
+            return True
+        # MIXED attribution (committed-prefix flush AND rejected-row
+        # flush, gamma+1 > ratio): partial restore is exact when B == 1
+        # and every stashed push is a single row (rowseq per-row decode
+        # path) — the committed flushes' pooled entries were computed
+        # row-sequentially by the verify (bitwise = sequential decode)
+        # and are simply KEPT. B > 1 or batched pushes -> commit-forward.
+        return len(snap[0]) == 1 and all(
+            kv.shape[1] == 1 for kv, _, _ in self._spec_pushed or []
         )
 
     def spec_rollback(self, snap, keep):
         pushed, per_stream = self._spec_stream_flushes(snap, keep)
         trim_branch = all(ft == fc for ft, fc in per_stream)
+        restore_branch = not trim_branch and all(
+            fc == 0 for _, fc in per_stream
+        )
         if os.environ.get("EXO_DSV4_SPEC_RB_LOG") == "1":
             import sys as _srb_sys
 
+            _branch = (
+                "trim" if trim_branch
+                else ("restore" if restore_branch else "mixed")
+            )
             _srb_sys.stderr.write(
                 f"[SPEC-RB] pool id={id(self) % 100000} ratio={self.ratio} "
                 f"rem0={snap[1]} rem_now={self.remainder} keep={keep} "
                 f"pushed={pushed} fl={per_stream} "
-                f"branch={'trim' if trim_branch else 'restore'}\n"
+                f"branch={_branch}\n"
             )
         if trim_branch:
             self.trim(pushed - keep)
-        else:
+        elif restore_branch:
             self.restore_meta(snap)
             done = 0
             for kv, gate, offset in self._spec_pushed or []:
@@ -2107,6 +2171,60 @@ class BatchPoolingCache(_BaseCache):
                 )
                 assert r_kv.shape[1] == 0, "spec_rollback re-push flushed"
                 done += take
+        else:
+            # MIXED, B == 1 (gated by spec_can_rollback): keep the
+            # committed-prefix flushes, drop the rejected-row flushes,
+            # rebuild the remainder from the stashed committed tail. No
+            # model forward, no compress.
+            #
+            # Slot layout: update_and_fetch_deferred refuses to run with
+            # an uncommitted bump, so every flush wrote at the committed
+            # _pool_lengths of its moment — flush i sits at storage slot
+            # total0 + (i-1). The first flushes_committed entries are in
+            # place and bitwise-sequential; rewinding the length+pending
+            # TOTAL to total0 + flushes_committed hides exactly the
+            # rejected-row entries. Only the total is observable:
+            # commit_pending runs at the top of every Compressor call
+            # before any read of pool state.
+            fc = per_stream[0][1]
+            rem0 = snap[1][0]
+            total0 = snap[0][0] + snap[5][0]
+            new_width = total0 + fc
+            self._pool_lengths = [new_width]
+            self._pending_bumps = [0]
+            # trim() keeps _processed - remainder invariant the same way:
+            # sequential decode after `keep` committed rows sits at
+            # processed0 + keep.
+            self._processed = [snap[2][0] + keep]
+            # In the mixed case rem0 < ratio <= fc * ratio, so the new
+            # remainder rows are all stashed verify rows (the last
+            # new_rem of the keep committed rows).
+            new_rem = (rem0 + keep) % self.ratio
+            self.remainder = [new_rem]
+            if new_rem > 0:
+                rows_kv = []
+                rows_gate = []
+                done = 0
+                for kv, gate, _offset in self._spec_pushed or []:
+                    if done == keep:
+                        break
+                    take = min(keep - done, kv.shape[1])
+                    rows_kv.append(kv[:, :take])
+                    rows_gate.append(gate[:, :take])
+                    done += take
+                tail_kv = mx.concatenate(rows_kv, axis=1)[:, -new_rem:]
+                tail_gate = mx.concatenate(rows_gate, axis=1)[:, -new_rem:]
+                self.buf_kv[:, :new_rem] = tail_kv
+                self.buf_gate[:, :new_rem] = tail_gate
+            # Width discipline (see save_meta): slice off the rejected
+            # flushes' deferred-write pad so subsequent forwards attend
+            # over the SAME K-width sequential decode would; sequential's
+            # storage after fc flushes is exactly new_width columns and
+            # its _visible_width equals it (flush rows return the padded
+            # storage; non-flush rows commit_pending to storage width).
+            if self.pooled is not None and self.pooled.shape[1] > new_width:
+                self.pooled = self.pooled[:, :new_width]
+            self._visible_width = new_width
         self._spec_pushed = None
 
     def save_meta(self):
