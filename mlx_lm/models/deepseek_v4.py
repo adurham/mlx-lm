@@ -4518,6 +4518,230 @@ class DeepseekV4MTPModule(nn.Module):
         return logits
 
 
+class DSparkLocalAttention(LocalAttention):
+    """LocalAttention with the two DSpark entry points.
+
+    The DSpark draft attends over a rotating WINDOW of context KV — computed
+    from the projected target hiddens (``main_x``), NOT from the draft's own
+    outputs — plus the current block's KV, bidirectionally within the block
+    (reference: DSparkAttention in DeepSeek-V4-Flash-DSpark/inference/model.py).
+    Both entry points reuse this layer's own wkv/kv_norm/rope, so the only
+    deltas vs LocalAttention.__call__ are WHICH input feeds kv and that the
+    block rows see no causal mask.
+    """
+
+    def append_ctx(self, main_x: mx.array, cache: Any) -> None:
+        """Push context KV (from projected target hiddens) into the window.
+
+        No attention output — this is the reference's start_pos==0 branch and
+        the per-round ``main_kv`` append, generalized to L new positions.
+        """
+        B, L, _ = main_x.shape
+        offset = cache.offset
+        kv = self.kv_norm(self.wkv(main_x)).reshape(B, 1, L, self.head_dim)
+        kv = _rope_dispatch(self.rope, kv, offset)
+        if _FP32_ACT and kv.dtype == mx.float32:
+            kv = kv.astype(mx.bfloat16)
+        cache.update_and_fetch(kv, _zero_values(B, L))
+
+    def draft_block(self, x: mx.array, cache: Any) -> mx.array:
+        """Attend the draft block (anchor + masks) over [ctx window; block].
+
+        The block KV is pushed into the cache for the duration of the sdpa
+        and the CALLER trims it back out afterwards (same rotating-ring trim
+        discipline the speculative verify path uses everywhere). mask=None ⇒
+        full bidirectional attention within the block and over the window,
+        matching the reference topk_idxs [window slots + block slots].
+        """
+        B, L, _ = x.shape
+        offset = cache.offset
+        q_lora, kv_pre = self._project_qa_kv(x)
+        q = _q_finalize(
+            self.wq_b(self.q_norm(q_lora)),
+            B, L, self.n_heads, self.head_dim,
+            self.config.rms_norm_eps,
+        )
+        kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+        q = _rope_dispatch(self.rope, q, offset)
+        kv = _rope_dispatch(self.rope, kv, offset)
+        if _FP32_ACT and kv.dtype == mx.float32:
+            kv = kv.astype(mx.bfloat16)
+        kv_full, _ = cache.update_and_fetch(kv, _zero_values(B, L))
+        out = scaled_dot_product_attention(
+            q,
+            kv_full,
+            kv_full,
+            cache=cache,
+            scale=self.scale,
+            mask=None,
+            sinks=_cached_sinks(self, q.dtype),
+        )
+        out = _rope_dispatch(self.rope, out, offset, inverse=True)
+        out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
+        out = self.wo_a(out)
+        out = _o_pre_b(out)
+        return self.wo_b(out)
+
+
+class DeepseekV4DSparkStage(nn.Module):
+    """One DSpark draft block (``decoder.{idx}.*`` in the dedicated head).
+
+    Body is a standard DSv4 decoder block (hc/attn/MoE-ffn) with
+    DSparkLocalAttention. Stage 0 additionally owns the target-context
+    projection (main_proj/main_norm); the LAST stage owns the output side
+    (norm, hc_head, markov + confidence heads) — attached by the module.
+    """
+
+    def __init__(self, config: ModelArgs, stage_idx: int):
+        super().__init__()
+        self.config = config
+        self.stage_idx = stage_idx
+        body_layer_idx = config.num_hidden_layers + stage_idx
+        self.attn = DSparkLocalAttention(config, body_layer_idx)
+        self.ffn = DeepseekV4MoE(config, body_layer_idx)
+        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_hc = HyperConnection(config)
+        self.ffn_hc = HyperConnection(config)
+
+    def __call__(
+        self, x: mx.array, block_ids: mx.array, cache: Any
+    ) -> mx.array:
+        residual = x
+        x_in, post, comb = self.attn_hc(x)
+        x_attn = self.attn.draft_block(self.attn_norm(x_in), cache)
+        x = hc_expand(x_attn, residual, post, comb)
+
+        residual = x
+        x_in, post, comb = self.ffn_hc(x)
+        x_ffn = self.ffn(self.ffn_norm(x_in), block_ids)
+        return hc_expand(x_ffn, residual, post, comb)
+
+
+class DeepseekV4DSparkModule(nn.Module):
+    """DSpark 3-stage semi-autoregressive draft head (arXiv:2607.05147).
+
+    Replaces MTP-1 self-chaining: ONE parallel forward over
+    ``[anchor, noise×(block_size−1)]`` produces base logits for all
+    ``block_size`` draft positions; a rank-``markov_rank`` first-order
+    transition bias then injects intra-block dependency during a lightweight
+    sequential sampling loop; a confidence head scores per-position prefix
+    survival. Context conditioning: the target model's hc-MEAN hidden states
+    at ``dspark_target_layer_ids``, concatenated, projected by stage-0's
+    main_proj, feed every stage's rotating window ctx-KV cache via
+    ``append_ctx`` — the caller pushes committed positions' hiddens each
+    round (and rolls back rejected ones with the standard ring trims).
+    """
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.block_size = int(getattr(config, "dspark_block_size", 5))
+        self.noise_token_id = int(getattr(config, "dspark_noise_token_id", 128799))
+        self.markov_rank = int(getattr(config, "dspark_markov_rank", 256))
+        self.target_layer_ids = list(
+            getattr(config, "dspark_target_layer_ids", [40, 41, 42])
+        )
+        n_stages = int(getattr(config, "n_mtp_layers", 3))
+        self.stages = [DeepseekV4DSparkStage(config, i) for i in range(n_stages)]
+
+        h = config.hidden_size
+        # stage-0 extras (kept on the module; sanitize maps decoder.0.* here)
+        self.main_proj = nn.Linear(len(self.target_layer_ids) * h, h, bias=False)
+        self.main_norm = nn.RMSNorm(h, eps=config.rms_norm_eps)
+        # last-stage extras
+        self.norm = nn.RMSNorm(h, eps=config.rms_norm_eps)
+        self.hc_head = HyperHead(config)
+        self.markov_w1 = nn.Embedding(config.vocab_size, self.markov_rank)
+        self.markov_w2 = nn.Linear(self.markov_rank, config.vocab_size, bias=False)
+        self.confidence_proj = nn.Linear(h + self.markov_rank, 1, bias=False)
+
+    def make_cache(self) -> list:
+        return [
+            RotatingKVCache(max_size=self.config.sliding_window)
+            for _ in self.stages
+        ]
+
+    def project_ctx(self, main_hidden_cat: mx.array) -> mx.array:
+        """(B, L, n_layers*hidden) concatenated target hc-means → main_x."""
+        return self.main_norm(self.main_proj(main_hidden_cat))
+
+    def append_ctx(self, main_hidden_cat: mx.array, caches: list) -> None:
+        main_x = self.project_ctx(main_hidden_cat)
+        for stage, c in zip(self.stages, caches):
+            stage.attn.append_ctx(main_x, c)
+
+    def draft(
+        self,
+        anchor_tokens: mx.array,          # (B,)
+        embed_tokens: nn.Embedding,
+        lm_head: Any,
+        caches: list,
+        *,
+        temperature: float = 0.0,
+        sample_fn: Optional[Any] = None,  # (logits(B,V), step) -> tokens(B,)
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """One parallel draft round.
+
+        Returns (draft_tokens (B, block_size-1... see note), corrected_logits
+        (B, block_size, V), confidence (B, block_size) fp32 sigmoid-inputs).
+        Position 0 of the block IS the anchor: its sampled token is draft #1.
+        The caller trims every stage cache by ``block_size`` afterwards
+        (block KV must not persist as context) and appends real ctx for
+        whatever gets committed.
+        """
+        B = anchor_tokens.shape[0]
+        bs = self.block_size
+        block_ids = mx.concatenate(
+            [
+                anchor_tokens[:, None],
+                mx.full((B, bs - 1), self.noise_token_id, dtype=anchor_tokens.dtype),
+            ],
+            axis=1,
+        )
+
+        x = embed_tokens(block_ids)
+        if _FP32_ACT:
+            x = x.astype(mx.float32)
+        x = mx.broadcast_to(
+            x[:, :, None, :], (B, bs, self.config.hc_mult, x.shape[-1])
+        )
+        x = mx.contiguous(x)
+
+        for stage, c in zip(self.stages, caches):
+            x = stage(x, block_ids, c)
+
+        x = self.hc_head(x)                     # (B, bs, hidden) pre-norm
+        base_logits = lm_head(self.norm(x))     # (B, bs, V)
+
+        # Sequential Markov loop: bias_k = W2(W1[x_{k-1}]), sample left→right.
+        prev = anchor_tokens
+        toks, logits_out, m_embeds = [], [], []
+        for k in range(bs):
+            m_emb = self.markov_w1(prev)                    # (B, r)
+            step_logits = base_logits[:, k, :] + self.markov_w2(m_emb)
+            if sample_fn is not None:
+                nxt = sample_fn(step_logits, k)
+            elif temperature and temperature > 0:
+                nxt = mx.random.categorical(step_logits / temperature)
+            else:
+                nxt = mx.argmax(step_logits, axis=-1)
+            toks.append(nxt)
+            logits_out.append(step_logits[:, None, :])
+            m_embeds.append(m_emb[:, None, :])
+            prev = nxt
+
+        draft_tokens = mx.stack(toks, axis=1)               # (B, bs)
+        corrected = mx.concatenate(logits_out, axis=1)       # (B, bs, V)
+        m_embed = mx.concatenate(m_embeds, axis=1)           # (B, bs, r)
+        conf_in = mx.concatenate([x.astype(mx.float32),
+                                  m_embed.astype(mx.float32)], axis=-1)
+        confidence = mx.sigmoid(
+            self.confidence_proj(conf_in).squeeze(-1)
+        )                                                    # (B, bs)
+        return draft_tokens, corrected, confidence
+
+
 class DeepseekV4Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
