@@ -459,6 +459,7 @@ def generate_step(
         _step_high = int(_os.environ.get("EXO_PREFILL_STEP_SIZE_HIGH_CTX", "0"))
         _crossover = int(_os.environ.get("EXO_PREFILL_STEP_SIZE_CROSSOVER", "0"))
         _adaptive = _step_high > 0 and _crossover > 0 and _step_low > _step_high
+        _chunk_idx = 0
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             if _adaptive:
@@ -484,7 +485,19 @@ def generate_step(
                 if input_embeddings is not None
                 else input_embeddings
             )
-            mx.clear_cache()
+            # EXO_PREFILL_CLEAR_CACHE_INTERVAL (default 1): clear the MLX
+            # Metal buffer cache every N prefill chunks instead of every
+            # chunk. Each clear_cache forces the allocator to release and
+            # re-acquire multi-GB KV buffers — at 1024 tokens/chunk across a
+            # 500K prefill that's ~500 release/re-acquire cycles. Setting N>1
+            # amortizes this overhead across chunks. The cache still holds
+            # freed buffers for reuse between clears (MLX's pool), so memory
+            # grows by at most (N-1) chunks' worth of intermediates before the
+            # next clear. Safe default (1) preserves original behavior.
+            _clear_interval = int(_os.environ.get("EXO_PREFILL_CLEAR_CACHE_INTERVAL", "1"))
+            _chunk_idx += 1
+            if _chunk_idx % _clear_interval == 0:
+                mx.clear_cache()
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
