@@ -4587,13 +4587,26 @@ _VERIFY_ROWSEQ_VEC = os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_VEC", "0") == "1"
 # inverse-rope + o-proj tail per row — the only remaining batched piece
 # is the gathered ring view + single manual write, bitwise-proven by the
 # increment 1-4 harnesses.
+#
+# Level 2's output is BYTE-IDENTICAL to level 1's on the serving gate
+# (3/3, separate deployments) — so the batched projections/o-proj are
+# output-NEUTRAL and the loop-divergence lives in the vec cache
+# mechanics both levels share (gathered views / manual end-state write /
+# shared pre-write mask / one-entry spec stash). Level 3 is the inverse
+# bet: KEEP the proven-neutral batched projections + batched o-proj
+# tail, and make the per-row attention body the REAL loop — real
+# update_and_fetch (stash + bookkeeping exact), real per-row
+# _rowseq_row_mask, real post-write buffer reads. Loop-exact cache
+# mechanics by construction; the speed win is hoisting ~6 quantized
+# matmul dispatches per layer out of the row loop.
 try:
     _VERIFY_ROWSEQ_VEC_ROWSDPA = int(
         os.environ.get("EXO_DSV4_VERIFY_ROWSEQ_VEC_ROWSDPA", "0") or "0"
     )
 except ValueError:
     _VERIFY_ROWSEQ_VEC_ROWSDPA = 0
-_ROWSDPA_ROWPROJ = _VERIFY_ROWSEQ_VEC_ROWSDPA >= 2
+_ROWSDPA_ROWPROJ = _VERIFY_ROWSEQ_VEC_ROWSDPA == 2
+_ROWSDPA_LOOPREAL = _VERIFY_ROWSEQ_VEC_ROWSDPA >= 3
 
 
 def _rowsdpa_project_rows(self: Any, x: mx.array, offset0):
@@ -4624,6 +4637,191 @@ def _rowsdpa_project_rows(self: Any, x: mx.array, offset0):
         mx.concatenate(q_parts, axis=2),
         mx.concatenate(kv_parts, axis=2),
         q_res_rows,
+    )
+
+
+def _rowsdpa_hoisted_qkv(self: Any, x: mx.array, offset0):
+    """Batched q/kv projections + rope-in (ROWSDPA level 3 hoist).
+
+    The exact batched block levels 1-2 proved output-neutral vs the
+    loop's per-row projections (level-1 vs level-2 gate outputs were
+    byte-identical). Returns (q_rows (L,H,1,D) contiguous, kv (B,1,L,D)
+    roped, q_residual (B,L,rank) for the sparse indexer).
+    """
+    B, L, _ = x.shape
+    q_lora, kv_pre = self._project_qa_kv(x)
+    q_residual = self.q_norm(q_lora)
+    q = _q_finalize(
+        self.wq_b(q_residual),
+        B, L, self.n_heads, self.head_dim,
+        self.config.rms_norm_eps,
+    )
+    kv = self.kv_norm(kv_pre).reshape(B, 1, L, self.head_dim)
+    q = _rope_dispatch(self.rope, q, offset0)
+    kv = _rope_dispatch(self.rope, kv, offset0)
+    if _FP32_ACT and kv.dtype == mx.float32:
+        kv = kv.astype(mx.bfloat16)
+    q_rows = mx.contiguous(
+        q.transpose(0, 2, 1, 3).reshape(L, self.n_heads, 1, self.head_dim)
+    )
+    return q_rows, kv, q_residual
+
+
+def _rowsdpa_oproj_batched(
+    self: Any, out_rows: mx.array, offset0, batch_size: int, seq_len: int
+) -> mx.array:
+    """Batched inverse-rope + o-proj tail over per-row sdpa outputs
+    (ROWSDPA level 3 hoist; the level-1 tail, proven output-neutral).
+    out_rows: (L, H, 1, D)."""
+    out = out_rows.reshape(
+        1, seq_len, self.n_heads, self.head_dim
+    ).transpose(0, 2, 1, 3)
+    out = _rope_dispatch(self.rope, out, offset0, inverse=True)
+    out = _o_pre_a(out, batch_size, self.o_groups, seq_len, self.head_dim)
+    out = self.wo_a(out)
+    out = _o_pre_b(out)
+    return self.wo_b(out)
+
+
+def _rowsdpa_row_mask(x_row: mx.array, cache: Any):
+    """The mask the rowseq LOOP layer would pass for this row (built at
+    the row's pre-update cache state, layer lines at the rowseq dispatch:
+    row mask only under EXO_DSV4_ROWSEQ_ROWMASK at B==1, else None)."""
+    if _VERIFY_ROWSEQ_ROWMASK and x_row.shape[0] == 1:
+        return _rowseq_row_mask(x_row, cache)
+    return None
+
+
+def _local_rowseq_vec_loopreal(self: Any, x: mx.array, cache: Any) -> mx.array:
+    """ROWSDPA level 3, LocalAttention: hoisted projections over the REAL
+    per-row loop body (LocalAttention.__call__ at L=1: real
+    update_and_fetch, real row mask, real post-write buffer sdpa)."""
+    B, L, _ = x.shape
+    offset = cache.offset
+    offset = mx.array(offset) if isinstance(offset, mx.array) else offset
+    q_rows, kv, _ = _rowsdpa_hoisted_qkv(self, x, offset)
+    sinks = _cached_sinks(self, q_rows.dtype)
+    outs: list = []
+    for _i in range(L):
+        _m = _rowsdpa_row_mask(x[:, _i : _i + 1], cache)
+        kv_full, _ = cache.update_and_fetch(
+            kv[..., _i : _i + 1, :], _zero_values(B, 1)
+        )
+        _m = _clamp_mask_to_kv(_m, kv_full.shape[2])
+        outs.append(
+            scaled_dot_product_attention(
+                q_rows[_i : _i + 1],
+                kv_full,
+                kv_full,
+                cache=cache,
+                scale=self.scale,
+                mask=_m,
+                sinks=sinks,
+            )
+        )
+    return _rowsdpa_oproj_batched(
+        self, mx.concatenate(outs, axis=0), offset, B, L
+    )
+
+
+def _compressed_rowseq_vec_loopreal(
+    self: Any, x: mx.array, cache: Any
+) -> mx.array:
+    """ROWSDPA level 3, CompressedAttention: hoisted projections over the
+    REAL per-row loop body (__call__ at L=1: real compressor order, real
+    update_and_fetch, real pmask/_extend_mask)."""
+    local_cache, pool_cache = cache[0], cache[1]
+    B, L, _ = x.shape
+    offset0 = local_cache.offset
+    offset0 = mx.array(offset0) if isinstance(offset0, mx.array) else offset0
+    q_rows, kv, _ = _rowsdpa_hoisted_qkv(self, x, offset0)
+    sinks = _cached_sinks(self, q_rows.dtype)
+    outs: list = []
+    for _i in range(L):
+        _m = _rowsdpa_row_mask(x[:, _i : _i + 1], cache)
+        pooled_i = self.compressor(x[:, _i : _i + 1], pool_cache, offset0 + _i)
+        kv_full, _ = local_cache.update_and_fetch(
+            kv[..., _i : _i + 1, :], _zero_values(B, 1)
+        )
+        pmask_i = None
+        if pooled_i.shape[1] > 0:
+            pmask_i = _dispatch_pmask(pool_cache, 1, offset0 + _i)
+            kv_full = mx.concatenate([kv_full, pooled_i[:, None]], axis=2)
+        _m = _extend_mask(_m, pmask_i, kv_full.shape[2])
+        outs.append(
+            scaled_dot_product_attention(
+                q_rows[_i : _i + 1],
+                kv_full,
+                kv_full,
+                cache=local_cache,
+                scale=self.scale,
+                mask=_m,
+                sinks=sinks,
+            )
+        )
+    return _rowsdpa_oproj_batched(
+        self, mx.concatenate(outs, axis=0), offset0, B, L
+    )
+
+
+def _sparse_rowseq_vec_loopreal(
+    self: Any, x: mx.array, cache: Any
+) -> mx.array:
+    """ROWSDPA level 3, SparseCompressedAttention: hoisted projections
+    over the REAL per-row loop body (__call__ at L=1: real compressor /
+    update / pmask / indexer order, real mode dispatch, real
+    _sparse_pooled_attention L_q=1 call)."""
+    local_cache, comp_cache, idx_cache = cache[0], cache[1], cache[2]
+    B, L, _ = x.shape
+    offset0 = local_cache.offset
+    offset0 = mx.array(offset0) if isinstance(offset0, mx.array) else offset0
+    q_rows, kv, q_residual = _rowsdpa_hoisted_qkv(self, x, offset0)
+    sinks = _cached_sinks(self, q_rows.dtype)
+    topk_k = self.indexer.index_topk
+    outs: list = []
+    for _i in range(L):
+        _xi = x[:, _i : _i + 1]
+        _m = _rowsdpa_row_mask(_xi, cache)
+        pooled_i = self.compressor(_xi, comp_cache, offset0 + _i)
+        kv_full, _ = local_cache.update_and_fetch(
+            kv[..., _i : _i + 1, :], _zero_values(B, 1)
+        )
+        pmask_i = _dispatch_pmask(comp_cache, 1, offset0 + _i)
+        topk_i = self.indexer(
+            _xi,
+            q_residual[:, _i : _i + 1],
+            self.rope,
+            idx_cache,
+            offset0 + _i,
+        )
+        q_i = q_rows[_i : _i + 1]
+        if pooled_i.shape[1] == 0:
+            out_i = scaled_dot_product_attention(
+                q_i, kv_full, kv_full,
+                cache=local_cache, scale=self.scale, mask=_m, sinks=sinks,
+            )
+        elif pooled_i.shape[1] <= topk_k:
+            full_kv = mx.concatenate([kv_full, pooled_i[:, None]], axis=2)
+            _m2 = _extend_mask(_m, pmask_i, full_kv.shape[2])
+            out_i = scaled_dot_product_attention(
+                q_i, full_kv, full_kv,
+                cache=local_cache, scale=self.scale, mask=_m2, sinks=sinks,
+            )
+        else:
+            sparse_mask = None
+            if pmask_i is not None:
+                sparse_mask = mx.take_along_axis(
+                    pmask_i[None] if pmask_i.ndim == 2 else pmask_i,
+                    topk_i,
+                    axis=2,
+                )[:, None]
+            out_i = _sparse_pooled_attention(
+                q_i, kv_full, pooled_i, topk_i, _m, sparse_mask,
+                self.scale, sinks,
+            )
+        outs.append(out_i)
+    return _rowsdpa_oproj_batched(
+        self, mx.concatenate(outs, axis=0), offset0, B, L
     )
 
 
@@ -4788,6 +4986,8 @@ class _RowseqVecMixin:
         return _VERIFY_ROWSEQ_VEC and _rowseq_vec_ring_ok(cache)
 
     def rowseq_vec(self, x: mx.array, cache: Any) -> mx.array:
+        if _ROWSDPA_LOOPREAL:
+            return _local_rowseq_vec_loopreal(self, x, cache)
         B, L, _ = x.shape
         offset = cache.offset
         # Batch rings carry offset as an mx array MUTATED IN PLACE by the
@@ -4902,6 +5102,8 @@ def _compressed_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
     L=1 decode call configuration (visibility is encoded by cache
     contents; _extend_mask(None, ...) is None).
     """
+    if _ROWSDPA_LOOPREAL:
+        return _compressed_rowseq_vec_loopreal(self, x, cache)
     local_cache, pool_cache = cache[0], cache[1]
     B, L, _ = x.shape
     offset0 = local_cache.offset
@@ -5045,6 +5247,8 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
     storage is append-only, so gathered values are bitwise the sequential
     ones). Sparse masks are the per-row pmask gathers, stacked.
     """
+    if _ROWSDPA_LOOPREAL:
+        return _sparse_rowseq_vec_loopreal(self, x, cache)
     local_cache, comp_cache, idx_cache = cache[0], cache[1], cache[2]
     B, L, _ = x.shape
     offset0 = local_cache.offset
