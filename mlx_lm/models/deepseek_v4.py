@@ -175,6 +175,50 @@ _SEQ_SPLIT_MIN_L = int(os.environ.get("EXO_DSV4_SEQ_SPLIT_MIN_L", "16"))
 _SEQ_SPLIT_GATHER_VIA_ALLSUM = (
     os.environ.get("EXO_DSV4_SEQSPLIT_GATHER_VIA_ALLSUM", "1") == "1"
 )
+# Balanced causal seq-split assignment (default 1). The original split assigns
+# contiguous bands (rank 0 = rows [0:L/2], rank 1 = [L/2:L]) — for causal
+# attention, rank 1's rows attend to ~3x more positions (avg ~3L/4 vs ~L/4),
+# creating a straggler: rank 0 finishes SDPA early and stalls in all_gather
+# waiting for rank 1 (observed 2263ms avg all_gather span with high variance
+# at 300K context). Balanced assignment interleaves sub-chunks so each rank
+# gets an equal share of the causal work: for N=2, split L into 2N sub-chunks
+# and assign every-other sub-chunk to each rank (rank 0 gets [0,2,4..],
+# rank 1 gets [1,3,5..]). Total causal FLOPs per rank are balanced. The
+# zero-padded all_sum reconstruction (GATHER_VIA_ALLSUM) is position-based,
+# so non-contiguous bands work correctly — each rank scatters its output to
+# the correct row positions and zeros elsewhere. Bit-identical math, zero
+# quality risk. Kill switch: =0 restores contiguous bands.
+_SEQ_SPLIT_BALANCED = (
+    os.environ.get("EXO_DSV4_SEQSPLIT_BALANCED", "1") == "1"
+)
+
+
+def _seqsplit_band(rank: int, size: int, L: int) -> tuple[list[int], list[tuple[int, int]]]:
+    """Return (row_indices, contiguous_ranges) for this rank's seq-split band.
+
+    Contiguous (legacy): rows [rank*band : (rank+1)*band].
+    Balanced: L split into 2*size sub-chunks, this rank gets every-other
+    sub-chunk. For causal attention this halves the straggler gap because
+    each rank's total causal FLOPs are ~equal instead of 3:1.
+
+    row_indices is the flat list of row positions this rank owns.
+    contiguous_ranges is [(lo, hi), ...] of contiguous slices that cover
+    row_indices (used by callers that need to slice q/mask contiguously).
+    """
+    band = L // size
+    if not _SEQ_SPLIT_BALANCED or size == 1:
+        lo = rank * band
+        return list(range(lo, lo + band)), [(lo, lo + band)]
+    # Balanced: 2*size sub-chunks, interleaved assignment.
+    sub = L // (2 * size)
+    ranges: list[tuple[int, int]] = []
+    for i in range(2 * size):
+        if i % size == rank:
+            ranges.append((i * sub, (i + 1) * sub))
+    rows: list[int] = []
+    for lo, hi in ranges:
+        rows.extend(range(lo, hi))
+    return rows, ranges
 # fp32-activation batch-invariance fix. When on, the whole forward runs fp32
 # activations (weights stay bf16/quantized) so B=2 verify is batch-invariant.
 # To halve the fp32 memory (the 4000-tok c=2 run faulted the GPU at the 112GB
@@ -3676,14 +3720,24 @@ class CompressedAttention(nn.Module):
                 and L % _sg.size() == 0
             )
             _seq_lo = 0
+            _seq_rows: list[int] | None = None
             if _seq and _sg is not None:
                 _N = _sg.size()
                 _band = L // _N
-                _seq_lo = _sg.rank() * _band
-                _seq_hi = _seq_lo + _band
-                q = q[:, :, _seq_lo:_seq_hi, :]
-                if mask is not None and not isinstance(mask, str):
-                    mask = mask[..., _seq_lo:_seq_hi, :]
+                if _SEQ_SPLIT_BALANCED:
+                    _seq_rows, _seq_ranges = _seqsplit_band(_sg.rank(), _N, L)
+                    _seq_lo = _seq_ranges[0][0]  # for rope offset
+                    # Gather balanced rows into a contiguous buffer for SDPA.
+                    _idx = mx.array(_seq_rows, dtype=mx.int32)
+                    q = q[:, :, _idx, :]
+                    if mask is not None and not isinstance(mask, str):
+                        mask = mask[..., _idx, :]
+                else:
+                    _seq_lo = _sg.rank() * _band
+                    _seq_hi = _seq_lo + _band
+                    q = q[:, :, _seq_lo:_seq_hi, :]
+                    if mask is not None and not isinstance(mask, str):
+                        mask = mask[..., _seq_lo:_seq_hi, :]
 
             with span("attn.sdpa"):
                 if "compressed_attn" in _get_nop_targets():
@@ -3760,15 +3814,26 @@ class CompressedAttention(nn.Module):
                         # each row has exactly one non-zero contributor and
                         # bf16 0+x == x. Avoids the subgroup UC all_gather
                         # (see _SEQ_SPLIT_GATHER_VIA_ALLSUM).
-                        _band_len = out.shape[1]
-                        _full = mx.pad(
-                            out,
-                            (
-                                (0, 0),
-                                (_seq_lo, L - _seq_lo - _band_len),
-                                (0, 0),
-                            ),
-                        )
+                        if _SEQ_SPLIT_BALANCED and _seq_rows is not None:
+                            # Balanced split: scatter non-contiguous rows to
+                            # their correct positions in a full-L zero tensor.
+                            _full = mx.zeros(
+                                (out.shape[0], L, out.shape[-1]),
+                                dtype=out.dtype,
+                            )
+                            _idx_full = mx.array(_seq_rows, dtype=mx.int32)
+                            _full[:, _idx_full, :] = out
+                            _full = finalize(_full)
+                        else:
+                            _band_len = out.shape[1]
+                            _full = mx.pad(
+                                out,
+                                (
+                                    (0, 0),
+                                    (_seq_lo, L - _seq_lo - _band_len),
+                                    (0, 0),
+                                ),
+                            )
                         out = finalize(
                             mx.distributed.all_sum(
                                 _full, group=self.sharding_group
@@ -3881,6 +3946,7 @@ class SparseCompressedAttention(nn.Module):
             _seq_lo = 0
             _seq_hi = L
             _seq_band = None
+            _seq_rows = None  # only set for balanced split in LocalAttention
             if _seq and _sg is not None:
                 _band = L // _sg.size()
                 _seq_lo = _sg.rank() * _band
@@ -4163,15 +4229,26 @@ class SparseCompressedAttention(nn.Module):
                         # each row has exactly one non-zero contributor and
                         # bf16 0+x == x. Avoids the subgroup UC all_gather
                         # (see _SEQ_SPLIT_GATHER_VIA_ALLSUM).
-                        _band_len = out.shape[1]
-                        _full = mx.pad(
-                            out,
-                            (
-                                (0, 0),
-                                (_seq_lo, L - _seq_lo - _band_len),
-                                (0, 0),
-                            ),
-                        )
+                        if _SEQ_SPLIT_BALANCED and _seq_rows is not None:
+                            # Balanced split: scatter non-contiguous rows to
+                            # their correct positions in a full-L zero tensor.
+                            _full = mx.zeros(
+                                (out.shape[0], L, out.shape[-1]),
+                                dtype=out.dtype,
+                            )
+                            _idx_full = mx.array(_seq_rows, dtype=mx.int32)
+                            _full[:, _idx_full, :] = out
+                            _full = finalize(_full)
+                        else:
+                            _band_len = out.shape[1]
+                            _full = mx.pad(
+                                out,
+                                (
+                                    (0, 0),
+                                    (_seq_lo, L - _seq_lo - _band_len),
+                                    (0, 0),
+                                ),
+                            )
                         out = finalize(
                             mx.distributed.all_sum(
                                 _full, group=self.sharding_group
