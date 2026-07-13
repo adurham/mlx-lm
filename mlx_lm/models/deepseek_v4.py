@@ -1410,6 +1410,46 @@ _VERIFY_ROWSEQ_ROWMASK = (
     os.environ.get("EXO_DSV4_ROWSEQ_ROWMASK", "0") == "1"
 )
 
+# EXO_DSV4_ATTN_ALLSUM=0: skip the attention-tail all_sum on
+# sharding_group. DSv4 REPLICATES attention on every rank (MoE-only
+# sharding), yet the seq-split strategy sets sharding_group on the
+# compressed/sparse classes, so the legacy tail all_sum SUMS TWO
+# (near-)identical replicas — ~2x the attention branch on multi-node vs
+# a single node's numerics (the 2026-07-12 vec gold-gate root cause was
+# the vec paths missing this same all_sum). Default 1 preserves the
+# long-standing 2-node numerics; 0 is the single-node-reference
+# semantics under investigation. Applies ONLY to the attention tails —
+# the MoE sum_gradients/all_sum is a real sharded reduction, untouched.
+_ATTN_ALLSUM = os.environ.get("EXO_DSV4_ATTN_ALLSUM", "1") == "1"
+
+# EXO_DSV4_ALLSUM_PROBE=<path>: append pre/post norms + a pre-all_sum
+# hash for the first 200 attention-tail all_sums. ratio≈2.0 with
+# rank-equal prehashes (compare the file across nodes) == exact
+# replicated doubling.
+_ALLSUM_PROBE_PATH = os.environ.get("EXO_DSV4_ALLSUM_PROBE", "")
+_ALLSUM_PROBE_REMAINING = [200]
+
+
+def _allsum_probe(layer_idx: int, pre: mx.array, post: mx.array) -> None:
+    if not _ALLSUM_PROBE_PATH or _ALLSUM_PROBE_REMAINING[0] <= 0:
+        return
+    _ALLSUM_PROBE_REMAINING[0] -= 1
+    import hashlib as _ap_hashlib
+
+    import numpy as _ap_np
+
+    mx.eval(pre, post)
+    _pre32 = _ap_np.asarray(pre.astype(mx.float32))
+    _post32 = _ap_np.asarray(post.astype(mx.float32))
+    _pn = float(_ap_np.linalg.norm(_pre32))
+    _qn = float(_ap_np.linalg.norm(_post32))
+    with open(_ALLSUM_PROBE_PATH, "a") as _ap_f:
+        _ap_f.write(
+            f"L{layer_idx:02d} pre={_pn:.6e} post={_qn:.6e} "
+            f"ratio={(_qn / _pn) if _pn else 0.0:.6f} "
+            f"prehash={_ap_hashlib.md5(_pre32.tobytes()).hexdigest()[:12]}\n"
+        )
+
 
 def _rowseq_row_mask(row_h: Any, cache: Any):
     """The mask a REAL single-token decode step would use at the current
@@ -3496,11 +3536,13 @@ class LocalAttention(nn.Module):
                 out = self.wo_b(out)
                 out = finalize(out)
 
-            if self.sharding_group is not None:
+            if self.sharding_group is not None and _ATTN_ALLSUM:
                 with span("attn.all_sum"):
+                    _pre_sum = out
                     out = finalize(
                         mx.distributed.all_sum(out, group=self.sharding_group)
                     )
+                    _allsum_probe(self.layer_idx, _pre_sum, out)
 
             return finalize(out)
 
@@ -3743,11 +3785,13 @@ class CompressedAttention(nn.Module):
                             .transpose(1, 0, 2, 3)
                             .reshape(_B, L, _H)
                         )
-            elif self.sharding_group is not None:
+            elif self.sharding_group is not None and _ATTN_ALLSUM:
                 with span("attn.all_sum"):
+                    _pre_sum = out
                     out = finalize(
                         mx.distributed.all_sum(out, group=self.sharding_group)
                     )
+                    _allsum_probe(self.layer_idx, _pre_sum, out)
 
             return finalize(out)
 
@@ -4144,11 +4188,13 @@ class SparseCompressedAttention(nn.Module):
                             .transpose(1, 0, 2, 3)
                             .reshape(_B, L, _H)
                         )
-            elif self.sharding_group is not None:
+            elif self.sharding_group is not None and _ATTN_ALLSUM:
                 with span("attn.all_sum"):
+                    _pre_sum = out
                     out = finalize(
                         mx.distributed.all_sum(out, group=self.sharding_group)
                     )
+                    _allsum_probe(self.layer_idx, _pre_sum, out)
 
             return finalize(out)
 
@@ -4685,8 +4731,10 @@ def _rowsdpa_sharding_allsum(self: Any, out: mx.array) -> mx.array:
     per-row all_sums (elementwise, row-independent).
     """
     _sg = getattr(self, "sharding_group", None)
-    if _sg is not None:
+    if _sg is not None and _ATTN_ALLSUM:
+        _pre_sum = out
         out = mx.distributed.all_sum(out, group=_sg)
+        _allsum_probe(getattr(self, "layer_idx", -1), _pre_sum, out)
     return out
 
 
