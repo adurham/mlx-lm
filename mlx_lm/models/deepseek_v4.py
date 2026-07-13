@@ -4667,6 +4667,29 @@ def _rowsdpa_hoisted_qkv(self: Any, x: mx.array, offset0):
     return q_rows, kv, q_residual
 
 
+def _rowsdpa_sharding_allsum(self: Any, out: mx.array) -> mx.array:
+    """Mirror the loop tail's `if self.sharding_group is not None:
+    all_sum(out)` (LocalAttention line ~3499 / the compressed & sparse
+    `elif` at their __call__ tails).
+
+    THE serving gold-gate root cause for every vec variant (batched,
+    ROWSDPA 1/2/3): the DSv4 strategy replicates attention but sets
+    attn.sharding_group on Compressed/SparseCompressedAttention when
+    EXO_DSV4_SEQ_SPLIT=1 (prod default), so the LOOP's per-row calls
+    all_sum their outputs while the vec paths never did — a deterministic,
+    rank-level numeric difference on every compressed/sparse layer forward
+    that the single-rank harness (sharding_group=None) can never see.
+    Forensics: layer-hash dump 2026-07-12, first divergence B02.attn_out
+    at pos 129 (first vec-engaged forward) with attn_in and all cache
+    state identical. Batched all_sum over (1,L,hidden) == the loop's L
+    per-row all_sums (elementwise, row-independent).
+    """
+    _sg = getattr(self, "sharding_group", None)
+    if _sg is not None:
+        out = mx.distributed.all_sum(out, group=_sg)
+    return out
+
+
 def _rowsdpa_oproj_batched(
     self: Any, out_rows: mx.array, offset0, batch_size: int, seq_len: int
 ) -> mx.array:
@@ -4680,7 +4703,7 @@ def _rowsdpa_oproj_batched(
     out = _o_pre_a(out, batch_size, self.o_groups, seq_len, self.head_dim)
     out = self.wo_a(out)
     out = _o_pre_b(out)
-    return self.wo_b(out)
+    return _rowsdpa_sharding_allsum(self, self.wo_b(out))
 
 
 def _rowsdpa_row_mask(x_row: mx.array, cache: Any):
@@ -4841,7 +4864,7 @@ def _rowsdpa_oproj_rows(self: Any, out_rows: mx.array, offset0) -> mx.array:
         o_i = _o_pre_a(o_i, 1, self.o_groups, 1, self.head_dim)
         o_i = self.wo_a(o_i)
         o_i = _o_pre_b(o_i)
-        outs.append(self.wo_b(o_i))
+        outs.append(_rowsdpa_sharding_allsum(self, self.wo_b(o_i)))
     return mx.concatenate(outs, axis=1)
 
 
@@ -5060,7 +5083,7 @@ class _RowseqVecMixin:
         out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
         out = self.wo_a(out)
         out = _o_pre_b(out)
-        return self.wo_b(out)
+        return _rowsdpa_sharding_allsum(self, self.wo_b(out))
 
 
 # Attach the vec entry points to LocalAttention (mixin is defined below the
@@ -5213,7 +5236,7 @@ def _compressed_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
     out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
     out = self.wo_a(out)
     out = _o_pre_b(out)
-    return self.wo_b(out)
+    return _rowsdpa_sharding_allsum(self, self.wo_b(out))
 
 
 CompressedAttention.rowseq_vec_supported = _compressed_rowseq_vec_supported
@@ -5479,7 +5502,7 @@ def _sparse_rowseq_vec(self: Any, x: mx.array, cache: Any) -> mx.array:
     out = _o_pre_a(out, B, self.o_groups, L, self.head_dim)
     out = self.wo_a(out)
     out = _o_pre_b(out)
-    return self.wo_b(out)
+    return _rowsdpa_sharding_allsum(self, self.wo_b(out))
 
 
 SparseCompressedAttention.rowseq_vec_supported = _sparse_rowseq_vec_supported
