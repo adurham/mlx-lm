@@ -496,7 +496,18 @@ def generate_step(
                 ),
             )
             quantize_cache_fn(prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
+            # EXO_PREFILL_ASYNC_EVAL (default 0): use mx.async_eval instead of
+            # mx.eval for the cache state, allowing chunk N+1's graph build to
+            # overlap with chunk N's GPU execution. This targets the 7% GPU
+            # idle gap measured by EXO_PREFILL_GPU_TIME. Risk: the lazy graph
+            # grows without bound without periodic sync. Set EXO_PREFILL_EVAL_INTERVAL
+            # (default 1) to force a full mx.eval every N chunks for memory safety.
+            _eval_interval = int(_os.environ.get("EXO_PREFILL_EVAL_INTERVAL", "1"))
+            _use_async = _os.environ.get("EXO_PREFILL_ASYNC_EVAL", "0") == "1"
+            if _use_async and _eval_interval > 1 and _chunk_idx % _eval_interval != _eval_interval - 1:
+                mx.async_eval([c.state for c in prompt_cache])
+            else:
+                mx.eval([c.state for c in prompt_cache])
             # Stop GPU trace capture after the 3rd chunk's eval
             if _trace_started and _chunk_idx == 2:
                 mx.metal.stop_capture()
