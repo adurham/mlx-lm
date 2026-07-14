@@ -503,6 +503,10 @@ def generate_step(
                 _trace_started = False
             # Log GPU time vs wall time for this chunk
             if _gpu_time_probe:
+                # mx.synchronize() forces GPU completion + flushes the
+                # async gpu_time_ns() completion handlers so the reading is
+                # accurate for THIS chunk's work.
+                mx.synchronize()
                 _gpu_ns_delta = mx.metal.gpu_time_ns() - _gpu_ns_start
                 _wall_delta = (time.perf_counter() - _wall_start) * 1e9
                 _gpu_time_sum += _gpu_ns_delta
