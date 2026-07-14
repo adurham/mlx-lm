@@ -2331,7 +2331,7 @@ def _sparse_pooled_attention(
     if _TOPK_DUMP_FILE and L >= 64:
         try:
             import os as _os_topk
-            if _os_topk.exists(_TOPK_DUMP_FILE):
+            if _os_topk.path.exists(_TOPK_DUMP_FILE):
                 _TOPK_DUMP_COUNT[0] += 1
                 if _TOPK_DUMP_COUNT[0] <= _TOPK_DUMP_MAX:
                     import numpy as _np_topk
