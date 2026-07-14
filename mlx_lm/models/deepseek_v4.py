@@ -406,6 +406,14 @@ import time as _nop_time
 _NOP_FILE = "/tmp/dsv4_nop_targets"
 _nop_cache = [0.0, set()]
 
+# ─────────── Top-k diversity dump toggle (2026-07-14 diagnostic) ──────────
+# Presence of /tmp/dsv4_topk_dump enables dumping raw topk indices (B, L, k)
+# to /tmp/dsv4_topk_dump_<N>.npy for offline Jaccard/union-per-tile analysis.
+# Capped to _TOPK_DUMP_MAX dumps to avoid disk fill. No-op when absent.
+_TOPK_DUMP_FILE = "/tmp/dsv4_topk_dump"
+_TOPK_DUMP_COUNT = [0]
+_TOPK_DUMP_MAX = 5
+
 
 def _get_nop_targets():
     now = _nop_time.time()
@@ -2315,6 +2323,24 @@ def _sparse_pooled_attention(
         offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
         topk_flat = (topk + offset).reshape(-1)
         pooled_gathered = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
+    # ─────────── Top-k diversity dump (EXO topk diagnostic, 2026-07-14) ──────────
+    # File toggle: presence of /tmp/dsv4_topk_dump enables dumping the raw topk
+    # indices (B, L, k) for offline Jaccard/union-per-tile analysis. Gated to the
+    # large-L prefill path (L_q == step size) and capped to a few dumps to avoid
+    # disk fill. No-op when the toggle file is absent (production path unchanged).
+    if _TOPK_DUMP_FILE and L >= 64:
+        try:
+            import os as _os_topk
+            if _os_topk.exists(_TOPK_DUMP_FILE):
+                _TOPK_DUMP_COUNT[0] += 1
+                if _TOPK_DUMP_COUNT[0] <= _TOPK_DUMP_MAX:
+                    import numpy as _np_topk
+                    _np_topk.save(
+                        f"/tmp/dsv4_topk_dump_{_TOPK_DUMP_COUNT[0]}.npy",
+                        _np_topk.array(topk),
+                    )
+        except Exception:
+            pass
     # Need (B, 1, L, k, D) for the inner kernel
     pooled_gathered = pooled_gathered[:, None, :, :, :]  # (B, 1, L, k, D)
     sinks_expanded = sinks[None, :, None, None] if sinks is not None else None
