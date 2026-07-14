@@ -460,10 +460,18 @@ def generate_step(
         _crossover = int(_os.environ.get("EXO_PREFILL_STEP_SIZE_CROSSOVER", "0"))
         _adaptive = _step_high > 0 and _crossover > 0 and _step_low > _step_high
         _chunk_idx = 0
+        # EXO_PREFILL_GPU_TIME: log per-chunk GPU time vs wall time.
+        # GPU time from mx.metal.gpu_time_ns() is the ACTUAL GPU execution
+        # time (async, populated by completion handlers). If GPU time ≈ wall
+        # time, the GPU is compute-bound. If GPU time << wall time, there are
+        # idle bubbles (sync/eval/RDMA stalls). This is immune to the lazy-eval
+        # misattribution that makes CPU-side span profiles unreliable.
+        _gpu_time_probe = bool(_os.environ.get("EXO_PREFILL_GPU_TIME"))
+        _gpu_time_sum = 0
+        _wall_time_sum = 0
+        _gpu_time_count = 0
         # EXO_PREFILL_GPU_TRACE: capture a Metal GPU trace of one prefill chunk.
         # Set to a file path (e.g. /tmp/prefill_chunk.gputrace) to capture.
-        # The trace records actual per-kernel GPU timings — immune to the
-        # lazy-eval misattribution that makes CPU-side span profiles unreliable.
         _trace_path = _os.environ.get("EXO_PREFILL_GPU_TRACE", "")
         _trace_started = False
         while total_prompt_tokens - prompt_processed_tokens > 1:
@@ -473,6 +481,8 @@ def generate_step(
             else:
                 _chunk = prefill_step_size
             n_to_process = min(_chunk, remaining)
+            _gpu_ns_start = mx.metal.gpu_time_ns() if _gpu_time_probe else 0
+            _wall_start = time.perf_counter() if _gpu_time_probe else 0
             # Start GPU trace capture on the 3rd chunk (steady state, past warmup)
             if _trace_path and _chunk_idx == 2 and not _trace_started:
                 mx.metal.start_capture(_trace_path)
@@ -491,6 +501,23 @@ def generate_step(
             if _trace_started and _chunk_idx == 2:
                 mx.metal.stop_capture()
                 _trace_started = False
+            # Log GPU time vs wall time for this chunk
+            if _gpu_time_probe:
+                _gpu_ns_delta = mx.metal.gpu_time_ns() - _gpu_ns_start
+                _wall_delta = (time.perf_counter() - _wall_start) * 1e9
+                _gpu_time_sum += _gpu_ns_delta
+                _wall_time_sum += int(_wall_delta)
+                _gpu_time_count += 1
+                if _gpu_time_count % 16 == 0 or _gpu_time_count <= 3:
+                    _ratio = _gpu_ns_delta / _wall_delta * 100 if _wall_delta > 0 else 0
+                    import sys as _gpu_sys
+                    _gpu_sys.stderr.write(
+                        f"[PREFILL_GPU] chunk={_chunk_idx} tok={prompt_processed_tokens} "
+                        f"gpu_ms={_gpu_ns_delta/1e6:.1f} wall_ms={_wall_delta/1e6:.1f} "
+                        f"gpu/wall={_ratio:.0f}% "
+                        f"avg_gpu/wall={_gpu_time_sum/_wall_time_sum*100:.0f}%\n"
+                    )
+                    _gpu_sys.stderr.flush()
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
