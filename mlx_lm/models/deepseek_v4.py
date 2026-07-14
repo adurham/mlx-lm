@@ -412,7 +412,7 @@ _nop_cache = [0.0, set()]
 # Capped to _TOPK_DUMP_MAX dumps to avoid disk fill. No-op when absent.
 _TOPK_DUMP_FILE = "/tmp/dsv4_topk_dump"
 _TOPK_DUMP_COUNT = [0]
-_TOPK_DUMP_MAX = 5
+_TOPK_DUMP_MAX = 500
 
 
 def _get_nop_targets():
