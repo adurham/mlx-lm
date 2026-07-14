@@ -2132,6 +2132,7 @@ def _sparse_pooled_attention(
     pooled_mask: Optional[mx.array],
     scale: float,
     sinks: Optional[mx.array],
+    pooled_gathered: Optional[mx.array] = None,
 ) -> mx.array:
     """Sparse-pooled attention dispatch.
 
@@ -2316,13 +2317,18 @@ def _sparse_pooled_attention(
     # Large L_q (prefill chunk): batched inner kernel.
     # OPT-10 (2026-06-24): reshape+gather instead of take_along_axis on
     # broadcast. 14× faster, does NOT scale with P, B-general.
+    # OPT-11 (2026-07-14): when pooled_gathered is pre-supplied by the caller
+    # (the tiling loop in SparseCompressedAttention), skip the per-tile gather
+    # entirely. The caller gathers once for the full L_q and passes slices.
+    # Saves 16x gather dispatch overhead at L_q=2048, tile=128.
     P_dim = pooled.shape[1]
     k_dim = topk.shape[2]
-    with span("attn.gather"):
-        pooled_flat = pooled.reshape(B * P_dim, D)
-        offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
-        topk_flat = (topk + offset).reshape(-1)
-        pooled_gathered = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
+    if pooled_gathered is None:
+        with span("attn.gather"):
+            pooled_flat = pooled.reshape(B * P_dim, D)
+            offset = (mx.arange(B) * P_dim).reshape(B, 1, 1)
+            topk_flat = (topk + offset).reshape(-1)
+            pooled_gathered = pooled_flat[topk_flat].reshape(B, L, k_dim, D)
     # ─────────── Top-k diversity dump (EXO topk diagnostic, 2026-07-14) ──────────
     # File toggle: presence of /tmp/dsv4_topk_dump enables dumping the raw topk
     # indices (B, L, k) for offline Jaccard/union-per-tile analysis. Gated to the
@@ -4102,7 +4108,49 @@ class SparseCompressedAttention(nn.Module):
                         # mutation here (kv/pooled already built).
                         _Lq = q.shape[2]
                         _tile = _SPARSE_SDPA_TILE
-                        if _tile > 0 and _Lq > _tile:
+                        # OPT-11 (2026-07-14): gather once for the full L_q,
+                        # pass pre-gathered slices to each tile. Saves 16x
+                        # gather dispatch overhead at L_q=2048, tile=128.
+                        # Gate: EXO_DSV4_SINGLE_GATHER (default 1).
+                        _single_gather = (
+                            os.environ.get("EXO_DSV4_SINGLE_GATHER", "1") == "1"
+                            and _tile > 0
+                            and _Lq > _tile
+                        )
+                        if _single_gather:
+                            _B_s = q.shape[0]
+                            _D_s = q.shape[3]
+                            _P_s = pooled.shape[1]
+                            _k_s = topk.shape[2]
+                            with span("attn.gather"):
+                                _pooled_flat = pooled.reshape(_B_s * _P_s, _D_s)
+                                _offset = (mx.arange(_B_s) * _P_s).reshape(_B_s, 1, 1)
+                                _topk_flat = (topk + _offset).reshape(-1)
+                                _pg_full = _pooled_flat[_topk_flat].reshape(
+                                    _B_s, _Lq, _k_s, _D_s
+                                )
+                            _parts = []
+                            for _s in range(0, _Lq, _tile):
+                                _e = min(_s + _tile, _Lq)
+                                _qm = mask
+                                if _qm is not None and not isinstance(_qm, str):
+                                    _qm = _qm[..., _s:_e, :]
+                                _sm = sparse_mask
+                                if _sm is not None:
+                                    _sm = _sm[:, :, _s:_e, :]
+                                _parts.append(_sparse_pooled_attention(
+                                    q[:, :, _s:_e, :],
+                                    kv,
+                                    pooled,
+                                    topk[:, _s:_e, :],
+                                    _qm,
+                                    _sm,
+                                    self.scale,
+                                    sinks,
+                                    pooled_gathered=_pg_full[:, _s:_e, :, :],
+                                ))
+                            out = mx.concatenate(_parts, axis=2)
+                        elif _tile > 0 and _Lq > _tile:
                             _parts = []
                             for _s in range(0, _Lq, _tile):
                                 _e = min(_s + _tile, _Lq)
