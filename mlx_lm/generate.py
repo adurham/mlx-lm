@@ -496,7 +496,7 @@ def generate_step(
             # next clear. Safe default (1) preserves original behavior.
             _clear_interval = int(_os.environ.get("EXO_PREFILL_CLEAR_CACHE_INTERVAL", "1"))
             _chunk_idx += 1
-            if _chunk_idx % _clear_interval == 0:
+            if _clear_interval > 0 and _chunk_idx % _clear_interval == 0:
                 mx.clear_cache()
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
