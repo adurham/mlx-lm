@@ -1526,6 +1526,160 @@ _SPARSE_FUSED_DEBUG = (
 )
 _SPARSE_FUSED_DEBUG_SEEN: set = set()
 
+# OPT-12 (2026-07-14): Fused softmax epilogue kernel for prefill.
+# Replaces the unfused logsumexp+logaddexp+exp chain with one Metal kernel
+# that computes weights directly, eliminating intermediate materialization.
+# Gate: EXO_DSV4_FUSED_SOFTMAX (default 0 — needs A/B validation).
+_FUSED_SOFTMAX = (
+    os.environ.get("EXO_DSV4_FUSED_SOFTMAX", "0") == "1"
+)
+_FUSED_SOFTMAX_KERNEL_CACHE = {}
+
+_FUSED_SOFTMAX_KERNEL_SOURCE = r"""
+uint gid      = thread_position_in_grid.x;
+uint simd_lid = gid % 32;
+uint triple   = gid / 32;
+uint l        = triple % L_;
+uint bh       = triple / L_;
+uint h        = bh % H_;
+uint b        = bh / H_;
+
+constexpr int BD = 32;
+constexpr int N = SW_ + K_;
+constexpr int elems_per_thread = (N + BD - 1) / BD;
+
+float scores_r[elems_per_thread];
+float local_max = -3.3895313892515355e+38f;
+
+for (int i = 0; i < elems_per_thread; i++) {
+    uint idx = simd_lid * elems_per_thread + i;
+    float s = -3.3895313892515355e+38f;
+    if (idx < N) {
+        if (idx < SW_) {
+            s = float(local_scores[((b * H_ + h) * L_ + l) * SW_ + idx]);
+            if (!lmask[((b * L_ + l) * SW_ + idx)]) {
+                s = -3.3895313892515355e+38f;
+            }
+        } else {
+            uint k_idx = idx - SW_;
+            s = float(pooled_scores[((b * H_ + h) * L_ + k_idx)]);
+            if (!pmask[((b * L_ + l) * K_ + k_idx)]) {
+                s = -3.3895313892515355e+38f;
+            }
+        }
+    }
+    scores_r[i] = s;
+    if (s > local_max) local_max = s;
+}
+
+float global_max = simd_max(local_max);
+float sink_val = float(sinks[h]);
+global_max = fmax(global_max, sink_val);
+
+float exp_sum = 0.0f;
+float sink_exp = metal::exp(sink_val - global_max);
+exp_sum += sink_exp;
+for (int i = 0; i < elems_per_thread; i++) {
+    scores_r[i] = metal::exp(scores_r[i] - global_max);
+    exp_sum += scores_r[i];
+}
+float total_exp = simd_sum(exp_sum);
+float inv_total = 1.0f / total_exp;
+
+for (int i = 0; i < elems_per_thread; i++) {
+    uint idx = simd_lid * elems_per_thread + i;
+    if (idx >= N) continue;
+    float w = scores_r[i] * inv_total;
+    if (idx < SW_) {
+        local_weights[((b * H_ + h) * L_ + l) * SW_ + idx] = T(w);
+    } else {
+        uint k_idx = idx - SW_;
+        pooled_weights[((b * H_ + h) * L_ + k_idx)] = T(w);
+    }
+}
+"""
+
+
+def _get_fused_softmax_kernel(H: int, L: int, SW: int, K: int):
+    key = (H, L, SW, K)
+    if key in _FUSED_SOFTMAX_KERNEL_CACHE:
+        return _FUSED_SOFTMAX_KERNEL_CACHE[key]
+    header = f"""
+constant uint H_ = {H};
+constant uint L_ = {L};
+constant uint SW_ = {SW};
+constant uint K_ = {K};
+"""
+    kern = mx.fast.metal_kernel(
+        name=f"fused_softmax_h{H}_l{L}_sw{SW}_k{K}",
+        input_names=["local_scores", "pooled_scores", "lmask", "pmask", "sinks"],
+        output_names=["local_weights", "pooled_weights"],
+        source=_FUSED_SOFTMAX_KERNEL_SOURCE,
+        header=header,
+        ensure_row_contiguous=True,
+    )
+    _FUSED_SOFTMAX_KERNEL_CACHE[key] = kern
+    return kern
+
+
+def _fused_softmax_inner(
+    q_scaled: mx.array,
+    local_kv: mx.array,
+    pooled_gathered: mx.array,
+    local_mask: Optional[mx.array],
+    pooled_mask: Optional[mx.array],
+    sinks_expanded: Optional[mx.array],
+) -> Optional[mx.array]:
+    """Fused softmax epilogue: score matmuls + fused softmax kernel + value matmuls.
+    Returns None on contract miss (caller falls back to the compiled inner)."""
+    B, H, L, D = q_scaled.shape
+    sw = local_kv.shape[2]
+    k_sel = pooled_gathered.shape[3] if pooled_gathered.ndim == 5 else pooled_gathered.shape[2]
+    if (
+        q_scaled.dtype != mx.bfloat16
+        or local_kv.dtype != mx.bfloat16
+        or pooled_gathered.dtype != mx.bfloat16
+        or sinks_expanded is None
+        or local_mask is None
+        or pooled_mask is None
+        or local_mask.dtype != mx.bool_
+        or pooled_mask.dtype != mx.bool_
+    ):
+        return None
+    # Score matmuls (not compiled — run eager)
+    local_scores = q_scaled @ local_kv.swapaxes(-1, -2)
+    pooled_sq = pooled_gathered.squeeze(1)
+    q_bl = q_scaled.transpose(0, 2, 1, 3)
+    pooled_scores = (q_bl @ pooled_sq.swapaxes(-1, -2)).transpose(0, 2, 1, 3)
+    # Fused softmax kernel
+    kern = _get_fused_softmax_kernel(H, L, sw, k_sel)
+    # Normalize masks to (B, L, sw) and (B, L, k) for the kernel
+    lm = local_mask
+    if lm.ndim == 4 and lm.shape[1] == 1:
+        lm = lm[:, 0]  # (B, L, sw)
+    elif lm.ndim == 4:
+        lm = lm[:, 0]  # take head 0 (head-uniform in this path)
+    pm = pooled_mask
+    if pm.ndim == 4 and pm.shape[1] == 1:
+        pm = pm[:, 0]
+    elif pm.ndim == 4:
+        pm = pm[:, 0]
+    sinks_1d = sinks_expanded[:, :, 0, 0] if sinks_expanded.ndim == 4 else sinks_expanded
+    outs = kern(
+        inputs=[local_scores, pooled_scores, lm, pm, sinks_1d.astype(mx.bfloat16)],
+        template=[("T", mx.bfloat16)],
+        grid=(B * H * L * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, H, L, sw), (B, H, L, k_sel)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16],
+    )
+    local_weights, pooled_weights = outs
+    # Value matmuls
+    out = local_weights @ local_kv
+    pw_bl = pooled_weights.transpose(0, 2, 1, 3)
+    out = out + (pw_bl @ pooled_sq).transpose(0, 2, 1, 3)
+    return out.astype(q_scaled.dtype)
+
 
 def _sparse_fused_debug_note(fired, q, lm, pm, sinks):
     key = (
@@ -2358,6 +2512,17 @@ def _sparse_pooled_attention(
     sw_pref = local_kv.shape[2]
     if local_mask is not None and local_mask.shape[-1] > sw_pref:
         local_mask = local_mask[..., -sw_pref:] if sw_pref > 0 else local_mask[..., :0]
+    # OPT-12 (2026-07-14): fused softmax epilogue kernel. Replaces the
+    # unfused logsumexp+logaddexp+exp chain with one Metal kernel that computes
+    # weights directly, eliminating intermediate materialization. Gate:
+    # EXO_DSV4_FUSED_SOFTMAX (default 0 — needs A/B validation).
+    if _FUSED_SOFTMAX and local_mask is not None and pooled_mask is not None:
+        fused_out = _fused_softmax_inner(
+            q * scale, local_kv, pooled_gathered,
+            local_mask, pooled_mask, sinks_expanded,
+        )
+        if fused_out is not None:
+            return fused_out
     return _sparse_pooled_attention_inner(
         q * scale,
         local_kv,
