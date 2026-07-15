@@ -2517,6 +2517,14 @@ def _sparse_pooled_attention(
     # weights directly, eliminating intermediate materialization. Gate:
     # EXO_DSV4_FUSED_SOFTMAX (default 0 — needs A/B validation).
     if _FUSED_SOFTMAX and local_mask is not None and pooled_mask is not None:
+        # Dispatch counter (file toggle, like topk dump — no restart needed)
+        import os as _os_fs
+        if _os_fs.path.exists("/tmp/dsv4_fused_dispatch"):
+            try:
+                with open("/tmp/dsv4_fused_dispatch_count", "a") as _f_fs:
+                    _f_fs.write("1\n")
+            except Exception:
+                pass
         fused_out = _fused_softmax_inner(
             q * scale, local_kv, pooled_gathered,
             local_mask, pooled_mask, sinks_expanded,
