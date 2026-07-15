@@ -2516,9 +2516,26 @@ def _sparse_pooled_attention(
     # unfused logsumexp+logaddexp+exp chain with one Metal kernel that computes
     # weights directly, eliminating intermediate materialization. Gate:
     # EXO_DSV4_FUSED_SOFTMAX (default 0 — needs A/B validation).
+    # Debug: log mask types/dtypes to understand why fused path may not fire
+    import os as _os_fs
+    if _os_fs.path.exists("/tmp/dsv4_fused_debug"):
+        try:
+            with open("/tmp/dsv4_fused_debug_log", "a") as _f_dbg:
+                _f_dbg.write(
+                    f"FUSED={_FUSED_SOFTMAX} "
+                    f"lm={local_mask is not None} "
+                    f"pm={pooled_mask is not None} "
+                    f"lm_type={type(local_mask).__name__ if local_mask is not None else 'None'} "
+                    f"lm_dtype={getattr(local_mask, 'dtype', 'N/A') if local_mask is not None else 'N/A'} "
+                    f"pm_type={type(pooled_mask).__name__ if pooled_mask is not None else 'None'} "
+                    f"pm_dtype={getattr(pooled_mask, 'dtype', 'N/A') if pooled_mask is not None else 'N/A'} "
+                    f"sinks={sinks_expanded is not None} "
+                    f"L={L}\n"
+                )
+        except Exception:
+            pass
     if _FUSED_SOFTMAX and local_mask is not None and pooled_mask is not None:
         # Dispatch counter (file toggle, like topk dump — no restart needed)
-        import os as _os_fs
         if _os_fs.path.exists("/tmp/dsv4_fused_dispatch"):
             try:
                 with open("/tmp/dsv4_fused_dispatch_count", "a") as _f_fs:
