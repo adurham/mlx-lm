@@ -6297,7 +6297,17 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                     )
                 )
             else:
-                out = finalize(self.norm(self.hc_head(h)))
+                if os.environ.get("EXO_PP_DEBUG") == "1":
+                    import sys as _dbg_sys
+                    mx.eval(h)
+                    _dbg_sys.stderr.write(f"[PP PRE-NORM h shape={h.shape} dtype={h.dtype} sum={float(mx.abs(h).sum()):.4f}]\n"); _dbg_sys.stderr.flush()
+                    _hc_dbg = self.hc_head(h); mx.eval(_hc_dbg)
+                    _dbg_sys.stderr.write(f"[PP POST-HC_HEAD shape={_hc_dbg.shape} sum={float(mx.abs(_hc_dbg).sum()):.4f}]\n"); _dbg_sys.stderr.flush()
+                    _normed_dbg = self.norm(_hc_dbg); mx.eval(_normed_dbg)
+                    _dbg_sys.stderr.write(f"[PP POST-NORM shape={_normed_dbg.shape} sum={float(mx.abs(_normed_dbg).sum()):.4f}]\n"); _dbg_sys.stderr.flush()
+                    out = finalize(_normed_dbg)
+                else:
+                    out = finalize(self.norm(self.hc_head(h)))
         if _bp:
             _bp_t_end = _BUILD_PROBE_PERF()
             _BUILD_PROBE_ACC["final_norm"] += (_bp_t_end - _bp_t_post_mask)
