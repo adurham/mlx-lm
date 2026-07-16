@@ -3907,7 +3907,7 @@ class CompressedAttention(nn.Module):
                 if mask is not None and not isinstance(mask, str):
                     mask = mask[..., _seq_lo:_seq_hi, :]
 
-            with span("attn.sdpa"):
+            with span("attn.sdpa.compressed"):
                 if "compressed_attn" in _get_nop_targets():
                     out = mx.zeros(q.shape, dtype=q.dtype)
                 else:
