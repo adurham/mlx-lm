@@ -6407,6 +6407,10 @@ class Model(nn.Module):
                     and os.environ.get("EXO_DSV4_LMHEAD_LASTROW", "0") == "1"):
                 h = h[:, -1:, :]
             _logits = self.lm_head(h)
+            if os.environ.get("EXO_PP_DEBUG") == "1":
+                import sys as _dbg_sys2
+                mx.eval(_logits)
+                _dbg_sys2.stderr.write(f"[PP LOGITS shape={_logits.shape} sum={float(mx.abs(_logits).sum()):.4f} max={float(_logits.max()):.4f} argmax={int(_logits[0,-1].argmax().item())}]\n"); _dbg_sys2.stderr.flush()
             if os.environ.get("EXO_DSV4_ACT_PROBE") == "1":
                 import sys as _lp_sys
                 mx.eval(_logits)
