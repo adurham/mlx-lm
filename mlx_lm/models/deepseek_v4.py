@@ -5968,10 +5968,23 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         _dspark_tap = _DSPARK_CTX["taps"] if _DSPARK_CTX["enabled"] else None
         if _dspark_tap is not None:
             _DSPARK_CTX["hiddens"] = {}
+        # PP FIX (2026-07-18): _ap_i is enumerate()'s LOCAL index into this
+        # rank's already-sliced self.pipeline_layers -- but dspark_target_
+        # layer_ids (_dspark_tap) are GLOBAL layer indices. Under exo's
+        # custom PP sharding (self.layers IS the local slice, not upstream
+        # PipelineMixin's start_idx/end_idx windowing), _ap_i ranges
+        # 0..(this-rank-layer-count-1), never matching a global tap id on
+        # any rank -- DSpark ctx capture silently never fired under PP.
+        # pipeline_start_idx (set by auto_parallel.py's pipeline_auto_
+        # parallel, defaults to 0 for the TP path / any model that never
+        # sets it) converts local->global so the tap check is correct in
+        # both topologies.
+        _pp_start = getattr(self, "pipeline_start_idx", 0)
         for _ap_i, (layer, layer_cache) in enumerate(zip(self.pipeline_layers, cache)):
             h = layer(h, mask, layer_cache, inputs)
-            if _dspark_tap is not None and _ap_i in _dspark_tap:
-                _DSPARK_CTX["hiddens"][_ap_i] = h.mean(axis=2)
+            _global_i = _pp_start + _ap_i
+            if _dspark_tap is not None and _global_i in _dspark_tap:
+                _DSPARK_CTX["hiddens"][_global_i] = h.mean(axis=2)
             _lh_dump(f"L{_ap_i:02d}", h)
             if _actprobe:
                 mx.eval(h)
