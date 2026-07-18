@@ -5719,6 +5719,7 @@ class DeepseekV4DSparkModule(nn.Module):
         *,
         temperature: float = 0.0,
         sample_fn: Optional[Any] = None,  # (logits(B,V), step) -> tokens(B,)
+        width: Optional[int] = None,
     ) -> Tuple[mx.array, mx.array, mx.array]:
         """One parallel draft round.
 
@@ -5728,9 +5729,22 @@ class DeepseekV4DSparkModule(nn.Module):
         The caller trims every stage cache by ``block_size`` afterwards
         (block KV must not persist as context) and appends real ctx for
         whatever gets committed.
+
+        ``width`` (2026-07-18, opt-in, default None = full block_size):
+        truncates the draft to fewer than ``block_size`` positions. Callers
+        that only ever VERIFY a subset of the drafted block (e.g. exo's PP
+        path, which found verify-width truncation gives a real decode-speed
+        win on bandwidth-bound hardware) can pass the same width here to
+        avoid computing and returning positions that will never be checked.
+        Every stage forward, the hc_head/lm_head projection, and the
+        sequential Markov loop all scale with width, so this is a real
+        compute saving, not just a smaller return value. Callers MUST trim
+        their caches by the SAME width afterwards (not block_size) when
+        width is passed -- the physical KV written this call is exactly
+        `width` positions, not the full block.
         """
         B = anchor_tokens.shape[0]
-        bs = self.block_size
+        bs = width if width is not None else self.block_size
         block_ids = mx.concatenate(
             [
                 anchor_tokens[:, None],
