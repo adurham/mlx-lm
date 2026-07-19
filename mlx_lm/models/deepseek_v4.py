@@ -3252,6 +3252,20 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
+        # OVERLAP DIAGNOSTIC (2026-07-18, opt-in via EXO_DSV4_TOPK_OVERLAP_LOG=1):
+        # tracks this layer's previous decode step's selected top-k SET (as a
+        # Python set of ints) to measure real Jaccard overlap between
+        # consecutive steps -- the cheap validation step for whether "stale
+        # top-k reuse" (full rescoring every N steps + cheap incremental
+        # scoring in between) is viable. If overlap is consistently high
+        # (>90%), full O(context) indexer rescoring every single decode step
+        # is largely redundant work. Not used unless the env var is set;
+        # zero overhead otherwise (the attribute itself is cheap, the
+        # overlap COMPUTATION only runs when the flag is on).
+        self._topk_overlap_log = _os.environ.get("EXO_DSV4_TOPK_OVERLAP_LOG", "0") == "1"
+        self._prev_topk_set: Optional[set[int]] = None
+        self._topk_overlap_step = 0
+
 
     def __call__(
         self,
@@ -3374,13 +3388,14 @@ class Indexer(nn.Module):
                 and "topk_off" not in _topk_targets)
         )
         with span("indexer.topk"):
+            _topk_result: Optional[mx.array] = None
             if (_topk_enabled
                     and scores.shape[1] == 1
                     and pmask is None
                     and k <= 1024):
                 fused = _fused_topk(scores, k)
                 if fused is not None:
-                    return fused
+                    _topk_result = fused
             # EXACT fused top-k (2026-07-07): decode + MTP-verify rows
             # (L <= 16) take the histogram/threshold kernel — exact top-k
             # set (multiset of selected scores == argpartition's, always),
@@ -3390,12 +3405,13 @@ class Indexer(nn.Module):
             # through unchanged. Prefill chunks (L > 16) keep the landed
             # argpartition path. Gate: EXO_DSV4_EXACT_TOPK (default 1);
             # "exact_topk_off" in /tmp/dsv4_nop_targets disables live.
-            if (_EXACT_TOPK
+            if (_topk_result is None
+                    and _EXACT_TOPK
                     and scores.shape[1] <= 16
                     and "exact_topk_off" not in _topk_targets):
                 exact = _exact_topk(scores, k)
                 if exact is not None:
-                    return exact
+                    _topk_result = exact
             # OPT-1 (env-gated EXO_DSV4_PREFILL_ARGPARTITION=1): in PREFILL (L>1)
             # the argsort below is a full O(P log P) sort over the pool just to take
             # the top-k. argpartition is O(P) and the top-k SET is identical; the
@@ -3410,13 +3426,46 @@ class Indexer(nn.Module):
             # Measured: at P=500 (2K context) argpartition drops throughput 295->163
             # t/s. Only fire when P exceeds EXO_DSV4_ARGPARTITION_MIN_P (default 0 =
             # always fire when env enabled; set e.g. 20000 to only fire past ~80K ctx).
-            if (scores.shape[1] > 1
+            if (_topk_result is None
+                    and scores.shape[1] > 1
                     and _topk_os.environ.get("EXO_DSV4_PREFILL_ARGPARTITION", "0") == "1"
                     and pooled.shape[1] >= int(_topk_os.environ.get("EXO_DSV4_ARGPARTITION_MIN_P", "0"))):
-                return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+                _topk_result = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
             # Fallback: 2026-05-13 argsort+slice. Bit-equivalent to argpartition
             # +slice for this shape and ~5% faster on Apple's Metal kernel.
-            return mx.argsort(-scores, axis=-1)[..., :k]
+            if _topk_result is None:
+                _topk_result = mx.argsort(-scores, axis=-1)[..., :k]
+
+            # OVERLAP DIAGNOSTIC (2026-07-18): only computed when
+            # EXO_DSV4_TOPK_OVERLAP_LOG=1. Restricted to true single-token
+            # decode steps (scores.shape[1] == 1, i.e. L==1, B==1) since
+            # that's the only case where "previous step's set" is a
+            # meaningful, single well-defined comparison -- prefill chunks
+            # and multi-row verify batches don't have one linear "previous
+            # step" to compare against. Cheap: k is at most ~512, set
+            # operations on that are microseconds; only the .tolist() eval
+            # forces materialization, and only on this opt-in path.
+            if (self._topk_overlap_log
+                    and _topk_result.shape[0] == 1
+                    and _topk_result.shape[1] == 1):
+                _cur_set: set[int] = set(
+                    int(v) for v in _topk_result[0, 0].tolist()  # type: ignore
+                )
+                if self._prev_topk_set is not None:
+                    _inter = len(_cur_set & self._prev_topk_set)
+                    _union = len(_cur_set | self._prev_topk_set)
+                    _jaccard = _inter / _union if _union > 0 else 1.0
+                    self._topk_overlap_step += 1
+                    print(
+                        f"[TOPK OVERLAP] step={self._topk_overlap_step} "
+                        f"ratio={self.compressor.compress_ratio} "
+                        f"jaccard={_jaccard:.4f} "
+                        f"inter={_inter}/{len(_cur_set)} "
+                        f"pool_size={pooled.shape[1]}"
+                    )
+                self._prev_topk_set = _cur_set
+
+            return _topk_result
 
 
 class LocalAttention(nn.Module):
