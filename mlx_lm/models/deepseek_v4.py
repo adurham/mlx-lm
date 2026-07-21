@@ -2,8 +2,6 @@
 
 import math
 import os
-import sys
-import time
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -138,6 +136,20 @@ _SECTION_TIME_ACC: Dict[str, float] = {
     "attn": 0.0, "ffn": 0.0, "other": 0.0, "layer_count": 0,
 }
 _SECTION_TIME_CYCLES: int = 0
+
+# exo-stall-diag (2026-07-21): gated by EXO_MOE_EXPERT_HIST_DIAG=1. Holds
+# (layer_idx, lazy inds array) tuples captured from every MoE layer's
+# switch_mlp call site DURING ONE forward pass, with ZERO evaluation forced
+# (mx is lazy -- appending a reference to a Python list costs nothing and
+# does not materialize anything). The consumer (pp_speculation.py's
+# SpecPipelineLastLayer.__call__, immediately after its EXISTING
+# mx.eval(output) call that already materializes the whole graph) computes
+# the actual expert-assignment histogram from these captured arrays, riding
+# the same real eval point instead of adding a new synchronization boundary
+# that would change the lazy-graph fusion/scheduling being investigated.
+# MUST be cleared by the consumer after each forward pass (not appended to
+# forever) -- see pp_speculation.py's own comment at the consumer site.
+_MOE_HIST_CAPTURE: List[Tuple[int, Any]] = []
 
 # Sub-section attn attribution (same gate). When on, SparseCompressedAttention
 # accumulates true GPU wall (mx.synchronize boundaries) for the three big attn
@@ -2508,21 +2520,37 @@ class DeepseekV4MoE(nn.Module):
                 finalize(scores)
 
             with span("moe.switch_mlp"):
-                # exo-stall-diag (2026-07-21): gated by EXO_MOE_EXPERT_HIST_DIAG=1,
-                # times this switch_mlp (GatherQMM-backed) call and, when slow,
-                # logs the per-token expert-assignment histogram. Part of the
-                # r0_fwd/spec_fwd GPU-compute stall investigation -- the ring
-                # diagnostic (EXO_CMDBUF_RING_DIAG) identified GatherQMM as the
-                # consistently-largest command buffer during every captured
-                # stall. This tests the leading hypothesis: a skewed/imbalanced
-                # expert assignment (many tokens routed to few experts) forcing
-                # a much larger effective matmul than the "average" case,
-                # rather than a uniform per-call cost. Zero overhead when unset.
-                _moe_hist_enabled = os.environ.get("EXO_MOE_EXPERT_HIST_DIAG") == "1"
-                _t0_switch = 0.0
-                if _moe_hist_enabled:
-                    mx.synchronize()
-                    _t0_switch = time.perf_counter()
+                # exo-stall-diag (2026-07-21), REVISED same day: gated by
+                # EXO_MOE_EXPERT_HIST_DIAG=1. Part of the r0_fwd/spec_fwd
+                # GPU-compute stall investigation -- the ring diagnostic
+                # (EXO_CMDBUF_RING_DIAG) identified GatherQMM as the
+                # consistently-largest command buffer during captured stalls,
+                # motivating a check of whether skewed expert routing (many
+                # tokens -> few experts) explains the stall.
+                #
+                # FIRST VERSION OF THIS DIAGNOSTIC WAS WRONG: it wrapped
+                # switch_mlp in mx.synchronize() calls to measure wall time,
+                # which forces EAGER per-layer materialization -- but MLX is
+                # lazy, and this whole model forward is normally built as ONE
+                # graph, only materialized once at pp_speculation.py's
+                # mx.eval(output) (SpecPipelineLastLayer.__call__). Per-layer
+                # synchronize() breaks that fusion/scheduling, changing the
+                # execution pattern being measured (confirmed live: a real
+                # 45.6s stall reproduced with this diagnostic active, but
+                # NEVER attributed to switch_mlp -- the sync calls likely
+                # relocated whatever cost exists to a different point, or
+                # masked it entirely by forcing early materialization).
+                #
+                # FIX: capture the LAZY `inds` array (zero cost -- no eval,
+                # no sync, just a Python reference) into a module-level list
+                # instead. The actual histogram is computed later, in
+                # pp_speculation.py, immediately after the EXISTING
+                # mx.eval(output) call that already materializes the whole
+                # graph -- riding the same real eval point instead of adding
+                # a new one. See _MOE_HIST_CAPTURE below and its consumer in
+                # pp_speculation.py's SpecPipelineLastLayer.__call__.
+                if os.environ.get("EXO_MOE_EXPERT_HIST_DIAG") == "1":
+                    _MOE_HIST_CAPTURE.append((self.layer_idx, inds))
                 if "switch" in _prs:
                     y = finalize(
                         mx.concatenate(
@@ -2537,45 +2565,6 @@ class DeepseekV4MoE(nn.Module):
                     )
                 else:
                     y = finalize(self.switch_mlp(x, inds))
-                if _moe_hist_enabled:
-                    mx.synchronize()
-                    _dt_switch = (time.perf_counter() - _t0_switch) * 1000
-                    if _dt_switch > 300:
-                        try:
-                            _inds_flat = inds.reshape(-1)
-                            _inds_raw: Any = _inds_flat.tolist()  # pyright: ignore[reportAny]
-                            _inds_list: List[int] = (
-                                [int(_v) for _v in _inds_raw]
-                                if isinstance(_inds_raw, list)
-                                else [int(_inds_raw)]
-                            )
-                            _counts: Dict[int, int] = {}
-                            for _e_int in _inds_list:
-                                _counts[_e_int] = _counts.get(_e_int, 0) + 1
-                            _sorted_counts = sorted(
-                                _counts.values(), reverse=True
-                            )
-                            _n_tokens = len(_inds_list)
-                            _n_experts_hit = len(_counts)
-                            _max_count = _sorted_counts[0] if _sorted_counts else 0
-                            _top5 = _sorted_counts[:5]
-                            print(
-                                f"[MOE_EXPERT_HIST_DIAG] layer={self.layer_idx} "
-                                f"switch_mlp_ms={_dt_switch:.1f} "
-                                f"n_tokens={_n_tokens} n_experts_hit={_n_experts_hit} "
-                                f"max_count={_max_count} top5_counts={_top5} "
-                                f"inds_shape={list(inds.shape)}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                        except Exception as _e_hist:  # noqa: BLE001 -- diag-only
-                            print(
-                                f"[MOE_EXPERT_HIST_DIAG] layer={self.layer_idx} "
-                                f"switch_mlp_ms={_dt_switch:.1f} "
-                                f"(histogram failed: {_e_hist!r})",
-                                file=sys.stderr,
-                                flush=True,
-                            )
 
             with span("moe.post_combine"):
                 # Phase H: fused weighted_reduce + shared_experts add via
