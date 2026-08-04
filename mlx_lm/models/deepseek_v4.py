@@ -810,6 +810,17 @@ class ModelArgs(BaseModelArgs):
     num_nextn_predict_layers: int = 1
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
+    # DSpark 3-stage speculative-draft-head config (arXiv:2607.05147).
+    # Declared here (rather than left to DeepseekV4DSparkModule's own
+    # getattr(config, ..., default) fallbacks) so BaseModelArgs.from_dict's
+    # allow-listed-field filter actually lets these through from
+    # config.json instead of always silently falling back to defaults
+    # that happen to match -0731's checkpoint values today.
+    dspark_block_size: int = 5
+    dspark_noise_token_id: int = 128799
+    dspark_markov_rank: int = 256
+    dspark_target_layer_ids: List[int] = field(default_factory=lambda: [40, 41, 42])
+    n_mtp_layers: int = 3
 
     def __post_init__(self):
         if not self.compress_ratios:
@@ -6307,18 +6318,37 @@ class Model(nn.Module):
                 )
         return caches
 
-    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    def sanitize(
+        self, weights: Dict[str, mx.array], n_mtp_override: Optional[int] = None
+    ) -> Dict[str, mx.array]:
+        """
+        Args:
+            n_mtp_override: when set, bypasses the EXO_DSV4_MTP-gated
+                num_nextn_predict_layers-derived stage count entirely and
+                keeps/transforms exactly this many ``mtp.{0..n-1}.*`` stages
+                instead. Used by the DSpark native-head overlay
+                (_overlay_dsv4_dspark_native in utils_mlx.py) to run this
+                same fp8-dequant/hc-rename/expert-stack/wo_a-reshape
+                pipeline against the checkpoint's 3-stage DSpark head
+                (mtp.0/1/2.*) independent of whatever num_nextn_predict_layers
+                (single-head MTP-1 self-chaining count) the checkpoint
+                advertises — the two mechanisms are unrelated stage counts
+                sharing the same `mtp.` key prefix on disk.
+        """
         n_layers = self.args.num_hidden_layers
         # Only KEEP mtp.* weights when we'll actually have modules to
         # absorb them — see the matching gate in DeepseekV4Model.__init__
         # for the rationale (mlx-community variants advertise
         # num_nextn_predict_layers=1 but ship zero mtp.* keys; the
         # MTP-included variant is opt-in via EXO_DSV4_MTP=1).
-        mtp_enabled = (
-            self.args.num_nextn_predict_layers > 0
-            and os.environ.get("EXO_DSV4_MTP", "0") == "1"
-        )
-        n_mtp = self.args.num_nextn_predict_layers if mtp_enabled else 0
+        if n_mtp_override is not None:
+            n_mtp = n_mtp_override
+        else:
+            mtp_enabled = (
+                self.args.num_nextn_predict_layers > 0
+                and os.environ.get("EXO_DSV4_MTP", "0") == "1"
+            )
+            n_mtp = self.args.num_nextn_predict_layers if mtp_enabled else 0
 
         new_weights = {}
         for k, v in weights.items():
@@ -6334,7 +6364,7 @@ class Model(nn.Module):
                 # variants without mtp weights, or user hasn't opted
                 # in via EXO_DSV4_MTP=1) or the index is out-of-range.
                 try:
-                    if not mtp_enabled or int(parts[1]) >= n_mtp:
+                    if int(parts[1]) >= n_mtp:
                         continue
                 except ValueError:
                     pass
