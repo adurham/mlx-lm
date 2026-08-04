@@ -4491,6 +4491,44 @@ class DeepseekV4Block(nn.Module):
                 )
             if _lh_fh is not None:
                 _lh_sub("ffn_out", _fb_ffn)
+            # EXO_DSV4_MOE_ISOLATION_DUMP (2026-08-04): offline-bisect
+            # capture for the FULLBLOCK_MOE bandwidth-cost investigation
+            # (see exo-perf-tuning skill). Saves the REAL block-level
+            # ffn_in/input_ids/ground-truth-ffn_out this cycle already
+            # computed above -- reuses that data, adds NO new forward
+            # pass and NO new mx.eval beyond what FULLBLOCK_MOE=1's
+            # correct per-row loop already forced. An offline script
+            # later loads this layer's real weights once and replays
+            # candidate MOE_PARTS_ROWSEQ subsets against the saved
+            # ffn_in, comparing to the saved ground-truth ffn_out --
+            # bisecting which MoE sub-op (gate/switch/shared/combine)
+            # is the true batched-vs-M=1 divergence source, without
+            # any further live cluster relaunches per hypothesis.
+            _moe_dump_dir = os.environ.get("EXO_DSV4_MOE_ISOLATION_DUMP", "")
+            if _moe_dump_dir and _VERIFY_ROWSEQ_FULLBLOCK_MOE:
+                try:
+                    import numpy as _mid_np
+                    import uuid as _mid_uuid
+
+                    _mid_ffn_in = mx.concatenate(
+                        [r[0] for r in _fb_rows], axis=1
+                    )
+                    mx.eval(_mid_ffn_in, _fb_ffn)
+                    _mid_path = os.path.join(
+                        _moe_dump_dir,
+                        f"L{self.ffn.layer_idx:02d}_{_mid_uuid.uuid4().hex[:10]}.npz",
+                    )
+                    _mid_np.savez(
+                        _mid_path,
+                        layer_idx=self.ffn.layer_idx,
+                        ffn_in=_mid_np.asarray(_mid_ffn_in.astype(mx.float32)),
+                        ffn_out_ground_truth=_mid_np.asarray(
+                            _fb_ffn.astype(mx.float32)
+                        ),
+                        input_ids=_mid_np.asarray(input_ids),
+                    )
+                except Exception:
+                    pass
             _fb_out = finalize(
                 mx.concatenate(
                     [
