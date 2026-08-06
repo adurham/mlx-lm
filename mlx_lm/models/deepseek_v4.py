@@ -4,7 +4,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -6235,7 +6235,50 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = HyperHead(config)
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
+    def _forward_steps(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        *,
+        interruptible: bool = False,
+    ) -> Iterator[
+        Union[
+            Tuple[Literal["layer"], int, mx.array],
+            Tuple[Literal["done"], None, mx.array],
+        ]
+    ]:
+        """2026-08-06 (Phase 2 scoping session, generator-core refactor,
+        consult-reviewed): the ORIGINAL `__call__` body, byte-for-byte
+        unchanged, EXCEPT for one new yield point inside the per-layer
+        loop (only reached when `interruptible=True`) and the final
+        `return out` becoming `yield out`. `__call__` (below) stays a
+        thin eager wrapper that drains this generator to its single
+        yielded value -- EVERY existing caller (decode, speculative-
+        decode verify, tree-verify, non-chunked prefill) goes through
+        `__call__` unchanged and is structurally atomic: its path
+        through this generator never reaches the conditional yield
+        inside the loop, so it runs start-to-finish on the FIRST
+        `next()`/for-loop iteration, identical to the original eager
+        function's timing -- a generator function with a yield that is
+        never REACHED during a given call does not pause at all.
+
+        Only large PREFILL CHUNKS (via a future, not-yet-built
+        generate.py integration) will ever pass `interruptible=True`
+        and drive this generator across multiple `next()`/`send()`
+        calls, pausing between transformer layers so a real decode
+        step can run in the gap -- this is the actual mechanism the
+        design doc's chunked-prefill-interruption pivot is for.
+
+        DOES NOT itself call `mx.eval()` at the yield point -- per a
+        consult review, forcing materialization unconditionally here
+        would hurt the "immediate resume" (i.e. non-interrupted, just
+        driven step-by-step) case by breaking MLX's kernel-fusion
+        across layers even when nothing actually pauses. The CALLER
+        (the not-yet-built generate.py driver) decides whether to
+        `mx.eval()` and genuinely pause, or call `next()` again
+        immediately to keep going -- that decision belongs one level
+        up, not baked into this generator.
+        """
         _bp = _BUILD_PROBE_ENABLED
         if _bp:
             _bp_t_start = _BUILD_PROBE_PERF()
@@ -6412,6 +6455,19 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 _r = _ap_std(h)
                 _ap_sys.stderr.write(f"[ACTPROBE] layer={_ap_i:2d} rms={_r:.4f}\n")
                 _ap_sys.stderr.flush()
+            # 2026-08-06 (Phase 2 scoping session, consult-reviewed):
+            # the ONLY yield point in this generator. Reached after
+            # EVERY layer when interruptible=True (not just at chunk
+            # segment boundaries -- the CALLER decides how many
+            # next()/send() calls to drain before actually pausing via
+            # mx.eval(); this generator itself imposes no segment-size
+            # policy). Never reached at all when interruptible=False
+            # (every existing eager caller), so this line changes
+            # NOTHING about their behavior -- a generator function's
+            # yield that the caller's code path never executes simply
+            # never fires.
+            if interruptible:
+                yield ("layer", _ap_i, h)
         if _lhash_fh is not None:
             _lhash_fh.close()
 
@@ -6531,6 +6587,21 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             _SECTION_TIME_CYCLES += 1
             if _SECTION_TIME_CYCLES % max(1, _SECTION_TIME_LOG_EVERY) == 0:
                 _section_time_dump()
+        yield ("done", None, out)
+
+    def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
+        """Thin eager wrapper (2026-08-06, Phase 2 scoping session,
+        consult-reviewed) -- drives `_forward_steps` to completion and
+        returns its single yielded final value, matching this
+        method's ORIGINAL (pre-refactor) return contract exactly.
+        `interruptible` defaults to False here, so every existing
+        caller (decode, verify, tree-verify, non-chunked prefill)
+        takes the SAME code path as before this refactor, byte-for-
+        byte -- only a future, not-yet-built caller that wants
+        mid-forward-pass interruption will ever call `_forward_steps`
+        directly with `interruptible=True`.
+        """
+        *_, (_kind, _idx, out) = self._forward_steps(inputs, cache)
         return out
 
 
