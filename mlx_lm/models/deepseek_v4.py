@@ -137,6 +137,20 @@ _SECTION_TIME_ACC: Dict[str, float] = {
 }
 _SECTION_TIME_CYCLES: int = 0
 
+# exo-stall-diag (2026-07-21): gated by EXO_MOE_EXPERT_HIST_DIAG=1. Holds
+# (layer_idx, lazy inds array) tuples captured from every MoE layer's
+# switch_mlp call site DURING ONE forward pass, with ZERO evaluation forced
+# (mx is lazy -- appending a reference to a Python list costs nothing and
+# does not materialize anything). The consumer (pp_speculation.py's
+# SpecPipelineLastLayer.__call__, immediately after its EXISTING
+# mx.eval(output) call that already materializes the whole graph) computes
+# the actual expert-assignment histogram from these captured arrays, riding
+# the same real eval point instead of adding a new synchronization boundary
+# that would change the lazy-graph fusion/scheduling being investigated.
+# MUST be cleared by the consumer after each forward pass (not appended to
+# forever) -- see pp_speculation.py's own comment at the consumer site.
+_MOE_HIST_CAPTURE: List[Tuple[int, Any]] = []
+
 # Sub-section attn attribution (same gate). When on, SparseCompressedAttention
 # accumulates true GPU wall (mx.synchronize boundaries) for the three big attn
 # blocks — compressor / indexer / sdpa — plus the remaining projections/rope.
@@ -804,6 +818,17 @@ class ModelArgs(BaseModelArgs):
     num_nextn_predict_layers: int = 1
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
+    # DSpark 3-stage speculative-draft-head config (arXiv:2607.05147).
+    # Declared here (rather than left to DeepseekV4DSparkModule's own
+    # getattr(config, ..., default) fallbacks) so BaseModelArgs.from_dict's
+    # allow-listed-field filter actually lets these through from
+    # config.json instead of always silently falling back to defaults
+    # that happen to match -0731's checkpoint values today.
+    dspark_block_size: int = 5
+    dspark_noise_token_id: int = 128799
+    dspark_markov_rank: int = 256
+    dspark_target_layer_ids: List[int] = field(default_factory=lambda: [40, 41, 42])
+    n_mtp_layers: int = 3
 
     def __post_init__(self):
         if not self.compress_ratios:
@@ -2728,6 +2753,37 @@ class DeepseekV4MoE(nn.Module):
                 finalize(scores)
 
             with span("moe.switch_mlp"):
+                # exo-stall-diag (2026-07-21), REVISED same day: gated by
+                # EXO_MOE_EXPERT_HIST_DIAG=1. Part of the r0_fwd/spec_fwd
+                # GPU-compute stall investigation -- the ring diagnostic
+                # (EXO_CMDBUF_RING_DIAG) identified GatherQMM as the
+                # consistently-largest command buffer during captured stalls,
+                # motivating a check of whether skewed expert routing (many
+                # tokens -> few experts) explains the stall.
+                #
+                # FIRST VERSION OF THIS DIAGNOSTIC WAS WRONG: it wrapped
+                # switch_mlp in mx.synchronize() calls to measure wall time,
+                # which forces EAGER per-layer materialization -- but MLX is
+                # lazy, and this whole model forward is normally built as ONE
+                # graph, only materialized once at pp_speculation.py's
+                # mx.eval(output) (SpecPipelineLastLayer.__call__). Per-layer
+                # synchronize() breaks that fusion/scheduling, changing the
+                # execution pattern being measured (confirmed live: a real
+                # 45.6s stall reproduced with this diagnostic active, but
+                # NEVER attributed to switch_mlp -- the sync calls likely
+                # relocated whatever cost exists to a different point, or
+                # masked it entirely by forcing early materialization).
+                #
+                # FIX: capture the LAZY `inds` array (zero cost -- no eval,
+                # no sync, just a Python reference) into a module-level list
+                # instead. The actual histogram is computed later, in
+                # pp_speculation.py, immediately after the EXISTING
+                # mx.eval(output) call that already materializes the whole
+                # graph -- riding the same real eval point instead of adding
+                # a new one. See _MOE_HIST_CAPTURE below and its consumer in
+                # pp_speculation.py's SpecPipelineLastLayer.__call__.
+                if os.environ.get("EXO_MOE_EXPERT_HIST_DIAG") == "1":
+                    _MOE_HIST_CAPTURE.append((self.layer_idx, inds))
                 if "switch" in _prs:
                     y = finalize(
                         mx.concatenate(
@@ -3474,6 +3530,20 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
+        # OVERLAP DIAGNOSTIC (2026-07-18, opt-in via EXO_DSV4_TOPK_OVERLAP_LOG=1):
+        # tracks this layer's previous decode step's selected top-k SET (as a
+        # Python set of ints) to measure real Jaccard overlap between
+        # consecutive steps -- the cheap validation step for whether "stale
+        # top-k reuse" (full rescoring every N steps + cheap incremental
+        # scoring in between) is viable. If overlap is consistently high
+        # (>90%), full O(context) indexer rescoring every single decode step
+        # is largely redundant work. Not used unless the env var is set;
+        # zero overhead otherwise (the attribute itself is cheap, the
+        # overlap COMPUTATION only runs when the flag is on).
+        self._topk_overlap_log = _os.environ.get("EXO_DSV4_TOPK_OVERLAP_LOG", "0") == "1"
+        self._prev_topk_set: Optional[set[int]] = None
+        self._topk_overlap_step = 0
+
 
     def __call__(
         self,
@@ -3596,13 +3666,14 @@ class Indexer(nn.Module):
                 and "topk_off" not in _topk_targets)
         )
         with span("indexer.topk"):
+            _topk_result: Optional[mx.array] = None
             if (_topk_enabled
                     and scores.shape[1] == 1
                     and pmask is None
                     and k <= 1024):
                 fused = _fused_topk(scores, k)
                 if fused is not None:
-                    return fused
+                    _topk_result = fused
             # EXACT fused top-k (2026-07-07): decode + MTP-verify rows
             # (L <= 16) take the histogram/threshold kernel — exact top-k
             # set (multiset of selected scores == argpartition's, always),
@@ -3612,12 +3683,13 @@ class Indexer(nn.Module):
             # through unchanged. Prefill chunks (L > 16) keep the landed
             # argpartition path. Gate: EXO_DSV4_EXACT_TOPK (default 1);
             # "exact_topk_off" in /tmp/dsv4_nop_targets disables live.
-            if (_EXACT_TOPK
+            if (_topk_result is None
+                    and _EXACT_TOPK
                     and scores.shape[1] <= 16
                     and "exact_topk_off" not in _topk_targets):
                 exact = _exact_topk(scores, k)
                 if exact is not None:
-                    return exact
+                    _topk_result = exact
             # OPT-1 (env-gated EXO_DSV4_PREFILL_ARGPARTITION=1): in PREFILL (L>1)
             # the argsort below is a full O(P log P) sort over the pool just to take
             # the top-k. argpartition is O(P) and the top-k SET is identical; the
@@ -3632,13 +3704,46 @@ class Indexer(nn.Module):
             # Measured: at P=500 (2K context) argpartition drops throughput 295->163
             # t/s. Only fire when P exceeds EXO_DSV4_ARGPARTITION_MIN_P (default 0 =
             # always fire when env enabled; set e.g. 20000 to only fire past ~80K ctx).
-            if (scores.shape[1] > 1
+            if (_topk_result is None
+                    and scores.shape[1] > 1
                     and _topk_os.environ.get("EXO_DSV4_PREFILL_ARGPARTITION", "0") == "1"
                     and pooled.shape[1] >= int(_topk_os.environ.get("EXO_DSV4_ARGPARTITION_MIN_P", "0"))):
-                return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+                _topk_result = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
             # Fallback: 2026-05-13 argsort+slice. Bit-equivalent to argpartition
             # +slice for this shape and ~5% faster on Apple's Metal kernel.
-            return mx.argsort(-scores, axis=-1)[..., :k]
+            if _topk_result is None:
+                _topk_result = mx.argsort(-scores, axis=-1)[..., :k]
+
+            # OVERLAP DIAGNOSTIC (2026-07-18): only computed when
+            # EXO_DSV4_TOPK_OVERLAP_LOG=1. Restricted to true single-token
+            # decode steps (scores.shape[1] == 1, i.e. L==1, B==1) since
+            # that's the only case where "previous step's set" is a
+            # meaningful, single well-defined comparison -- prefill chunks
+            # and multi-row verify batches don't have one linear "previous
+            # step" to compare against. Cheap: k is at most ~512, set
+            # operations on that are microseconds; only the .tolist() eval
+            # forces materialization, and only on this opt-in path.
+            if (self._topk_overlap_log
+                    and _topk_result.shape[0] == 1
+                    and _topk_result.shape[1] == 1):
+                _cur_set: set[int] = set(
+                    int(v) for v in _topk_result[0, 0].tolist()  # type: ignore
+                )
+                if self._prev_topk_set is not None:
+                    _inter = len(_cur_set & self._prev_topk_set)
+                    _union = len(_cur_set | self._prev_topk_set)
+                    _jaccard = _inter / _union if _union > 0 else 1.0
+                    self._topk_overlap_step += 1
+                    print(
+                        f"[TOPK OVERLAP] step={self._topk_overlap_step} "
+                        f"ratio={self.compressor.compress_ratio} "
+                        f"jaccard={_jaccard:.4f} "
+                        f"inter={_inter}/{len(_cur_set)} "
+                        f"pool_size={pooled.shape[1]}"
+                    )
+                self._prev_topk_set = _cur_set
+
+            return _topk_result
 
 
 class LocalAttention(nn.Module):
@@ -4650,6 +4755,44 @@ class DeepseekV4Block(nn.Module):
                 )
             if _lh_fh is not None:
                 _lh_sub("ffn_out", _fb_ffn)
+            # EXO_DSV4_MOE_ISOLATION_DUMP (2026-08-04): offline-bisect
+            # capture for the FULLBLOCK_MOE bandwidth-cost investigation
+            # (see exo-perf-tuning skill). Saves the REAL block-level
+            # ffn_in/input_ids/ground-truth-ffn_out this cycle already
+            # computed above -- reuses that data, adds NO new forward
+            # pass and NO new mx.eval beyond what FULLBLOCK_MOE=1's
+            # correct per-row loop already forced. An offline script
+            # later loads this layer's real weights once and replays
+            # candidate MOE_PARTS_ROWSEQ subsets against the saved
+            # ffn_in, comparing to the saved ground-truth ffn_out --
+            # bisecting which MoE sub-op (gate/switch/shared/combine)
+            # is the true batched-vs-M=1 divergence source, without
+            # any further live cluster relaunches per hypothesis.
+            _moe_dump_dir = os.environ.get("EXO_DSV4_MOE_ISOLATION_DUMP", "")
+            if _moe_dump_dir and _VERIFY_ROWSEQ_FULLBLOCK_MOE:
+                try:
+                    import numpy as _mid_np
+                    import uuid as _mid_uuid
+
+                    _mid_ffn_in = mx.concatenate(
+                        [r[0] for r in _fb_rows], axis=1
+                    )
+                    mx.eval(_mid_ffn_in, _fb_ffn)
+                    _mid_path = os.path.join(
+                        _moe_dump_dir,
+                        f"L{self.ffn.layer_idx:02d}_{_mid_uuid.uuid4().hex[:10]}.npz",
+                    )
+                    _mid_np.savez(
+                        _mid_path,
+                        layer_idx=self.ffn.layer_idx,
+                        ffn_in=_mid_np.asarray(_mid_ffn_in.astype(mx.float32)),
+                        ffn_out_ground_truth=_mid_np.asarray(
+                            _fb_ffn.astype(mx.float32)
+                        ),
+                        input_ids=_mid_np.asarray(input_ids),
+                    )
+                except Exception:
+                    pass
             _fb_out = finalize(
                 mx.concatenate(
                     [
@@ -5983,6 +6126,7 @@ class DeepseekV4DSparkModule(nn.Module):
         *,
         temperature: float = 0.0,
         sample_fn: Optional[Any] = None,  # (logits(B,V), step) -> tokens(B,)
+        width: Optional[int] = None,
     ) -> Tuple[mx.array, mx.array, mx.array]:
         """One parallel draft round.
 
@@ -5992,9 +6136,22 @@ class DeepseekV4DSparkModule(nn.Module):
         The caller trims every stage cache by ``block_size`` afterwards
         (block KV must not persist as context) and appends real ctx for
         whatever gets committed.
+
+        ``width`` (2026-07-18, opt-in, default None = full block_size):
+        truncates the draft to fewer than ``block_size`` positions. Callers
+        that only ever VERIFY a subset of the drafted block (e.g. exo's PP
+        path, which found verify-width truncation gives a real decode-speed
+        win on bandwidth-bound hardware) can pass the same width here to
+        avoid computing and returning positions that will never be checked.
+        Every stage forward, the hc_head/lm_head projection, and the
+        sequential Markov loop all scale with width, so this is a real
+        compute saving, not just a smaller return value. Callers MUST trim
+        their caches by the SAME width afterwards (not block_size) when
+        width is passed -- the physical KV written this call is exactly
+        `width` positions, not the full block.
         """
         B = anchor_tokens.shape[0]
-        bs = self.block_size
+        bs = width if width is not None else self.block_size
         block_ids = mx.concatenate(
             [
                 anchor_tokens[:, None],
@@ -6232,10 +6389,23 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         _dspark_tap = _DSPARK_CTX["taps"] if _DSPARK_CTX["enabled"] else None
         if _dspark_tap is not None:
             _DSPARK_CTX["hiddens"] = {}
+        # PP FIX (2026-07-18): _ap_i is enumerate()'s LOCAL index into this
+        # rank's already-sliced self.pipeline_layers -- but dspark_target_
+        # layer_ids (_dspark_tap) are GLOBAL layer indices. Under exo's
+        # custom PP sharding (self.layers IS the local slice, not upstream
+        # PipelineMixin's start_idx/end_idx windowing), _ap_i ranges
+        # 0..(this-rank-layer-count-1), never matching a global tap id on
+        # any rank -- DSpark ctx capture silently never fired under PP.
+        # pipeline_start_idx (set by auto_parallel.py's pipeline_auto_
+        # parallel, defaults to 0 for the TP path / any model that never
+        # sets it) converts local->global so the tap check is correct in
+        # both topologies.
+        _pp_start = getattr(self, "pipeline_start_idx", 0)
         for _ap_i, (layer, layer_cache) in enumerate(zip(self.pipeline_layers, cache)):
             h = layer(h, mask, layer_cache, inputs)
-            if _dspark_tap is not None and _ap_i in _dspark_tap:
-                _DSPARK_CTX["hiddens"][_ap_i] = h.mean(axis=2)
+            _global_i = _pp_start + _ap_i
+            if _dspark_tap is not None and _global_i in _dspark_tap:
+                _DSPARK_CTX["hiddens"][_global_i] = h.mean(axis=2)
             _lh_dump(f"L{_ap_i:02d}", h)
             if _actprobe:
                 mx.eval(h)
@@ -6464,18 +6634,37 @@ class Model(nn.Module):
                 )
         return caches
 
-    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    def sanitize(
+        self, weights: Dict[str, mx.array], n_mtp_override: Optional[int] = None
+    ) -> Dict[str, mx.array]:
+        """
+        Args:
+            n_mtp_override: when set, bypasses the EXO_DSV4_MTP-gated
+                num_nextn_predict_layers-derived stage count entirely and
+                keeps/transforms exactly this many ``mtp.{0..n-1}.*`` stages
+                instead. Used by the DSpark native-head overlay
+                (_overlay_dsv4_dspark_native in utils_mlx.py) to run this
+                same fp8-dequant/hc-rename/expert-stack/wo_a-reshape
+                pipeline against the checkpoint's 3-stage DSpark head
+                (mtp.0/1/2.*) independent of whatever num_nextn_predict_layers
+                (single-head MTP-1 self-chaining count) the checkpoint
+                advertises — the two mechanisms are unrelated stage counts
+                sharing the same `mtp.` key prefix on disk.
+        """
         n_layers = self.args.num_hidden_layers
         # Only KEEP mtp.* weights when we'll actually have modules to
         # absorb them — see the matching gate in DeepseekV4Model.__init__
         # for the rationale (mlx-community variants advertise
         # num_nextn_predict_layers=1 but ship zero mtp.* keys; the
         # MTP-included variant is opt-in via EXO_DSV4_MTP=1).
-        mtp_enabled = (
-            self.args.num_nextn_predict_layers > 0
-            and os.environ.get("EXO_DSV4_MTP", "0") == "1"
-        )
-        n_mtp = self.args.num_nextn_predict_layers if mtp_enabled else 0
+        if n_mtp_override is not None:
+            n_mtp = n_mtp_override
+        else:
+            mtp_enabled = (
+                self.args.num_nextn_predict_layers > 0
+                and os.environ.get("EXO_DSV4_MTP", "0") == "1"
+            )
+            n_mtp = self.args.num_nextn_predict_layers if mtp_enabled else 0
 
         new_weights = {}
         for k, v in weights.items():
@@ -6491,7 +6680,7 @@ class Model(nn.Module):
                 # variants without mtp weights, or user hasn't opted
                 # in via EXO_DSV4_MTP=1) or the index is out-of-range.
                 try:
-                    if not mtp_enabled or int(parts[1]) >= n_mtp:
+                    if int(parts[1]) >= n_mtp:
                         continue
                 except ValueError:
                     pass

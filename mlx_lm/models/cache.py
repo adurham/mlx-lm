@@ -782,7 +782,53 @@ class RotatingKVCache(_BaseCache):
         NOTE: mx ``__setitem__`` mutates IN PLACE (aliased) — a bare
         reference does NOT preserve pre-write contents — so keys/values are
         copied here (``mx.array``). Small: one local ring per layer.
+
+        exo-stall-diag (2026-07-21): gated by EXO_SPEC_STATE_SPLIT_DIAG=1,
+        times the keys-copy and values-copy SEPARATELY, forcing eager
+        materialization of each (mx.eval) within its own timed region --
+        mx.array() alone is lazy graph construction and would measure
+        near-zero regardless of real cost, so each copy is eval()'d before
+        its timer stops. Part of the ongoing PP+DSpark snapshot_eval stall
+        investigation (exo-cluster-development skill,
+        references/pp-dspark-snapshot-eval-stall-2026-07-20.md), which
+        isolated the stall to a single, deterministic layer index inside
+        this call but not yet to keys vs values specifically. Zero overhead
+        when unset -- both the env check and the logging are skipped, and
+        the returned tuple stays fully lazy (matching original behavior)
+        since the caller already does its own eval() pass.
         """
+        import os as _os_ssd
+
+        if _os_ssd.environ.get("EXO_SPEC_STATE_SPLIT_DIAG") == "1":
+            import time as _time_ssd
+            import sys as _sys_ssd
+
+            _t0 = _time_ssd.perf_counter()
+            _k = None if self.keys is None else mx.array(self.keys)
+            if _k is not None:
+                mx.eval(_k)
+            _t1 = _time_ssd.perf_counter()
+            _v = None if self.values is None else mx.array(self.values)
+            if _v is not None:
+                mx.eval(_v)
+            _t2 = _time_ssd.perf_counter()
+            _dt_k = (_t1 - _t0) * 1000
+            _dt_v = (_t2 - _t1) * 1000
+            if _dt_k > 100 or _dt_v > 100:
+                _kb = 0 if _k is None else int(_k.nbytes)
+                _vb = 0 if _v is None else int(_v.nbytes)
+                _kshape = None if _k is None else _k.shape
+                _vshape = None if _v is None else _v.shape
+                _sys_ssd.stderr.write(
+                    f"[SPEC_STATE_SPLIT_DIAG] keys_ms={_dt_k:.1f} "
+                    f"values_ms={_dt_v:.1f} keys_bytes={_kb} "
+                    f"values_bytes={_vb} keys_shape={_kshape} "
+                    f"values_shape={_vshape} offset={self.offset} "
+                    f"idx={self._idx} max_size={self.max_size}\n"
+                )
+                _sys_ssd.stderr.flush()
+            return (_k, _v, self.offset, self._idx)
+
         return (
             None if self.keys is None else mx.array(self.keys),
             None if self.values is None else mx.array(self.values),
