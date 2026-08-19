@@ -488,6 +488,115 @@ if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
     _all_sum_nop_aware._all_sum_nop_wrapped = True
     mx.distributed.all_sum = _all_sum_nop_aware
 
+# -----------------------------------------------------------------------
+# Bandwidth-reduced moe.all_sum: quantized all_gather + local dequant/sum.
+#
+# EXO_DSV4_MOE_ALLSUM_QUANT=1 (default 0, opt-in): replaces the plain
+# bf16 mx.distributed.all_sum(y) at the MoE combine point with:
+#   1. locally int8-quantize y (per-row-group affine quant, mx.quantize)
+#   2. mx.distributed.all_gather the quantized payload (w_q, scales,
+#      biases) across sharding_group instead of reducing bf16 y directly
+#   3. split the gathered payload back into per-rank shards and locally
+#      mx.dequantize + sum them (a pure local op -- no more network
+#      traffic once the gather lands)
+#
+# Rationale: w_q is int8 (1 byte/elem) vs bf16 y (2 bytes/elem), plus a
+# small scales/biases overhead (one fp16 scale + bias per group_size
+# elements, group_size=64 by default => 2*2/64 = 0.0625 bytes/elem extra).
+# Net payload per rank drops from 2.0 to ~1.06 bytes/elem, ~47% smaller,
+# before the collective algorithm's own multiplier. Quality cost is the
+# int8 round-trip quantization error on the *already MoE-combined* y
+# (weighted_reduce + shared_experts output) instead of an exact bf16 sum.
+#
+# `bits`/`group_size` are configurable via EXO_DSV4_MOE_ALLSUM_QUANT_BITS
+# (default 8) and EXO_DSV4_MOE_ALLSUM_QUANT_GROUP (default 64).
+#
+# The local dequant+sum step (`_dequant_sum_shards`) is unit-tested in
+# isolation (no mx.distributed dependency) since this dev machine has no
+# multi-rank capability -- see
+# src/exo/worker/engines/mlx/tests/test_moe_allsum_quant.py in the exo
+# repo for the correctness harness (quant-vs-exact error bound, additive
+# associativity, dtype/shape round-trip, and negative-control sabotage).
+# -----------------------------------------------------------------------
+_MOE_ALLSUM_QUANT = os.environ.get("EXO_DSV4_MOE_ALLSUM_QUANT", "0") == "1"
+_MOE_ALLSUM_QUANT_BITS = int(os.environ.get("EXO_DSV4_MOE_ALLSUM_QUANT_BITS", "8"))
+_MOE_ALLSUM_QUANT_GROUP = int(os.environ.get("EXO_DSV4_MOE_ALLSUM_QUANT_GROUP", "64"))
+
+
+def _dequant_sum_shards(
+    wq_all: mx.array,
+    scales_all: mx.array,
+    biases_all: mx.array,
+    *,
+    n_shards: int,
+    out_shape: tuple,
+    out_dtype: mx.Dtype,
+    bits: int,
+    group_size: int,
+) -> mx.array:
+    """Locally dequantize `n_shards` stacked quantized shards and sum them.
+
+    `wq_all`/`scales_all`/`biases_all` are the result of all_gather'ing one
+    rank's mx.quantize(y) output across `n_shards` ranks: shape[0] is
+    n_shards * per_rank_rows, concatenated along axis 0 (all_gather's
+    documented behavior). This function is pure/local -- it performs no
+    collective communication, so it is directly unit-testable by
+    synthesizing the "gathered" arrays from `n_shards` independently
+    quantized local shards.
+    """
+    per_rank_rows = wq_all.shape[0] // n_shards
+    total = mx.zeros(out_shape, dtype=mx.float32).reshape(per_rank_rows, -1)
+    for _r in range(n_shards):
+        _lo = _r * per_rank_rows
+        _hi = _lo + per_rank_rows
+        _deq = mx.dequantize(
+            wq_all[_lo:_hi],
+            scales_all[_lo:_hi],
+            biases_all[_lo:_hi],
+            group_size=group_size,
+            bits=bits,
+        )
+        total = total + _deq.astype(mx.float32)
+    return total.reshape(out_shape).astype(out_dtype)
+
+
+def _quantized_moe_all_sum(
+    y: mx.array,
+    group: "mx.distributed.Group",
+    *,
+    bits: int = 8,
+    group_size: int = 64,
+) -> mx.array:
+    """Bandwidth-reduced replacement for mx.distributed.all_sum(y, group).
+
+    Quantizes `y` locally, all_gathers the quantized payload (instead of
+    reducing the full bf16 tensor over the wire), then dequantizes and
+    sums the gathered per-rank shards locally. Mathematically approximates
+    the exact all_sum: `dequant(quant(y_0)) + dequant(quant(y_1)) + ...`
+    instead of `y_0 + y_1 + ...` -- introduces int8-affine-quant rounding
+    error on each rank's contribution, bounded by the group's dynamic
+    range / (2**bits - 1).
+    """
+    orig_dtype = y.dtype
+    orig_shape = y.shape
+    world_size = group.size()
+    y2 = y.reshape(-1, orig_shape[-1]).astype(mx.float32)
+    wq, scales, biases = mx.quantize(y2, group_size=group_size, bits=bits)
+    wq_all = mx.distributed.all_gather(wq, group=group)
+    scales_all = mx.distributed.all_gather(scales, group=group)
+    biases_all = mx.distributed.all_gather(biases, group=group)
+    return _dequant_sum_shards(
+        wq_all,
+        scales_all,
+        biases_all,
+        n_shards=world_size,
+        out_shape=orig_shape,
+        out_dtype=orig_dtype,
+        bits=bits,
+        group_size=group_size,
+    )
+
+
 # Wrap ALL collectives that can carry fp32 activations (all_gather, and
 # defensively all_max/all_min/sum_scatter) so no fp32 payload reaches jaccl.
 for _cname in ("all_gather", "all_max", "all_min", "sum_scatter"):
@@ -2834,7 +2943,15 @@ class DeepseekV4MoE(nn.Module):
 
             if self.sharding_group is not None:
                 with span("moe.all_sum"):
-                    y = mx.distributed.all_sum(y, group=self.sharding_group)
+                    if _MOE_ALLSUM_QUANT:
+                        y = _quantized_moe_all_sum(
+                            y,
+                            self.sharding_group,
+                            bits=_MOE_ALLSUM_QUANT_BITS,
+                            group_size=_MOE_ALLSUM_QUANT_GROUP,
+                        )
+                    else:
+                        y = mx.distributed.all_sum(y, group=self.sharding_group)
                     # Phase H Lever 1 (2026-05-06): force evaluation of the
                     # collective output before any subsequent layer reads
                     # `y`. The all_sum itself is bit-deterministic across
