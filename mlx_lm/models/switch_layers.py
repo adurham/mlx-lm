@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
+import os
 from functools import partial
 
 import mlx.core as mx
@@ -8,6 +9,68 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from ..profiler import span
+
+
+# ---------------------------------------------------------------------------
+# Hybrid MoE dispatch (PROTOTYPE, env-gated, default OFF)
+#
+# Motivation (routing granularity, not a workaround): MLX's GatherQMM
+# eval_gpu picks its kernel from an *aggregate* B/E ratio (total routed
+# (token,expert) pairs / total experts). For DeepSeek-V4-Flash decode-sized
+# chunks that aggregate is ~48, far above the threshold (~6) at which the
+# small-run `gather_qmv_rhs` kernel is enabled, so the fast small-run kernel
+# never fires -- even though real (skewed) routing leaves many individual
+# experts with only a handful of rows.
+#
+# This prototype splits the already-expert-sorted rows into two groups by
+# per-expert run length and issues two gather_qmm calls: the "short" group
+# has a low aggregate B/E ratio (so MLX may select gather_qmv_rhs) and the
+# "long" group keeps the existing steel path. Outputs are recombined into
+# the original row order, so the result is numerically equivalent to the
+# single-call path up to kernel accumulation order.
+#
+# Enable with EXO_MOE_HYBRID_DISPATCH=1 (default "0" == completely inert).
+# Threshold via EXO_MOE_HYBRID_THRESHOLD (default 8).
+#
+# !!! PERFORMANCE CAVEAT (correctness-only prototype) !!!
+# `_hybrid_partition` performs ONE host-side read (`.item()`) of the number
+# of short rows, because MLX needs a concrete shape to slice the two
+# sub-arrays. That forces a GPU sync mid-pipeline and would very likely
+# erase any kernel-level win. This MUST be replaced (e.g. by a fused
+# primitive, a padded fixed-capacity split, or a C++-level dispatch that
+# knows the run lengths without a round-trip) before this path could ever
+# be considered a real performance improvement.
+# ---------------------------------------------------------------------------
+
+
+def _hybrid_enabled() -> bool:
+    return os.environ.get("EXO_MOE_HYBRID_DISPATCH", "0") == "1"
+
+
+def _hybrid_threshold() -> int:
+    return int(os.environ.get("EXO_MOE_HYBRID_THRESHOLD", "8"))
+
+
+def _hybrid_partition(idx, num_experts, threshold):
+    """Split expert-sorted rows into (short-run, long-run) groups.
+
+    ``idx`` is the flat, already-expert-sorted rhs index array of shape
+    ``(P,)``. Returns ``(perm, n_short)`` where ``perm`` is a permutation of
+    ``range(P)`` that lists all rows belonging to short-run experts first
+    (still ordered by expert id), then all rows belonging to long-run
+    experts (also ordered by expert id); ``n_short`` is a Python int.
+
+    Both halves therefore satisfy ``sorted_indices=True`` for gather_qmm.
+    """
+    counts = mx.zeros((num_experts,), dtype=mx.int32)
+    counts = counts.at[idx].add(mx.ones(idx.shape, dtype=mx.int32))
+    is_long = (counts[idx] > threshold).astype(mx.int32)
+    # Sort key keeps the two groups contiguous and each group expert-sorted.
+    key = is_long * (num_experts + 1) + idx.astype(mx.int32)
+    perm = mx.argsort(key)
+    # NOTE: host-side sync -- see PERFORMANCE CAVEAT above.
+    n_short = int((1 - is_long).sum().item())
+    return perm, n_short
 
 
 def _gather_sort(x, indices):
@@ -187,20 +250,57 @@ class SwitchGLU(nn.Module):
                 x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        with span("switch.up_proj"):
-            x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        with span("switch.gate_proj"):
-            x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-        with span("switch.activation"):
-            x_act = self.activation(x_up, x_gate)
-        with span("switch.down_proj"):
-            x = self.down_proj(x_act, idx, sorted_indices=do_sort)
+
+        if do_sort and _hybrid_enabled():
+            x = self._hybrid_body(x, idx)
+        else:
+            with span("switch.up_proj"):
+                x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+            with span("switch.gate_proj"):
+                x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+            with span("switch.activation"):
+                x_act = self.activation(x_up, x_gate)
+            with span("switch.down_proj"):
+                x = self.down_proj(x_act, idx, sorted_indices=do_sort)
 
         if do_sort:
             with span("switch.scatter_unsort"):
                 x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+    def _hybrid_body(self, x, idx):
+        """Two-call hybrid dispatch over expert-sorted rows (PROTOTYPE).
+
+        ``x`` is ``(P, 1, D)`` expert-sorted, ``idx`` is ``(P,)``. Returns
+        the down_proj output in the SAME row order as the inputs, so the
+        caller's ``_scatter_unsort`` still applies unchanged.
+        """
+        num_experts = self.gate_proj.num_experts
+        threshold = _hybrid_threshold()
+        with span("switch.hybrid_partition"):
+            perm, n_short = _hybrid_partition(idx, num_experts, threshold)
+        total = idx.shape[0]
+        if n_short == 0 or n_short == total:
+            # Degenerate split: nothing to gain, take the single-call path.
+            return self._run_group(x, idx)
+
+        x_p = x[perm]
+        idx_p = idx[perm]
+        outs = []
+        with span("switch.hybrid_short"):
+            outs.append(self._run_group(x_p[:n_short], idx_p[:n_short]))
+        with span("switch.hybrid_long"):
+            outs.append(self._run_group(x_p[n_short:], idx_p[n_short:]))
+        out = mx.concatenate(outs, axis=0)
+        # Undo the partition permutation -> back to plain expert-sorted order.
+        inv_perm = mx.argsort(perm)
+        return out[inv_perm]
+
+    def _run_group(self, x, idx):
+        x_up = self.up_proj(x, idx, sorted_indices=True)
+        x_gate = self.gate_proj(x, idx, sorted_indices=True)
+        return self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=True)
 
 
 class BatchedSwitchGLU(SwitchGLU):
