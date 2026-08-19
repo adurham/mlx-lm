@@ -444,6 +444,51 @@ def _get_nop_targets():
     return targets
 
 
+# 2026-08-19 payload-size causal probe for the MoE all_sum (P1).
+# Putting a token "all_sum_frac=<f>" (0.0 <= f <= 1.0) in /tmp/dsv4_nop_targets
+# makes DeepseekV4MoE's per-layer all_sum reduce only the first ceil(f*L) SEQUENCE
+# ROWS of y across ranks, and pass the remaining rows through unreduced. The
+# collective's CALL COUNT (43/forward) and its call site are unchanged -- only the
+# payload BYTES change. So a warm-vs-warm sweep over f in {1.0, 0.5, 0.25, 0.0}
+# separates the two hypotheses:
+#   bandwidth-bound -> cost falls roughly linearly with f
+#   overhead-bound  -> cost stays roughly flat until f == 0 (or falls far less
+#                      than linearly), i.e. the per-call fixed cost dominates
+# Output is GARBAGE at any f < 1.0 (rows not reduced hold only this rank's
+# partial MoE result) -- bench tok/s only, exactly like the existing "all_sum"
+# NOP target. NEVER leave this token set. When f == 1.0 the sliced path is still
+# taken (same slice/concatenate graph shape) so the f=1.0 arm is the correct
+# apples-to-apples control for the smaller-f arms rather than the production path.
+# Absent token = production path, byte-identical, zero behaviour change.
+def _get_allsum_fraction():
+    """Return the all_sum payload fraction in [0,1], or None if not set."""
+    for _t in _get_nop_targets():
+        if _t.startswith("all_sum_frac="):
+            try:
+                _f = float(_t.split("=", 1)[1])
+            except ValueError:
+                return None
+            return min(max(_f, 0.0), 1.0)
+    return None
+
+
+def _all_sum_fractional(y, group, frac):
+    """all_sum only the first ceil(frac*L) sequence rows of y (B, L, H).
+
+    Diagnostic only -- breaks cross-rank correctness for the unreduced rows.
+    Keeps the per-layer collective call count identical (one call per layer,
+    or zero at frac == 0) while scaling the transferred payload by `frac`.
+    """
+    _seq_len = y.shape[1]
+    _n = int(-(-_seq_len * frac // 1))  # ceil
+    if _n <= 0:
+        return y
+    if _n >= _seq_len:
+        return mx.distributed.all_sum(y, group=group)
+    _head = mx.distributed.all_sum(y[:, :_n, :], group=group)
+    return mx.concatenate([_head, y[:, _n:, :]], axis=1)
+
+
 # Monkey-patch mx.distributed.all_sum to honor the NOP flag.
 # Idempotent: guarded by _all_sum_nop_wrapped attribute.
 #
@@ -2834,7 +2879,13 @@ class DeepseekV4MoE(nn.Module):
 
             if self.sharding_group is not None:
                 with span("moe.all_sum"):
-                    y = mx.distributed.all_sum(y, group=self.sharding_group)
+                    _asf = _get_allsum_fraction()
+                    if _asf is None:
+                        y = mx.distributed.all_sum(y, group=self.sharding_group)
+                    else:
+                        # P1 payload-size causal probe (diagnostic only; see
+                        # _all_sum_fractional). GARBAGE output by design.
+                        y = _all_sum_fractional(y, self.sharding_group, _asf)
                     # Phase H Lever 1 (2026-05-06): force evaluation of the
                     # collective output before any subsequent layer reads
                     # `y`. The all_sum itself is bit-deterministic across
