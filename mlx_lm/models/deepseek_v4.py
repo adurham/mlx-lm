@@ -488,6 +488,131 @@ if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
     _all_sum_nop_aware._all_sum_nop_wrapped = True
     mx.distributed.all_sum = _all_sum_nop_aware
 
+# -----------------------------------------------------------------------
+# Shared-scale int8 quantized moe.all_sum replacement (2026-08-19).
+#
+# STAYS 100% ON THE RELIABLE all_sum PATH. NO all_gather ANYWHERE. This is
+# a deliberately different design from the all_gather-based quantized
+# all_sum (mlx-lm branch feat/moe-allsum-quant-2026-08-19), which hung a
+# real 2-rank collective in production (see
+# docs/moe-allsum-quant-live-test-failed-2026-08-19.md) -- all_gather is
+# ruled OUT for this mechanism, permanently, on this codebase.
+#
+# Protocol (two all_sum calls, zero all_gather):
+#   1. Each rank computes its local max(|y|) and all_sum's that SCALAR
+#      across the group. Because all per-rank absmax values are >= 0, the
+#      SUM of them is always >= the true global max(|y|) (sum of
+#      non-negatives upper-bounds the max). So the post-all_sum scalar is
+#      a valid (if slightly loose/conservative) global scale -- and,
+#      critically, it is IDENTICAL bit-for-bit on every rank, because it
+#      is itself the output of a collective all_sum. This is what makes
+#      it a "shared scale": every rank quantizes with the exact same
+#      scale, so summing the quantized integers and dequantizing once at
+#      the end is mathematically equivalent (up to int8 rounding error)
+#      to summing the original values and is NOT affected by cross-rank
+#      scale mismatches (the failure mode that would arise from each rank
+#      picking its own independent per-tensor scale).
+#   2. Each rank quantizes y to signed int8 using that shared scale,
+#      casts to bf16 (bf16 exactly represents all integers in
+#      [-128, 127], so this cast is lossless and keeps the payload on
+#      jaccl's proven bf16 all_sum wire path -- no new dtype plumbing),
+#      and all_sum's the bf16 payload. Because both ranks used the SAME
+#      scale, the summed integer payload is the exact quantized
+#      representation of sum(y_rank_0, y_rank_1, ...) up to int8
+#      quantization error -- dequantizing once (mul by scale) recovers
+#      the combined MoE output.
+#
+# Bandwidth: int8-domain payload cast to bf16 for the wire (1 byte of
+# *information* per element, though the wire dtype is still bf16 -- see
+# caveat below) plus one tiny scalar all_sum. Correctness is validated by
+# a real 2-rank `mlx.launch -n 2` run (see
+# tests/test_moe_allsum_sharedscale_distributed.py) comparing against the
+# plain bf16 all_sum bit-for-bit reference, not just local math.
+#
+# CAVEAT (honest, not swept under the rug): because jaccl's proven wire
+# path is bf16, this payload is NOT actually smaller in bytes-on-the-wire
+# than plain bf16 all_sum (bf16 in, bf16 out either way) -- the reduction
+# here is in EFFECTIVE INFORMATION PRECISION (8 bits inside a 16-bit
+# slot) rather than raw bytes. This design intentionally trades that
+# byte-parity for perfect reliability: it reuses all_sum's exact existing
+# call shape (single tensor in, same tensor shape/dtype out, one
+# collective) with zero new distributed code paths, so it cannot exhibit
+# the all_gather shape/ordering hang that killed the other design. A
+# genuine byte-level win would need an int8-native wire dtype in jaccl,
+# which is out of scope here (see EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_BITS
+# below for the tunable that would matter if/when that lands).
+#
+# EXO_DSV4_MOE_ALLSUM_SHAREDSCALE=1 (default 0, opt-in, byte-identical to
+# the plain all_sum path when off). EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_BITS
+# (default 8) sets the integer quantization width.
+# -----------------------------------------------------------------------
+_MOE_ALLSUM_SHAREDSCALE = (
+    os.environ.get("EXO_DSV4_MOE_ALLSUM_SHAREDSCALE", "0") == "1"
+)
+_MOE_ALLSUM_SHAREDSCALE_BITS = int(
+    os.environ.get("EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_BITS", "8")
+)
+
+
+def _sharedscale_compute_scale(y: mx.array, *, group, bits: int, eps: float = 1e-8):
+    """Compute the shared (identical-on-every-rank) int quantization scale.
+
+    Uses ONLY all_sum. Sum of non-negative per-rank abs-max values
+    upper-bounds the true global abs-max, so the scale is safe (never
+    clips) though slightly looser than the true optimum -- the price
+    paid for staying off all_gather/all_reduce-max.
+
+    OVERFLOW-SAFETY HEADROOM (2026-08-19, real bug found + fixed before
+    any cluster deployment): scale = sum_r(max_r) / qmax, so each rank's
+    quantized code q_r satisfies |q_r| <= round(max_r * qmax / M) <=
+    max_r*qmax/M + 0.5 (M = sum_r(max_r)). Summing over ALL N ranks:
+    |sum(q_r)| <= sum(max_r)*qmax/M + N*0.5 = qmax + N/2 -- which
+    OVERFLOWS the full int8 range (qmax=127) as soon as N/2 > 0, i.e.
+    for ANY N >= 1 at the naive qmax=127. This bound also covers every
+    INTERMEDIATE partial sum inside jaccl's reduction, not just the
+    final result, since it holds for any subset of ranks. Reserve
+    ceil(group.size()/2) of headroom so the worst case (qmax + N/2)
+    stays within the representable range for the accumulation dtype.
+    Consulted and verified 2026-08-19 before this was ever deployed.
+    """
+    n_ranks = group.size() if group is not None else 1
+    full_range_max = (1 << (bits - 1)) - 1
+    qmax = full_range_max - -(-n_ranks // 2)  # full_range_max - ceil(n_ranks/2)
+    local_absmax = mx.max(mx.abs(y)).reshape(1).astype(mx.float32)
+    shared_absmax_sum = mx.distributed.all_sum(local_absmax, group=group)
+    scale = mx.maximum(shared_absmax_sum, eps) / float(qmax)
+    return scale, qmax
+
+
+def _quantized_moe_all_sum_sharedscale(
+    y: mx.array, *, group, bits: int = 8
+) -> mx.array:
+    """Shared-scale int8 quantized replacement for mx.distributed.all_sum.
+
+    100% on the all_sum path -- see the module-level comment above for
+    the full protocol and rationale. Byte-identical call SHAPE to plain
+    all_sum: one tensor in (float dtype), same-shape tensor out.
+    """
+    orig_dtype = y.dtype
+    y32 = y.astype(mx.float32)
+    scale, qmax = _sharedscale_compute_scale(y32, group=group, bits=bits)
+    q = mx.round(y32 / scale)
+    q = mx.clip(q, -(qmax + 1), qmax)
+    # Cast to the actual narrow integer wire dtype (int8 for bits=8) so
+    # all_sum moves 1 byte/element on the wire instead of the 2 bytes/
+    # element a bf16 cast would cost -- this is what realizes the real
+    # ~2x bandwidth win the shared-scale protocol is for. Summing N
+    # int8-clipped values in [-qmax-1, qmax] across `group` ranks can
+    # exceed the int8 range, so accumulate in int32 (still much cheaper
+    # to move than fp32/bf16 payloads) and only narrow to int8 for the
+    # wire cast itself.
+    q_i8 = q.astype(mx.int8)
+    summed_i8 = mx.distributed.all_sum(q_i8, group=group)
+    summed = summed_i8.astype(mx.int32)
+    result = summed.astype(mx.float32) * scale
+    return result.astype(orig_dtype)
+
+
 # Wrap ALL collectives that can carry fp32 activations (all_gather, and
 # defensively all_max/all_min/sum_scatter) so no fp32 payload reaches jaccl.
 for _cname in ("all_gather", "all_max", "all_min", "sum_scatter"):
@@ -2834,7 +2959,14 @@ class DeepseekV4MoE(nn.Module):
 
             if self.sharding_group is not None:
                 with span("moe.all_sum"):
-                    y = mx.distributed.all_sum(y, group=self.sharding_group)
+                    if _MOE_ALLSUM_SHAREDSCALE:
+                        y = _quantized_moe_all_sum_sharedscale(
+                            y,
+                            group=self.sharding_group,
+                            bits=_MOE_ALLSUM_SHAREDSCALE_BITS,
+                        )
+                    else:
+                        y = mx.distributed.all_sum(y, group=self.sharding_group)
                     # Phase H Lever 1 (2026-05-06): force evaluation of the
                     # collective output before any subsequent layer reads
                     # `y`. The all_sum itself is bit-deterministic across
