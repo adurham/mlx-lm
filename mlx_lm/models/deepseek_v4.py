@@ -553,8 +553,114 @@ _MOE_ALLSUM_SHAREDSCALE_BITS = int(
     os.environ.get("EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_BITS", "8")
 )
 
+# -----------------------------------------------------------------------
+# Shared-scale phase probe (2026-08-19, env-gated
+# EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE=1).
+#
+# WHY: the shared-scale protocol replaces ONE bf16 all_sum with a
+# five-phase pipeline (local abs-max -> scalar all_sum -> quantize ->
+# int8 payload all_sum -> dequantize). Aggregate end-to-end timing
+# cannot tell us WHICH phase eats the theoretical ~2x wire win, and it
+# cannot see the thing most likely to eat it: cross-rank ARRIVAL SKEW.
+# Both all_sum calls are barriers, so a rank that reaches phase N late
+# makes every other rank's collective look slow, and the cost shows up
+# attributed to the wrong rank and the wrong phase.
+#
+# WHAT: per-phase wall-clock, measured with an mx.eval() fence at every
+# phase boundary so each interval is real device time for that phase and
+# not lazy-graph build time that lands on whichever op is evaluated
+# first. Timestamps are ABSOLUTE (time.time(), i.e. wall-clock epoch
+# seconds, NOT perf_counter) precisely so two ranks' logs can be aligned
+# offline on a common axis and the entry/collective-entry skew read off
+# directly. Every line carries rank= and pid= for that alignment.
+#
+# COST when off: one bool read per call (the module global), nothing
+# else -- the instrumented function keeps the exact original op sequence
+# with no extra evals, so the OFF path stays byte-identical and
+# performance-identical to the uninstrumented commit.
+#
+# COST when on: 5 mx.eval() fences per call. These SERIALIZE the phases,
+# so absolute throughput drops; the point is per-phase SHARE and
+# cross-rank skew, not a throughput measurement. Never leave this on for
+# a benchmark run.
+#
+# MODES:
+#   EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE=1
+#       aggregate mode: accumulate per-phase ms and dump p50/p99/max
+#       every _SS_PROBE_LOG_EVERY calls (default 50).
+#   EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE=raw
+#       raw mode: additionally emit ONE line PER CALL carrying the
+#       absolute epoch timestamp of every phase boundary. This is the
+#       mode to use for cross-rank skew analysis -- diff rank 0's and
+#       rank 1's t_enter/t_scale_allsum_enter/t_payload_allsum_enter for
+#       the same call index to see who is waiting on whom.
+#   EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE_LOG_EVERY=N (default 50)
+#
+# Output (aggregate):
+#   [SS-PROBE pid=N rank=R] calls=N <phase>: n=N p50=X.XXms p99=... max=...
+# Output (raw, one per call):
+#   [SS-PROBE-RAW pid=N rank=R] call=N t_enter=<epoch> local_absmax=X.XXms
+#     scale_allsum=... quantize=... payload_allsum=... dequant=...
+#     t_scale_allsum_enter=<epoch> t_payload_allsum_enter=<epoch>
+#     t_exit=<epoch> nbytes=N
+# -----------------------------------------------------------------------
+_SS_PROBE_MODE = os.environ.get("EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE", "")
+_SS_PROBE_ENABLED = _SS_PROBE_MODE not in ("", "0")
+_SS_PROBE_RAW = _SS_PROBE_MODE == "raw"
+_SS_PROBE_LOG_EVERY = int(
+    os.environ.get("EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE_LOG_EVERY", "50")
+)
+_SS_PROBE_PHASES = (
+    "local_absmax",
+    "scale_allsum",
+    "quantize",
+    "payload_allsum",
+    "dequant",
+)
+_SS_PROBE_ACC: Dict[str, List[float]] = {p: [] for p in _SS_PROBE_PHASES}
+_SS_PROBE_CALLS: int = 0
 
-def _sharedscale_compute_scale(y: mx.array, *, group, bits: int, eps: float = 1e-8):
+
+def _ss_probe_rank(group) -> int:
+    """Best-effort rank id for probe lines (-1 when there is no group)."""
+    try:
+        return int(group.rank()) if group is not None else -1
+    except Exception:
+        return -1
+
+
+def _ss_probe_dump(rank: int) -> None:
+    """Emit the aggregate per-phase percentile line and clear the window."""
+    import sys as _ss_sys
+
+    head = f"[SS-PROBE pid={os.getpid()} rank={rank}] calls={_SS_PROBE_CALLS}"
+    lines = [head + "\n"]
+    for phase in _SS_PROBE_PHASES:
+        samples = sorted(_SS_PROBE_ACC[phase])
+        n = len(samples)
+        if n == 0:
+            continue
+        p50 = samples[n // 2]
+        p99 = samples[min(n - 1, int(n * 0.99))]
+        lines.append(
+            f"[SS-PROBE pid={os.getpid()} rank={rank}]   {phase:<14s} "
+            f"n={n:4d} p50={p50:7.3f}ms p99={p99:7.3f}ms "
+            f"max={samples[-1]:7.3f}ms sum={sum(samples):9.1f}ms\n"
+        )
+    _ss_sys.stderr.write("".join(lines))
+    _ss_sys.stderr.flush()
+    for phase in _SS_PROBE_PHASES:
+        _SS_PROBE_ACC[phase].clear()
+
+
+def _sharedscale_compute_scale(
+    y: mx.array,
+    *,
+    group,
+    bits: int,
+    eps: float = 1e-8,
+    timings: Optional[Dict[str, float]] = None,
+):
     """Compute the shared (identical-on-every-rank) int quantization scale.
 
     Uses ONLY all_sum. Sum of non-negative per-rank abs-max values
@@ -574,13 +680,36 @@ def _sharedscale_compute_scale(y: mx.array, *, group, bits: int, eps: float = 1e
     ceil(group.size()/2) of headroom so the worst case (qmax + N/2)
     stays within the representable range for the accumulation dtype.
     Consulted and verified 2026-08-19 before this was ever deployed.
+
+    PROBE (2026-08-19): when `timings` is not None the two sub-phases
+    ("local_absmax", "scale_allsum") are separately fenced with mx.eval
+    and their durations (ms) plus the absolute epoch timestamp at which
+    the scalar all_sum was entered are written into it. `timings` is
+    only ever non-None when EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE is
+    set, so the production path is unchanged.
     """
     n_ranks = group.size() if group is not None else 1
     full_range_max = (1 << (bits - 1)) - 1
     qmax = full_range_max - -(-n_ranks // 2)  # full_range_max - ceil(n_ranks/2)
+    if timings is None:
+        local_absmax = mx.max(mx.abs(y)).reshape(1).astype(mx.float32)
+        shared_absmax_sum = mx.distributed.all_sum(local_absmax, group=group)
+        scale = mx.maximum(shared_absmax_sum, eps) / float(qmax)
+        return scale, qmax
+
+    import time as _ss_time
+
+    t0 = _ss_time.time()
     local_absmax = mx.max(mx.abs(y)).reshape(1).astype(mx.float32)
+    mx.eval(local_absmax)
+    t1 = _ss_time.time()
     shared_absmax_sum = mx.distributed.all_sum(local_absmax, group=group)
     scale = mx.maximum(shared_absmax_sum, eps) / float(qmax)
+    mx.eval(scale)
+    t2 = _ss_time.time()
+    timings["local_absmax"] = (t1 - t0) * 1000.0
+    timings["scale_allsum"] = (t2 - t1) * 1000.0
+    timings["t_scale_allsum_enter"] = t1
     return scale, qmax
 
 
@@ -593,6 +722,8 @@ def _quantized_moe_all_sum_sharedscale(
     the full protocol and rationale. Byte-identical call SHAPE to plain
     all_sum: one tensor in (float dtype), same-shape tensor out.
     """
+    if _SS_PROBE_ENABLED:
+        return _quantized_moe_all_sum_sharedscale_probed(y, group=group, bits=bits)
     orig_dtype = y.dtype
     y32 = y.astype(mx.float32)
     scale, qmax = _sharedscale_compute_scale(y32, group=group, bits=bits)
@@ -611,6 +742,79 @@ def _quantized_moe_all_sum_sharedscale(
     summed = summed_i8.astype(mx.int32)
     result = summed.astype(mx.float32) * scale
     return result.astype(orig_dtype)
+
+
+def _quantized_moe_all_sum_sharedscale_probed(
+    y: mx.array, *, group, bits: int = 8
+) -> mx.array:
+    """Instrumented twin of _quantized_moe_all_sum_sharedscale.
+
+    Same math, same op sequence, same result -- but every phase boundary
+    carries an mx.eval() fence and an absolute wall-clock (epoch)
+    timestamp so per-phase cost and cross-rank arrival skew can both be
+    read off the logs. Only reachable when
+    EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE is set.
+    """
+    global _SS_PROBE_CALLS
+    import sys as _ss_sys
+    import time as _ss_time
+
+    rank = _ss_probe_rank(group)
+    timings: Dict[str, float] = {}
+    t_enter = _ss_time.time()
+
+    orig_dtype = y.dtype
+    y32 = y.astype(mx.float32)
+    scale, qmax = _sharedscale_compute_scale(
+        y32, group=group, bits=bits, timings=timings
+    )
+
+    t_quant0 = _ss_time.time()
+    q = mx.round(y32 / scale)
+    q = mx.clip(q, -(qmax + 1), qmax)
+    q_i8 = q.astype(mx.int8)
+    mx.eval(q_i8)
+    t_payload0 = _ss_time.time()
+    summed_i8 = mx.distributed.all_sum(q_i8, group=group)
+    mx.eval(summed_i8)
+    t_dequant0 = _ss_time.time()
+    summed = summed_i8.astype(mx.int32)
+    result = summed.astype(mx.float32) * scale
+    out = result.astype(orig_dtype)
+    mx.eval(out)
+    t_exit = _ss_time.time()
+
+    timings["quantize"] = (t_payload0 - t_quant0) * 1000.0
+    timings["payload_allsum"] = (t_dequant0 - t_payload0) * 1000.0
+    timings["dequant"] = (t_exit - t_dequant0) * 1000.0
+
+    for phase in _SS_PROBE_PHASES:
+        value = timings.get(phase)
+        if value is not None:
+            _SS_PROBE_ACC[phase].append(value)
+    _SS_PROBE_CALLS += 1
+
+    if _SS_PROBE_RAW:
+        _ss_sys.stderr.write(
+            f"[SS-PROBE-RAW pid={os.getpid()} rank={rank}] "
+            f"call={_SS_PROBE_CALLS} t_enter={t_enter:.6f} "
+            f"local_absmax={timings.get('local_absmax', 0.0):.3f}ms "
+            f"scale_allsum={timings.get('scale_allsum', 0.0):.3f}ms "
+            f"quantize={timings['quantize']:.3f}ms "
+            f"payload_allsum={timings['payload_allsum']:.3f}ms "
+            f"dequant={timings['dequant']:.3f}ms "
+            f"t_scale_allsum_enter="
+            f"{timings.get('t_scale_allsum_enter', 0.0):.6f} "
+            f"t_payload_allsum_enter={t_payload0:.6f} "
+            f"t_exit={t_exit:.6f} "
+            f"nbytes={q_i8.size} shape={tuple(y.shape)}\n"
+        )
+        _ss_sys.stderr.flush()
+
+    if _SS_PROBE_LOG_EVERY > 0 and _SS_PROBE_CALLS % _SS_PROBE_LOG_EVERY == 0:
+        _ss_probe_dump(rank)
+
+    return out
 
 
 # Wrap ALL collectives that can carry fp32 activations (all_gather, and
