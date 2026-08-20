@@ -1315,6 +1315,37 @@ class PoolingCache(_BaseCache):
         # top of __call__ so all in-call reads see consistent state.
         self._pending_offset_bump = 0
 
+    # ---- overlap-pooling (compress_ratio == 4) cross-call carry ----------
+    # Uniform API shared with BatchPoolingCache so Compressor.__call__ has a
+    # single code path for both. Single-stream: one carry, always updated,
+    # and the carry window is always the last window of the call.
+
+    def fetch_overlap_carry(self, batch_size, ratio, half_dim, dtype):
+        """Return (kv_carry, gate_carry) of shape (B, 1, ratio, half_dim).
+
+        At sequence start there is no previous window, so return the
+        zero/-inf pair that reproduces the original always-pad behavior.
+        """
+        if self._overlap_kv_carry is not None:
+            return self._overlap_kv_carry, self._overlap_gate_carry
+        return (
+            mx.zeros((batch_size, 1, ratio, half_dim), dtype=dtype),
+            mx.full((batch_size, 1, ratio, half_dim), -mx.inf, dtype=dtype),
+        )
+
+    def overlap_carry_index(self, num_windows: int):
+        """Index of the window whose tail feeds the NEXT call's carry.
+
+        Single-stream: the last window this call produced.
+        """
+        return mx.array([max(num_windows - 1, 0)], dtype=mx.int32)
+
+    def store_overlap_carry(self, last_kv_a, last_gate_a) -> None:
+        """Persist this call's carry. Single-stream, so unconditional: the
+        call only reaches here when at least one window was produced."""
+        self._overlap_kv_carry = last_kv_a
+        self._overlap_gate_carry = last_gate_a
+
     def commit_pending(self) -> None:
         """Apply any staged offset bump from update_and_fetch_deferred.
 
@@ -1915,6 +1946,79 @@ class BatchPoolingCache(_BaseCache):
         self._lengths = [2**31] * batch_size
         self._processed = [0] * batch_size
 
+        # ---- overlap-pooling (compress_ratio == 4) cross-call carry ------
+        # Per-stream twin of PoolingCache._overlap_kv_carry. Stored as a
+        # single (B, 1, ratio, half_dim) array (row i belongs ONLY to stream
+        # i) plus a per-stream "have we ever stored a carry" flag, because
+        # streams in a batch hit their first complete pooled window at
+        # different calls. ``None`` until the first window completes anywhere.
+        self._overlap_kv_carry = None
+        self._overlap_gate_carry = None
+        self._overlap_carry_valid = [False] * batch_size
+        # Complete pooled windows produced by the most recent
+        # accumulate_windows call, PER STREAM. Streams differ because
+        # ``usable[i]`` differs; the zero-padded rows of the returned r_kv
+        # must never be mistaken for real windows.
+        self._overlap_windows_this_call = [0] * batch_size
+
+    def fetch_overlap_carry(self, batch_size, ratio, half_dim, dtype):
+        """Return (kv_carry, gate_carry), shape (B, 1, ratio, half_dim).
+
+        Rows for streams that have not yet produced any pooled window get
+        the zero/-inf sequence-start pad; rows for streams that have get
+        THEIR OWN persisted carry. Never broadcasts one stream's carry onto
+        another.
+        """
+        zeros = mx.zeros((batch_size, 1, ratio, half_dim), dtype=dtype)
+        neg_inf = mx.full((batch_size, 1, ratio, half_dim), -mx.inf, dtype=dtype)
+        stored_kv = self._overlap_kv_carry
+        stored_gate = self._overlap_gate_carry
+        if stored_kv is None or stored_gate is None:
+            return zeros, neg_inf
+        valid = mx.array(self._overlap_carry_valid).reshape(batch_size, 1, 1, 1)
+        kv_carry = mx.where(valid, stored_kv.astype(dtype), zeros)
+        gate_carry = mx.where(valid, stored_gate.astype(dtype), neg_inf)
+        return kv_carry, gate_carry
+
+    def overlap_carry_index(self, num_windows: int):
+        """Per-stream index of the window whose tail feeds the next carry.
+
+        ``num_windows`` is the padded window count of the batched compress
+        input; the REAL per-stream count is ``_overlap_windows_this_call``.
+        Streams with zero real windows get index 0 (a padded row); their
+        gathered value is discarded by ``store_overlap_carry``.
+        """
+        return mx.array(
+            [max(n - 1, 0) for n in self._overlap_windows_this_call],
+            dtype=mx.int32,
+        )
+
+    def store_overlap_carry(self, last_kv_a, last_gate_a) -> None:
+        """Persist the per-stream carry, updating ONLY streams that actually
+        produced a complete window this call. A stream that produced none
+        keeps the carry from its own previous chunk — overwriting it with
+        the zero-padded row would silently corrupt that stream."""
+        produced = [n > 0 for n in self._overlap_windows_this_call]
+        if not any(produced):
+            return
+        prev_kv = self._overlap_kv_carry
+        prev_gate = self._overlap_gate_carry
+        if prev_kv is None or prev_gate is None:
+            prev_kv = mx.zeros_like(last_kv_a)
+            prev_gate = mx.full(
+                last_gate_a.shape, -mx.inf, dtype=last_gate_a.dtype
+            )
+        keep = mx.array(produced).reshape(len(produced), 1, 1, 1)
+        self._overlap_kv_carry = mx.where(
+            keep, last_kv_a, prev_kv.astype(last_kv_a.dtype)
+        )
+        self._overlap_gate_carry = mx.where(
+            keep, last_gate_a, prev_gate.astype(last_gate_a.dtype)
+        )
+        for i, p in enumerate(produced):
+            if p:
+                self._overlap_carry_valid[i] = True
+
     @property
     def offset(self):
         return mx.array(self._pool_lengths, dtype=mx.int32)
@@ -1953,6 +2057,7 @@ class BatchPoolingCache(_BaseCache):
 
         # No sequence produced a full window yet
         if max_usable == 0:
+            self._overlap_windows_this_call = [0] * B
             for i in range(B):
                 r = self.remainder[i]
                 vl = valid_lengths[i]
@@ -1966,6 +2071,8 @@ class BatchPoolingCache(_BaseCache):
             return r_kv, r_gate, r_base
 
         # At least one sequence completed a window
+        # Per-stream complete-window counts for this call (overlap carry).
+        self._overlap_windows_this_call = [u // ratio for u in usable]
         r_kv = mx.zeros((B, max_usable, D1), dtype=kv.dtype)
         r_gate = mx.zeros((B, max_usable, D2), dtype=gate.dtype)
         r_base = [0] * B
@@ -2113,20 +2220,59 @@ class BatchPoolingCache(_BaseCache):
 
     @property
     def state(self):
-        return (self.buf_kv, self.buf_gate, self.pooled)
+        return (
+            self.buf_kv,
+            self.buf_gate,
+            self.pooled,
+            self._overlap_kv_carry,
+            self._overlap_gate_carry,
+        )
 
     @state.setter
     def state(self, v):
-        self.buf_kv, self.buf_gate, self.pooled = v
+        # Backward-compat with the pre-carry 3-tuple state, mirroring
+        # PoolingCache.state: no persisted carry means "sequence start".
+        if len(v) == 5:
+            (
+                self.buf_kv,
+                self.buf_gate,
+                self.pooled,
+                self._overlap_kv_carry,
+                self._overlap_gate_carry,
+            ) = v
+        else:
+            self.buf_kv, self.buf_gate, self.pooled = v
+            self._overlap_kv_carry = None
+            self._overlap_gate_carry = None
+            self._overlap_carry_valid = [False] * len(self._pool_lengths)
 
     @property
     def meta_state(self):
         self.commit_pending()  # see filter(); keeps the tuple shape stable
-        return (self.ratio, self.remainder, self._pool_lengths, self._processed)
+        return (
+            self.ratio,
+            self.remainder,
+            self._pool_lengths,
+            self._processed,
+            self._overlap_carry_valid,
+            self._overlap_windows_this_call,
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.ratio, self.remainder, self._pool_lengths, self._processed = v
+        if len(v) == 6:
+            (
+                self.ratio,
+                self.remainder,
+                self._pool_lengths,
+                self._processed,
+                self._overlap_carry_valid,
+                self._overlap_windows_this_call,
+            ) = v
+        else:
+            self.ratio, self.remainder, self._pool_lengths, self._processed = v
+            self._overlap_carry_valid = [False] * len(self._pool_lengths)
+            self._overlap_windows_this_call = [0] * len(self._pool_lengths)
         self._pending_bumps = [0] * len(self._pool_lengths)
 
     def is_trimmable(self):

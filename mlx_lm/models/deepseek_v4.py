@@ -1252,7 +1252,7 @@ def _simple_compress_kv(kv, gate, ape, head_dim):
 
 
 @mx.compile
-def _overlap_compress_kv(kv, gate, ape, head_dim, kv_carry, gate_carry):
+def _overlap_compress_kv(kv, gate, ape, head_dim, kv_carry, gate_carry, carry_idx):
     """Overlap-pooling compress (compress_ratio == 4): each output window
     also sees the LAST sub-position of the PREVIOUS window (via the shifted
     ``kv_a``/``gate_a`` halves), so consecutive pooled windows overlap by
@@ -1277,13 +1277,20 @@ def _overlap_compress_kv(kv, gate, ape, head_dim, kv_carry, gate_carry):
     (there is no real previous window), matching prior behavior exactly.
     """
     kv_a, kv_b = mx.split(kv, 2, axis=-1)
-    last_kv_a = kv_a[:, -1:]
+    # Per-stream carry extraction: ``carry_idx[i]`` is the index of the LAST
+    # window stream i actually completed in this call. Single-stream (and
+    # batched calls where every stream completed the same number of windows)
+    # reduce to the previous ``kv_a[:, -1:]``; when streams complete
+    # different window counts (batched, ragged lengths) each stream must
+    # take ITS OWN last real window, not the padded tail of the widest one.
+    batch_index = mx.arange(kv_a.shape[0])
+    last_kv_a = kv_a[batch_index, carry_idx][:, None]
     kv_a = mx.concatenate([kv_carry, kv_a[:, :-1]], axis=1)
     kv = mx.concatenate([kv_a, kv_b], axis=2)
 
     gate = gate + ape.astype(gate.dtype)
     gate_a, gate_b = mx.split(gate, 2, axis=-1)
-    last_gate_a = gate_a[:, -1:]
+    last_gate_a = gate_a[batch_index, carry_idx][:, None]
     gate_a = mx.concatenate([gate_carry, gate_a[:, :-1]], axis=1)
     gate = mx.concatenate([gate_a, gate_b], axis=2)
 
@@ -3011,22 +3018,32 @@ class Compressor(nn.Module):
             kv = mx.unflatten(ready_kv, 1, (-1, self.compress_ratio))
             gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
             if self.overlap:
-                # Chunk-boundary fix (Phase 1, this commit): fetch the real
-                # cross-call carry (persisted on pool_cache) instead of
-                # always injecting zero/-inf. See _overlap_compress_kv.
+                # Chunk-boundary fix: fetch the real cross-call carry
+                # (persisted on pool_cache) instead of always injecting
+                # zero/-inf. See _overlap_compress_kv. Both PoolingCache
+                # (single-stream) and BatchPoolingCache (per-stream)
+                # implement the same three-method carry API, so this path
+                # is cache-shape agnostic — the batched cache returns a
+                # per-stream carry and a per-stream carry index, and only
+                # updates the rows of streams that actually completed a
+                # window in this call.
                 _R, _D = kv.shape[2], kv.shape[3] // 2
-                if pool_cache is not None and pool_cache._overlap_kv_carry is not None:
-                    kv_carry = pool_cache._overlap_kv_carry
-                    gate_carry = pool_cache._overlap_gate_carry
+                num_windows = kv.shape[1]
+                if pool_cache is not None:
+                    kv_carry, gate_carry = pool_cache.fetch_overlap_carry(
+                        B, _R, _D, kv.dtype
+                    )
+                    carry_idx = pool_cache.overlap_carry_index(num_windows)
                 else:
                     kv_carry = mx.zeros((B, 1, _R, _D), dtype=kv.dtype)
                     gate_carry = mx.full((B, 1, _R, _D), -mx.inf, dtype=kv.dtype)
+                    carry_idx = mx.full((B,), num_windows - 1, dtype=mx.int32)
                 new_pooled, last_kv_a, last_gate_a = _overlap_compress_kv(
-                    kv, gate, self.ape, self.head_dim, kv_carry, gate_carry
+                    kv, gate, self.ape, self.head_dim, kv_carry, gate_carry,
+                    carry_idx,
                 )
                 if pool_cache is not None:
-                    pool_cache._overlap_kv_carry = last_kv_a
-                    pool_cache._overlap_gate_carry = last_gate_a
+                    pool_cache.store_overlap_carry(last_kv_a, last_gate_a)
             else:
                 new_pooled = _simple_compress_kv(kv, gate, self.ape, self.head_dim)
             new_pooled = self.norm(new_pooled)
