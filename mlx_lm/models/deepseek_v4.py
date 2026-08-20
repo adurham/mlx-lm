@@ -1252,23 +1252,44 @@ def _simple_compress_kv(kv, gate, ape, head_dim):
 
 
 @mx.compile
-def _overlap_compress_kv(kv, gate, ape, head_dim):
-    B, L, R, D = kv.shape
+def _overlap_compress_kv(kv, gate, ape, head_dim, kv_carry, gate_carry):
+    """Overlap-pooling compress (compress_ratio == 4): each output window
+    also sees the LAST sub-position of the PREVIOUS window (via the shifted
+    ``kv_a``/``gate_a`` halves), so consecutive pooled windows overlap by
+    one raw KV position for smoother compression.
 
-    gate = gate + ape.astype(gate.dtype)
+    Chunk-boundary fix (Phase 1, this commit): the shift previously always
+    injected a zero/`` -inf`` carry for the FIRST window of every call
+    (``kv_0``/``gate_0``), which is only correct for the first window of the
+    whole sequence. When a monolithic prefill is split into sequential
+    chunks, every chunk after the first starts a fresh call here and used to
+    get the zero carry too -- silently dropping the true carry (the last
+    sub-position of the previous chunk's final window) that a monolithic
+    single-call prefill would have used. That is the root cause of the
+    layer-2/4 (compress_ratio=4, ``self.overlap``) pooled-cache divergence
+    found in bench/phase1_chunked_prefill_baseline.py.
 
-    kv_0 = mx.zeros((B, 1, R, D // 2), dtype=kv.dtype)
+    Fix: thread the real carry through explicitly. Callers pass the
+    previous call's last-window ``kv_a``/``gate_a`` slice (persisted on
+    ``PoolingCache``) instead of a hardcoded zero, and this function also
+    returns that slice back out so the caller can persist it for the next
+    chunk/step. The very first call for a sequence still passes zero/-inf
+    (there is no real previous window), matching prior behavior exactly.
+    """
     kv_a, kv_b = mx.split(kv, 2, axis=-1)
-    kv_a = mx.concatenate([kv_0, kv_a[:, :-1]], axis=1)
+    last_kv_a = kv_a[:, -1:]
+    kv_a = mx.concatenate([kv_carry, kv_a[:, :-1]], axis=1)
     kv = mx.concatenate([kv_a, kv_b], axis=2)
 
-    gate_0 = mx.full((B, 1, R, D // 2), -mx.inf, dtype=kv.dtype)
+    gate = gate + ape.astype(gate.dtype)
     gate_a, gate_b = mx.split(gate, 2, axis=-1)
-    gate_a = mx.concatenate([gate_0, gate_a[:, :-1]], axis=1)
+    last_gate_a = gate_a[:, -1:]
+    gate_a = mx.concatenate([gate_carry, gate_a[:, :-1]], axis=1)
     gate = mx.concatenate([gate_a, gate_b], axis=2)
 
     weights = mx.softmax(gate, axis=-2, precise=True)
-    return (kv * weights).sum(axis=-2)
+    pooled = (kv * weights).sum(axis=-2)
+    return pooled, last_kv_a, last_gate_a
 
 
 @partial(mx.compile, shapeless=True)
@@ -2928,7 +2949,7 @@ class Compressor(nn.Module):
         pool_cache: Optional[PoolingCache],
         offset: Union[int, mx.array],
     ) -> mx.array:
-        B, _, _ = x.shape
+        B, _prefill_L, _ = x.shape
         # W4 sub-op NOP toggles — each independent of the others. Replaces the
         # output with a zero-shaped placeholder that downstream code accepts.
         # Quality intentionally broken when any sub-toggle is on. Toggles:
@@ -2987,12 +3008,27 @@ class Compressor(nn.Module):
         if "compressor_compress" in _nop or ready_kv.size == 0:
             new_pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
         else:
-            compress_func = (
-                _overlap_compress_kv if self.overlap else _simple_compress_kv
-            )
             kv = mx.unflatten(ready_kv, 1, (-1, self.compress_ratio))
             gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
-            new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+            if self.overlap:
+                # Chunk-boundary fix (Phase 1, this commit): fetch the real
+                # cross-call carry (persisted on pool_cache) instead of
+                # always injecting zero/-inf. See _overlap_compress_kv.
+                _R, _D = kv.shape[2], kv.shape[3] // 2
+                if pool_cache is not None and pool_cache._overlap_kv_carry is not None:
+                    kv_carry = pool_cache._overlap_kv_carry
+                    gate_carry = pool_cache._overlap_gate_carry
+                else:
+                    kv_carry = mx.zeros((B, 1, _R, _D), dtype=kv.dtype)
+                    gate_carry = mx.full((B, 1, _R, _D), -mx.inf, dtype=kv.dtype)
+                new_pooled, last_kv_a, last_gate_a = _overlap_compress_kv(
+                    kv, gate, self.ape, self.head_dim, kv_carry, gate_carry
+                )
+                if pool_cache is not None:
+                    pool_cache._overlap_kv_carry = last_kv_a
+                    pool_cache._overlap_gate_carry = last_gate_a
+            else:
+                new_pooled = _simple_compress_kv(kv, gate, self.ape, self.head_dim)
             new_pooled = self.norm(new_pooled)
             # Phase I.b (2026-05-12): rope expects (..., L, D); the leading
             # axes can be any rank. The original code did
@@ -3024,7 +3060,28 @@ class Compressor(nn.Module):
             # for forensic A/B if a regression surfaces.
             if _FP32_ACT and new_pooled.dtype == mx.float32:
                 new_pooled = new_pooled.astype(mx.bfloat16)  # bf16 pooled cache
-            if "compressor_defer_off" in _nop:
+            # Chunked-prefill correctness fix (Phase 1, this commit): the
+            # deferred path is only valid for single-token DECODE steps,
+            # where "one call = one step" makes "visible next call" mean
+            # "visible next decode step" -- a bounded, intentional one-step
+            # staleness. During PROMPT/PREFILL mode (_prefill_L > 1, i.e.
+            # this __call__ processes a multi-token chunk) that assumption
+            # breaks: the deferred bump is only applied at the START of the
+            # *next* Compressor.__call__ (via commit_pending()), so if this
+            # is the chunk that follows a prefill chunk that just wrote
+            # pooled entries, downstream layers/heads within the SAME
+            # forward call still read the pre-write prefix. Worse, splitting
+            # one monolithic prefill into K sequential chunks changes how
+            # many "steps" (== chunks) occur between a window's compress and
+            # its first-visible read, so chunked vs monolithic prefill see
+            # different pooled prefixes -- the ~0.8-0.9 max-abs-diff KV-cache
+            # divergence found in bench/phase1_chunked_prefill_baseline.py.
+            # Fix: always use the synchronous path when this call processes
+            # more than one token (prompt/prefill), and reserve the deferred
+            # optimization for true decode (_prefill_L == 1). This makes
+            # prefill chunk-boundary-safe while preserving the validated
+            # decode-time latency win.
+            if "compressor_defer_off" in _nop or _prefill_L > 1:
                 new_pooled = pool_cache.update_and_fetch(new_pooled)
             else:
                 new_pooled = pool_cache.update_and_fetch_deferred(new_pooled)

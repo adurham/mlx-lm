@@ -1298,6 +1298,15 @@ class PoolingCache(_BaseCache):
 
         self._pool_storage = None
         self._pool_offset = 0
+        # Chunk-boundary fix (Phase 1, this commit): persists the
+        # "overlap compress" carry (last raw sub-position of the previous
+        # pooled window, split into kv/gate halves) across separate
+        # Compressor.__call__ invocations for compress_ratio==4 layers. See
+        # ``_overlap_compress_kv`` in deepseek_v4.py for the full story —
+        # without this, every chunk boundary silently reset the carry to
+        # zero, which is only valid at the very start of a sequence.
+        self._overlap_kv_carry = None
+        self._overlap_gate_carry = None
         # W4 deferred-update support. update_and_fetch_deferred stages an
         # offset bump here without making the just-written entry visible.
         # commit_pending() applies the bump and must be called BEFORE any
@@ -1543,16 +1552,32 @@ class PoolingCache(_BaseCache):
     def state(self):
         buf_kv = self.buf_kv[:, : self.remainder] if self.remainder > 0 else None
         buf_gate = self.buf_gate[:, : self.remainder] if self.remainder > 0 else None
-        return (buf_kv, buf_gate, self.pooled)
+        return (
+            buf_kv,
+            buf_gate,
+            self.pooled,
+            self._overlap_kv_carry,
+            self._overlap_gate_carry,
+        )
 
     @state.setter
     def state(self, v):
-        buf_kv, buf_gate, pooled = v
+        # Backward-compat: older 3-tuple state (pre chunk-boundary fix) has
+        # no persisted overlap carry -- treat it as "sequence start" (None),
+        # matching the exact prior always-zero behavior for the first window
+        # after a restore. New 5-tuple state round-trips the carry exactly.
+        if len(v) == 5:
+            buf_kv, buf_gate, pooled, kv_carry, gate_carry = v
+        else:
+            buf_kv, buf_gate, pooled = v
+            kv_carry = gate_carry = None
         self.remainder = 0
         self.buf_kv = self.buf_gate = None
         if buf_kv is not None:
             self.accumulate_windows(buf_kv, buf_gate, 0)
         self.pooled = pooled
+        self._overlap_kv_carry = kv_carry
+        self._overlap_gate_carry = gate_carry
 
     @property
     def meta_state(self):
