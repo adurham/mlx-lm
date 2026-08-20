@@ -605,8 +605,25 @@ _MOE_ALLSUM_SHAREDSCALE_BITS = int(
 #     t_exit=<epoch> nbytes=N
 # -----------------------------------------------------------------------
 _SS_PROBE_MODE = os.environ.get("EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE", "")
-_SS_PROBE_ENABLED = _SS_PROBE_MODE not in ("", "0")
+_SS_PROBE_LITE = _SS_PROBE_MODE == "lite"
+_SS_PROBE_ENABLED = _SS_PROBE_MODE not in ("", "0", "lite") and not _SS_PROBE_LITE
 _SS_PROBE_RAW = _SS_PROBE_MODE == "raw"
+# LITE mode (2026-08-19): entry/exit timing ONLY, NO per-phase mx.eval()
+# fences at all. Answers "next step #1" from
+# docs/local-absmax-fence-artifact-confirmed-2026-08-19.md -- the
+# per-phase probe's 5 mx.eval() fences serialize the phases and inflate
+# absolute latency (explicitly documented above), so its ~400ms
+# local_absmax number is suspected to be a fence-placement artifact, not
+# a real unfenced cost. LITE mode takes t_enter BEFORE issuing any op
+# (no eval -- an entry-side eval would itself force-flush whatever
+# backlog is already pending and reproduce the exact artifact being
+# tested for), lets the whole op sequence build up lazily exactly as
+# the unprobed fast path does (byte-identical ops, zero extra fences),
+# and takes t_exit only after the SINGLE mx.eval(out) that already
+# exists at the end of the real call -- so the measured wall-clock is
+# the real, unfenced, lazy-graph-scheduled cost of the WHOLE call under
+# normal execution. Trade-off: no per-phase attribution (can't tell
+# local_absmax from payload_allsum), only the call's total cost.
 _SS_PROBE_LOG_EVERY = int(
     os.environ.get("EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE_LOG_EVERY", "50")
 )
@@ -724,6 +741,8 @@ def _quantized_moe_all_sum_sharedscale(
     """
     if _SS_PROBE_ENABLED:
         return _quantized_moe_all_sum_sharedscale_probed(y, group=group, bits=bits)
+    if _SS_PROBE_LITE:
+        return _quantized_moe_all_sum_sharedscale_lite(y, group=group, bits=bits)
     orig_dtype = y.dtype
     y32 = y.astype(mx.float32)
     scale, qmax = _sharedscale_compute_scale(y32, group=group, bits=bits)
@@ -742,6 +761,69 @@ def _quantized_moe_all_sum_sharedscale(
     summed = summed_i8.astype(mx.int32)
     result = summed.astype(mx.float32) * scale
     return result.astype(orig_dtype)
+
+
+_SS_PROBE_LITE_ACC: List[float] = []
+_SS_PROBE_LITE_CALLS: int = 0
+
+
+def _quantized_moe_all_sum_sharedscale_lite(
+    y: mx.array, *, group, bits: int = 8
+) -> mx.array:
+    """Lite twin of _quantized_moe_all_sum_sharedscale: entry/exit timing
+    ONLY, no per-phase mx.eval() fences (see the LITE-mode module comment
+    above `_SS_PROBE_LITE` for rationale). Op sequence is byte-identical
+    to the unprobed fast path -- only ever reachable when
+    EXO_DSV4_MOE_ALLSUM_SHAREDSCALE_PROBE=lite is set.
+    """
+    global _SS_PROBE_LITE_CALLS
+    import sys as _ss_sys
+    import time as _ss_time
+
+    rank = _ss_probe_rank(group)
+    t_enter = _ss_time.time()
+
+    orig_dtype = y.dtype
+    y32 = y.astype(mx.float32)
+    scale, qmax = _sharedscale_compute_scale(y32, group=group, bits=bits)
+    q = mx.round(y32 / scale)
+    q = mx.clip(q, -(qmax + 1), qmax)
+    q_i8 = q.astype(mx.int8)
+    summed_i8 = mx.distributed.all_sum(q_i8, group=group)
+    summed = summed_i8.astype(mx.int32)
+    result = summed.astype(mx.float32) * scale
+    out = result.astype(orig_dtype)
+    mx.eval(out)
+    t_exit = _ss_time.time()
+
+    elapsed_ms = (t_exit - t_enter) * 1000.0
+    _SS_PROBE_LITE_ACC.append(elapsed_ms)
+    _SS_PROBE_LITE_CALLS += 1
+
+    if _SS_PROBE_RAW:
+        _ss_sys.stderr.write(
+            f"[SS-PROBE-LITE-RAW pid={os.getpid()} rank={rank}] "
+            f"call={_SS_PROBE_LITE_CALLS} t_enter={t_enter:.6f} "
+            f"t_exit={t_exit:.6f} elapsed={elapsed_ms:.3f}ms "
+            f"nbytes={q_i8.size} shape={tuple(y.shape)}\n"
+        )
+        _ss_sys.stderr.flush()
+
+    if _SS_PROBE_LOG_EVERY > 0 and _SS_PROBE_LITE_CALLS % _SS_PROBE_LOG_EVERY == 0:
+        samples = sorted(_SS_PROBE_LITE_ACC)
+        n = len(samples)
+        p50 = samples[n // 2]
+        p99 = samples[min(n - 1, int(n * 0.99))]
+        _ss_sys.stderr.write(
+            f"[SS-PROBE-LITE pid={os.getpid()} rank={rank}] "
+            f"calls={_SS_PROBE_LITE_CALLS} n={n} p50={p50:.3f}ms "
+            f"p99={p99:.3f}ms max={samples[-1]:.3f}ms "
+            f"sum={sum(samples):.1f}ms\n"
+        )
+        _ss_sys.stderr.flush()
+        _SS_PROBE_LITE_ACC.clear()
+
+    return out
 
 
 def _quantized_moe_all_sum_sharedscale_probed(
