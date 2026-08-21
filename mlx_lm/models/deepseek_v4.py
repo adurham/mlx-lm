@@ -987,10 +987,105 @@ def _o_pre_b(out: mx.array) -> mx.array:
     return out.transpose(0, 2, 1, 3).flatten(-2)
 
 
-# _try_fuse_two_quantized_linears / _fused_quantized_matmul REMOVED 2026-06-18:
-# helpers for the DSv4 wq_a+wkv / kv+gate fusions, which batch-mis-specialized
-# at BS>1 (concurrent MTP verify → repetition degeneration). All callers
-# removed. Redo batch-correctly later. See module/auto_parallel header.
+# _try_fuse_two_quantized_linears / _fused_quantized_matmul REMOVED 2026-06-18,
+# RESTORED 2026-08-21 for wq_a+wkv ONLY (gated EXO_DSV4_QA_KV_FUSED, default
+# OFF, c=1-only per 2026-08-21 investigation — see below). The original
+# removal covered a BUNDLE of fusions (MoE/layer fusion, mx.compile paths,
+# AND this wq_a+wkv fusion) that batch-mis-specialized at BS>1 together (a
+# concurrent MTP verify forward produced repetition-biased logits at BS=2).
+# That diagnosis never isolated which specific fusion(s) in the bundle caused
+# the degeneration — they were removed as one unit. wq_a+wkv fusion was
+# RE-VALIDATED in isolation 2026-08-21 at c=1 only (real hardware A/B +
+# needle-in-haystack correctness, matching the same validation the
+# EXO_DSV4_MOE_FUSED_GATE_UP lever received the same night): concatenates
+# wq_a (hidden_size -> q_lora_rank) + wkv (hidden_size -> head_dim) along the
+# output axis (both consume the SAME input x, both unsharded/per-rank-
+# duplicated), collapsing two quantized_matmul dispatches into one per
+# attention block per token. Bit-equivalent: same math, same order, just one
+# dispatch instead of two. B>1 (concurrency) safety is UNVALIDATED for this
+# specific fusion — do not enable outside c=1 deployments until B>1 is
+# separately re-tested against the known degeneration signature (repetition-
+# biased MTP verify logits).
+def _try_fuse_two_quantized_linears(
+    holder: nn.Module,
+    name_a: str,
+    name_b: str,
+    fused_prefix: str,
+) -> bool:
+    """Concatenate two same-input QuantizedLinears along the output axis.
+
+    Stores fused weights as ``f"_{fused_prefix}_w" / "_s" / "_b"`` on
+    ``holder`` along with ``f"_{fused_prefix}_n"`` (the size of the first
+    half) and ``_fused_group_size / _fused_bits / _fused_mode``. Frees
+    the original sub-linears by replacing them with empty modules.
+
+    Returns True on success, False if the projections aren't both
+    quantized or share incompatible modes/group_sizes/bits. Idempotent.
+    """
+    a: Any = getattr(holder, name_a)
+    b: Any = getattr(holder, name_b)
+    for proj_name, proj in ((name_a, a), (name_b, b)):
+        for attr in ("weight", "scales", "group_size", "bits", "mode"):
+            if not hasattr(proj, attr):
+                return False
+    if a.group_size != b.group_size or a.bits != b.bits or a.mode != b.mode:
+        return False
+
+    a_w = a["weight"]
+    b_w = b["weight"]
+    a_s = a["scales"]
+    b_s = b["scales"]
+    a_bias = a.get("biases") if hasattr(a, "get") else None
+    b_bias = b.get("biases") if hasattr(b, "get") else None
+
+    setattr(holder, f"_{fused_prefix}_w", mx.concatenate([a_w, b_w], axis=0))
+    setattr(holder, f"_{fused_prefix}_s", mx.concatenate([a_s, b_s], axis=0))
+    fused_b = (
+        mx.concatenate([a_bias, b_bias], axis=0)
+        if a_bias is not None and b_bias is not None
+        else None
+    )
+    setattr(holder, f"_{fused_prefix}_b", fused_b)
+    setattr(holder, f"_{fused_prefix}_n", int(a_w.shape[0]))
+    holder._fused_group_size = int(a.group_size)  # type: ignore[attr-defined]
+    holder._fused_bits = int(a.bits)  # type: ignore[attr-defined]
+    holder._fused_mode = a.mode  # type: ignore[attr-defined]
+
+    fused_w = getattr(holder, f"_{fused_prefix}_w")
+    fused_s = getattr(holder, f"_{fused_prefix}_s")
+    mx.eval(fused_w, fused_s)
+    if fused_b is not None:
+        mx.eval(fused_b)
+
+    setattr(holder, name_a, nn.Module())
+    setattr(holder, name_b, nn.Module())
+    return True
+
+
+def _fused_quantized_matmul(holder: nn.Module, fused_prefix: str, x: mx.array):
+    """Issue a single quantized_matmul against fused weights and split.
+
+    Returns ``(first_half, second_half)`` where ``first_half`` has
+    ``..._{fused_prefix}_n`` columns and ``second_half`` has the rest.
+    """
+    fused_w = getattr(holder, f"_{fused_prefix}_w")
+    fused_s = getattr(holder, f"_{fused_prefix}_s")
+    fused_b = getattr(holder, f"_{fused_prefix}_b")
+    n = getattr(holder, f"_{fused_prefix}_n")
+    out = mx.quantized_matmul(
+        x,
+        fused_w,
+        scales=fused_s,
+        biases=fused_b,
+        transpose=True,
+        group_size=holder._fused_group_size,  # type: ignore[attr-defined]
+        bits=holder._fused_bits,  # type: ignore[attr-defined]
+        mode=holder._fused_mode,  # type: ignore[attr-defined]
+    )
+    return out[..., :n], out[..., n:]
+
+
+_QA_KV_FUSED = os.environ.get("EXO_DSV4_QA_KV_FUSED", "0") == "1"
 
 
 @mx.compile
@@ -3863,10 +3958,23 @@ class LocalAttention(nn.Module):
 
         self.sharding_group = None
 
-    # fuse_qa_kv_weights REMOVED 2026-06-18 (BS>1 fusion degeneration;
-    # see module/auto_parallel header). _project_qa_kv keeps the unfused path.
+    def fuse_qa_kv_weights(self) -> bool:
+        """2026-08-21: fuse wq_a + wkv into a single quantized matmul.
+
+        Both consume the same input ``x`` and are NOT sharded
+        (q_lora_rank/head_dim are per-rank duplicated). Concatenating
+        along the output axis collapses two ``mx.quantized_matmul``
+        dispatches into one per attention block per token. The
+        downstream q_norm/wq_b path consumes the q_lora half; kv_norm
+        the kv half — both unchanged. Bit-equivalent. See the
+        EXO_DSV4_QA_KV_FUSED module-header comment for the c=1-only
+        scoping rationale.
+        """
+        return _try_fuse_two_quantized_linears(self, "wq_a", "wkv", "fused_qkv")
 
     def _project_qa_kv(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+        if hasattr(self, "_fused_qkv_w"):
+            return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
 
     def __call__(
@@ -3993,10 +4101,23 @@ class CompressedAttention(nn.Module):
 
         self.sharding_group = None
 
-    # fuse_qa_kv_weights REMOVED 2026-06-18 (BS>1 fusion degeneration;
-    # see module/auto_parallel header). _project_qa_kv keeps the unfused path.
+    def fuse_qa_kv_weights(self) -> bool:
+        """2026-08-21: fuse wq_a + wkv into a single quantized matmul.
+
+        Both consume the same input ``x`` and are NOT sharded
+        (q_lora_rank/head_dim are per-rank duplicated). Concatenating
+        along the output axis collapses two ``mx.quantized_matmul``
+        dispatches into one per attention block per token. The
+        downstream q_norm/wq_b path consumes the q_lora half; kv_norm
+        the kv half — both unchanged. Bit-equivalent. See the
+        EXO_DSV4_QA_KV_FUSED module-header comment for the c=1-only
+        scoping rationale.
+        """
+        return _try_fuse_two_quantized_linears(self, "wq_a", "wkv", "fused_qkv")
 
     def _project_qa_kv(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+        if hasattr(self, "_fused_qkv_w"):
+            return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
 
     def __call__(
@@ -4242,10 +4363,23 @@ class SparseCompressedAttention(nn.Module):
 
         self.sharding_group = None
 
-    # fuse_qa_kv_weights REMOVED 2026-06-18 (BS>1 fusion degeneration;
-    # see module/auto_parallel header). _project_qa_kv keeps the unfused path.
+    def fuse_qa_kv_weights(self) -> bool:
+        """2026-08-21: fuse wq_a + wkv into a single quantized matmul.
+
+        Both consume the same input ``x`` and are NOT sharded
+        (q_lora_rank/head_dim are per-rank duplicated). Concatenating
+        along the output axis collapses two ``mx.quantized_matmul``
+        dispatches into one per attention block per token. The
+        downstream q_norm/wq_b path consumes the q_lora half; kv_norm
+        the kv half — both unchanged. Bit-equivalent. See the
+        EXO_DSV4_QA_KV_FUSED module-header comment for the c=1-only
+        scoping rationale.
+        """
+        return _try_fuse_two_quantized_linears(self, "wq_a", "wkv", "fused_qkv")
 
     def _project_qa_kv(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+        if hasattr(self, "_fused_qkv_w"):
+            return _fused_quantized_matmul(self, "fused_qkv", x)
         return self.wq_a(x), self.wkv(x)
 
     def __call__(
