@@ -110,10 +110,27 @@ _FENCE_ASYNC_MAX_B = max(1, int(os.environ.get("EXO_DSV4_FENCE_ASYNC_C2", "0") o
 # clearing their key (drain deferred graphs before mutating shared state).
 _FENCE_ASYNC_CTX: Dict[str, bool] = {"engine": False, "cache": False}
 
+# TEMP DIAGNOSTIC (2026-08-22, EXO_DSV4_FENCE_GATE_DIAG=1): counter for
+# the rate-limited async-fence-gate-failure log below. See
+# docs/pysampler-blocking-eval-root-cause-2026-08-22.md. Remove once the
+# async-fence arming gap is understood.
+_FENCE_GATE_DIAG_COUNT: int = 0
+
 
 def _set_fence_async_ok(ok: bool, key: str = "engine") -> None:
     """Set one owner's arming key for the c=1 async fence."""
     _FENCE_ASYNC_CTX[key] = bool(ok)
+    # TEMP DIAGNOSTIC (2026-08-22, EXO_DSV4_FENCE_GATE_DIAG=1): see
+    # docs/pysampler-blocking-eval-root-cause-2026-08-22.md. Remove once
+    # the async-fence arming gap is understood.
+    if os.environ.get("EXO_DSV4_FENCE_GATE_DIAG") == "1":
+        import threading as _bp_threading
+
+        _bp_sys.stderr.write(
+            f"[fence-gate-diag] SETTER key={key} ok={ok} "
+            f"tid={_bp_threading.get_ident()} "
+            f"ctx_now={dict(_FENCE_ASYNC_CTX)}\n"
+        )
 _ALLSUM_PROBE_ACC: Dict[int, List[float]] = {}    # layer_idx -> list[ms]
 _ALLSUM_PROBE_CYCLES: int = 0
 
@@ -3013,6 +3030,23 @@ class DeepseekV4MoE(nn.Module):
                         # merges/rebuilds (owners' disarm does this).
                         mx.async_eval(y)
                     else:
+                        # TEMP DIAGNOSTIC (2026-08-22, EXO_DSV4_FENCE_GATE_DIAG=1):
+                        # rate-limited real-value log of why the async gate
+                        # failed, for the decode idle-gap investigation. See
+                        # docs/pysampler-blocking-eval-root-cause-2026-08-22.md.
+                        # Remove once the async-fence arming gap is understood.
+                        if os.environ.get("EXO_DSV4_FENCE_GATE_DIAG") == "1":
+                            global _FENCE_GATE_DIAG_COUNT
+                            _FENCE_GATE_DIAG_COUNT += 1
+                            if _FENCE_GATE_DIAG_COUNT <= 30 or _FENCE_GATE_DIAG_COUNT % 200 == 0:
+                                _bp_sys.stderr.write(
+                                    f"[fence-gate-diag] n={_FENCE_GATE_DIAG_COUNT} "
+                                    f"FENCE_ASYNC={_FENCE_ASYNC} "
+                                    f"engine={_FENCE_ASYNC_CTX['engine']} "
+                                    f"cache={_FENCE_ASYNC_CTX['cache']} "
+                                    f"B={y.shape[0]} MAX_B={_FENCE_ASYNC_MAX_B} "
+                                    f"L={y.shape[1]}\n"
+                                )
                         mx.eval(y)
                     y = finalize(y)
             return y
