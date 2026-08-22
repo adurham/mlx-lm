@@ -110,6 +110,36 @@ _FENCE_ASYNC_MAX_B = max(1, int(os.environ.get("EXO_DSV4_FENCE_ASYNC_C2", "0") o
 # clearing their key (drain deferred graphs before mutating shared state).
 _FENCE_ASYNC_CTX: Dict[str, bool] = {"engine": False, "cache": False}
 
+# REGISTRATION set (2026-08-22, fixes the "cache" owner permanently
+# blocking the async fence when MTP/DSpark is absent — see
+# docs/async-fence-cache-owner-dead-code-root-cause-2026-08-22.md).
+# Only keys with a REGISTERED, live owner are required to be True in the
+# gate check; an unregistered key is treated as satisfied (there is no
+# cache lifecycle to protect against if nothing manages one). This is a
+# fail-CLOSED design: the requirement is created by the owning object's
+# own __init__ actually registering itself (DSv4MTPPredictor does this
+# below), not by structurally sniffing for the owner's presence via
+# getattr/hasattr chains elsewhere (which would fail open silently on
+# an unrelated rename/refactor). "engine" registers itself unconditionally
+# at module import — it's always a required owner regardless of config.
+_FENCE_ASYNC_REGISTERED: Dict[str, bool] = {"engine": True, "cache": False}
+
+
+def _register_fence_async_owner(key: str) -> None:
+    """Declare that a real owner for ``key`` now exists and its arming
+    state must genuinely be True (not defaulted-satisfied) for the async
+    fence to engage. Call this from the owner's own construction path
+    only — never speculatively."""
+    _FENCE_ASYNC_REGISTERED[key] = True
+
+
+def _fence_key_ok(key: str) -> bool:
+    """True iff ``key`` either has no registered owner (nothing to
+    protect against) or has a registered owner that has armed True."""
+    if not _FENCE_ASYNC_REGISTERED.get(key, False):
+        return True
+    return _FENCE_ASYNC_CTX.get(key, False)
+
 # TEMP DIAGNOSTIC (2026-08-22, EXO_DSV4_FENCE_GATE_DIAG=1): counter for
 # the rate-limited async-fence-gate-failure log below. See
 # docs/pysampler-blocking-eval-root-cause-2026-08-22.md. Remove once the
@@ -3015,8 +3045,8 @@ class DeepseekV4MoE(nn.Module):
                                 _allsum_probe_dump()
                     elif (
                         _FENCE_ASYNC
-                        and _FENCE_ASYNC_CTX["engine"]
-                        and _FENCE_ASYNC_CTX["cache"]
+                        and _fence_key_ok("engine")
+                        and _fence_key_ok("cache")
                         and y.shape[0] <= _FENCE_ASYNC_MAX_B
                         and y.shape[1] <= 8
                     ):
@@ -3044,6 +3074,7 @@ class DeepseekV4MoE(nn.Module):
                                     f"FENCE_ASYNC={_FENCE_ASYNC} "
                                     f"engine={_FENCE_ASYNC_CTX['engine']} "
                                     f"cache={_FENCE_ASYNC_CTX['cache']} "
+                                    f"cache_registered={_FENCE_ASYNC_REGISTERED['cache']} "
                                     f"B={y.shape[0]} MAX_B={_FENCE_ASYNC_MAX_B} "
                                     f"L={y.shape[1]}\n"
                                 )
