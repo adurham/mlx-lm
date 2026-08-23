@@ -1897,8 +1897,12 @@ class BatchPoolingCache(_BaseCache):
             self.pooled = mx.zeros((B, max_pool, D), dtype=px.dtype)
         else:
             if self.pooled.shape[1] < max_pool:
+                _grow_step = int(os.environ.get("EXO_DSV4_POOL_GROW_STEP", "1"))
+                _target = max_pool if _grow_step <= 1 else (
+                    ((max_pool + _grow_step - 1) // _grow_step) * _grow_step
+                )
                 pad = mx.zeros(
-                    (B, max_pool - self.pooled.shape[1], D), dtype=px.dtype
+                    (B, _target - self.pooled.shape[1], D), dtype=px.dtype
                 )
                 self.pooled = mx.concatenate([self.pooled, pad], axis=1)
             pool_bytes = self.pooled.size * self.pooled.dtype.size
