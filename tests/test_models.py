@@ -1528,6 +1528,96 @@ class TestModels(unittest.TestCase):
         actual = hc_expand(block_out, residual, post, comb)
         self.assertTrue(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5))
 
+        # Fused Metal kernel path for hc_expand (EXO_DSV4_HC_EXPAND_KERNEL=1).
+        # Bit-identical semantics vs the compiled fp32 op modulo GPU rounding
+        # order of a small number of fp32 FMAs; must sit inside bf16's own
+        # rounding class at realistic activation magnitudes.
+        if mx.default_device() == mx.gpu and mx.metal.is_available():
+            from mlx_lm.models.hyper_connection import (
+                _hc_expand_op,
+                _make_hc_expand_kernel,
+            )
+
+            _kernel = _make_hc_expand_kernel()
+            self.assertIsNotNone(_kernel)
+
+            def _kernel_call(xk, rk, pk, ck):
+                B, L, HC, D = rk.shape
+                (o,) = _kernel(  # pyright: ignore[reportOptionalCall]
+                    inputs=[xk, rk, pk, ck],
+                    template=[
+                        ("T", xk.dtype),
+                        ("U", xk.dtype),
+                        ("HC", HC),
+                        ("D", D),
+                    ],
+                    grid=(B * L * 256, 1, 1),
+                    threadgroup=(256, 1, 1),
+                    output_shapes=[(B, L, HC, D)],
+                    output_dtypes=[xk.dtype],
+                )
+                return o
+
+            # Case A — realistic magnitudes at a production-class D=4096.
+            B, L, HC, D = 1, 8, 4, 4096
+            scale = 2.2
+            mx.random.seed(0)
+            xk = (mx.random.normal(shape=(B, L, D)) * scale).astype(mx.bfloat16)
+            rk = (mx.random.normal(shape=(B, L, HC, D)) * scale).astype(
+                mx.bfloat16
+            )
+            pk = mx.random.uniform(-1, 1, shape=(B, L, HC)).astype(mx.float32)
+            ck = mx.random.uniform(-1, 1, shape=(B, L, HC, HC)).astype(
+                mx.float32
+            )
+            ref_a = _hc_expand_op(xk, rk, pk, ck)
+            got_a = _kernel_call(xk, rk, pk, ck)
+            mx.eval(ref_a, got_a)
+            diff_a = mx.abs(
+                ref_a.astype(mx.float32) - got_a.astype(mx.float32)
+            )
+            self.assertFalse(bool(mx.any(mx.isnan(got_a))))
+            self.assertFalse(bool(mx.any(mx.isinf(got_a))))
+            # mean rel err <= 1e-3 (bf16-class agreement).
+            denom = mx.maximum(
+                mx.abs(ref_a.astype(mx.float32)), mx.array(1e-6)
+            )
+            self.assertLess(float((diff_a / denom).mean()), 1e-3)
+
+            # Case B — asymmetric deterministic (arange-based) so any
+            # index/transpose bug in the kernel produces a large error
+            # instead of averaging out over random data.
+            Bs, Ls, HCs, Ds = 1, 3, 4, 8
+            xs2 = (
+                mx.arange(Bs * Ls * Ds, dtype=mx.float32).reshape(Bs, Ls, Ds)
+                * 0.01
+            ).astype(mx.bfloat16)
+            rs2 = (
+                mx.arange(Bs * Ls * HCs * Ds, dtype=mx.float32).reshape(
+                    Bs, Ls, HCs, Ds
+                )
+                * 0.005
+            ).astype(mx.bfloat16)
+            ps2 = mx.arange(
+                Bs * Ls * HCs, dtype=mx.float32
+            ).reshape(Bs, Ls, HCs) * 0.1
+            cs2 = mx.arange(
+                Bs * Ls * HCs * HCs, dtype=mx.float32
+            ).reshape(Bs, Ls, HCs, HCs) * 0.05
+            ref_b = _hc_expand_op(xs2, rs2, ps2, cs2)
+            got_b = _kernel_call(xs2, rs2, ps2, cs2)
+            mx.eval(ref_b, got_b)
+            diff_b = mx.abs(
+                ref_b.astype(mx.float32) - got_b.astype(mx.float32)
+            )
+            denom_b = mx.maximum(
+                mx.abs(ref_b.astype(mx.float32)), mx.array(1e-6)
+            )
+            self.assertLess(float((diff_b / denom_b).mean()), 1e-3)
+            # A transpose bug would move max abs by O(0.1-10.0) on this
+            # data; guard tightly.
+            self.assertLess(float(diff_b.max()), 1e-1)
+
         # Model test
         args = deepseek_v4.ModelArgs(
             model_type="deepseek_v4",

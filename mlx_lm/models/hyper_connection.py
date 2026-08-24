@@ -266,8 +266,140 @@ def _hc_expand_op(x, residual, post, comb):
     return y.astype(x.dtype)
 
 
+def _make_hc_expand_kernel():
+    """Fused HyperConnection EXPAND: numerically equivalent to
+    ``_hc_expand_op`` (fp32 accumulate, single cast to output dtype at
+    store), but issued as ONE Metal kernel — avoids the fp32
+    materialization of ``residual`` (a 134MB intermediate at the
+    production shape [1,2048,4,4096]) and the separate broadcast/matmul
+    intermediates, cutting traffic to the fused ideal:
+    read ``x`` bf16 once, read ``residual`` bf16 once, read tiny
+    ``post`` / ``comb`` fp32 once, write ``out`` bf16 once.
+
+    Per-token dispatch: 256-thread threadgroup, one row per token.
+    ``post`` (``HC`` fp32 values) and ``comb`` (``HC*HC`` fp32 values)
+    are staged into threadgroup memory so the D4 strided loop reuses
+    them from fast on-chip storage. Each thread loads x[d4] once and
+    residual[m, d4] for all m, then writes all HC output streams for
+    that slice — maximizes register/threadgroup reuse of every loaded
+    byte across the HC*HC FMAs.
+
+    Requires ``D`` divisible by 4 (float4-vectorized loads/stores).
+    Production ``D`` is 4096; the caller must fall back to the ops path
+    for other shapes.
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    # Notes on address spaces:
+    #   * ``x_in`` / ``residual`` are always large; a ``const device T*``
+    #     cast is safe and needed for vec<T,4> loads.
+    #   * ``post`` / ``comb`` may be placed in ``constant`` address space
+    #     by MLX when the total number of elements is small (decode
+    #     shapes). Index them through the auto-generated accessor
+    #     without an explicit ``const device`` cast to work in both
+    #     regimes.
+    source = """
+        uint tid = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;  // B*L row index
+
+        // Stage tiny per-token post/comb into threadgroup memory. Every
+        // D4 iteration reads them repeatedly (HC*HC FMAs per iter), so
+        // keeping them on-chip removes the loads from the inner loop.
+        threadgroup float post_s[HC];
+        threadgroup float comb_s[HC * HC];  // comb[m,n] at m*HC + n
+
+        if (tid < (uint)HC) {
+            post_s[tid] = post[row * (uint)HC + tid];
+        }
+        if (tid < (uint)(HC * HC)) {
+            comb_s[tid] = comb[row * (uint)HC * (uint)HC + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        using T4 = vec<T, 4>;
+        using U4 = vec<U, 4>;
+        constexpr uint D4 = (uint)D / 4;
+
+        const device T* x_base   = (const device T*)x_in    + row * (uint)D;
+        const device T* res_base = (const device T*)residual
+                                        + row * (uint)HC * (uint)D;
+        device U*       out_base = (device U*)out
+                                        + row * (uint)HC * (uint)D;
+        const device T4* x_row = (const device T4*)x_base;
+
+        for (uint d4 = tid; d4 < D4; d4 += 256) {
+            float4 xv = float4(x_row[d4]);
+
+            // Load residual[m, d4] into registers for m=0..HC-1.
+            float4 rv[HC];
+            for (int m = 0; m < HC; ++m) {
+                const device T4* res_m =
+                    (const device T4*)(res_base + (uint)m * (uint)D);
+                rv[m] = float4(res_m[d4]);
+            }
+
+            // out[n] = post[n]*x + sum_m comb[m,n]*residual[m]
+            // fp32 accumulate; single U-cast at the store.
+            for (int n = 0; n < HC; ++n) {
+                float4 acc = float4(post_s[n]) * xv;
+                for (int m = 0; m < HC; ++m) {
+                    acc = fma(float4(comb_s[m * HC + n]), rv[m], acc);
+                }
+                device U4* out_n =
+                    (device U4*)(out_base + (uint)n * (uint)D);
+                out_n[d4] = U4(acc);
+            }
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="hc_expand_fused",
+        input_names=["x_in", "residual", "post", "comb"],
+        output_names=["out"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+# Read the enable flag ONCE at import; combined with the metal/gpu check
+# in ``_make_hc_expand_kernel`` this makes the DEFAULT path a literal
+# call to ``_hc_expand_op`` — bit-identical to the pre-kernel behavior.
+_HC_EXPAND_KERNEL_ENABLED = (
+    os.environ.get("EXO_DSV4_HC_EXPAND_KERNEL") == "1"
+)
+
+_hc_expand_kernel = (
+    _make_hc_expand_kernel() if _HC_EXPAND_KERNEL_ENABLED else None
+)
+
+
 def hc_expand(x, residual, post, comb):
-    return _hc_expand_op(x, residual, post, comb)
+    # Default OFF: EXO_DSV4_HC_EXPAND_KERNEL unset ⇒ this is the
+    # original compiled call, byte-for-byte.
+    if _hc_expand_kernel is None:
+        return _hc_expand_op(x, residual, post, comb)
+
+    # Kernel is float4-vectorized; guard rare off-shape ``D``. Production
+    # is D=4096 (hidden_size, replicated under TP) — always divisible.
+    B, L, hc_mult, D = residual.shape
+    if D % 4 != 0 or L == 0:
+        return _hc_expand_op(x, residual, post, comb)
+
+    (out,) = _hc_expand_kernel(
+        inputs=[x, residual, post, comb],
+        template=[
+            ("T", x.dtype),
+            ("U", x.dtype),
+            ("HC", hc_mult),
+            ("D", D),
+        ],
+        grid=(B * L * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, L, hc_mult, D)],
+        output_dtypes=[x.dtype],
+    )
+    return out
 
 
 class HyperHead(nn.Module):
