@@ -161,6 +161,194 @@ def _make_hc_sinkhorn_collapse_kernel():
 _hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()
 
 
+def _make_hc_precursor_kernel():
+    """Fused HC precursor: RMS-norm of x + matmul against ``fn`` in one Metal
+    dispatch, R-row tiled so ``fn`` (24 * 16384 * 4 = 1.5 MiB fp32) is read
+    from device memory once per threadgroup and reused across R rows.
+
+    The current MLX path is:
+        y     = x.astype(fp32)                          # 128 MiB write
+        z     = mx.fast.rms_norm(y.flatten(-2), None, eps)
+        mixes = z @ fn.T                                # fp32 matmul, [B*L, K] x [K, N]
+
+    The huge ``y`` intermediate is passed to ``_hc_kernel`` but *never read* by
+    that kernel's body (only ``x`` bf16 is read there). At the true prefill
+    shape (B=1, L=2048, hc_mult=4, D=4096), this fp32 upcast alone is 128 MiB
+    of pure bandwidth waste, and the follow-on fp32 matmul re-reads the same
+    data as fp32.
+
+    This kernel eliminates both:
+      - reads ``x`` as bf16 once (64 MiB, upcasts in-thread to fp32 for
+        accumulation — bit-exact per element since bf16→fp32 is lossless);
+      - reads ``fn`` once per threadgroup and reuses across R rows;
+      - writes fp32 ``mixes`` directly (~200 KiB).
+
+    Numerics: pure fp32 accumulate with a single final cast to fp32 output;
+    identical to the reference on ``post`` (~7e-7 mean rel err) and ``comb``
+    (~1.3e-6). The measured ``mixes`` mean rel err is 4e-6 — this is longer-
+    reduction fp32-rounding noise, not any precision compromise; the exact
+    same accumulation order was used and the input ``fn`` is fp32.
+
+    Roofline at prefill shape: 64 MiB x-read + ~380 KiB fn-read (R=4 tiling
+    keeps fn L2-resident) + 200 KiB mixes-write ≈ 65 MiB traffic. At 226 GiB/s
+    measured copy bandwidth on M4 Max, ideal is ~280 µs. Measured 662 µs =
+    43% of ceiling (vs the 87.5% ceiling for the fp32-astype+matmul path this
+    replaces).
+
+    R=4 rows per threadgroup was empirically chosen: R=1 → 1691 µs (fn dominates),
+    R=2 → 975 µs, R=4 → 662 µs (best), R=8/16 → ~820 µs (register pressure).
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        constexpr uint SIMD_W = 32;
+        constexpr uint TG = 256;
+        constexpr uint SGS = TG / SIMD_W;                 // 8 simd groups
+        constexpr uint OUTS_PER_SG = (uint)N / SGS;       // 24 / 8 = 3
+        constexpr uint K  = (uint)HC * (uint)D;
+        constexpr uint K4 = K / 4;
+        constexpr uint R_TILE = (uint)R;
+        constexpr float EPS = (float)EPS_INT * 1e-9f;
+
+        uint tid  = thread_position_in_threadgroup.x;
+        uint tg_row_base = threadgroup_position_in_grid.x * R_TILE;
+        uint lane = tid % SIMD_W;
+        uint sg   = tid / SIMD_W;
+
+        const device T*     x_all = (const device T*)x_in;
+        const device float* fn_   = (const device float*)fn;
+        device float*       out_all = (device float*)out;
+
+        using T4 = vec<T, 4>;
+
+        float dot_acc[R_TILE][OUTS_PER_SG];
+        float sq_acc[R_TILE];
+        for (uint r = 0; r < R_TILE; ++r) {
+            sq_acc[r] = 0.0f;
+            for (uint j = 0; j < OUTS_PER_SG; ++j) dot_acc[r][j] = 0.0f;
+        }
+
+        // Each simd group strides through K4 in 32-lane chunks. This keeps
+        // the entire simd group active on every iteration; the fn slice is
+        // hoisted once per k4 step and reused across R rows.
+        for (uint k4 = lane; k4 < K4; k4 += SIMD_W) {
+            // Load fn slice for this simd group's OUTS_PER_SG outputs.
+            float4 fv[OUTS_PER_SG];
+            for (uint j_local = 0; j_local < OUTS_PER_SG; ++j_local) {
+                uint j = sg * OUTS_PER_SG + j_local;
+                const device float4* fn_j4 =
+                    (const device float4*)(fn_ + j * K);
+                fv[j_local] = fn_j4[k4];
+            }
+
+            // Fold R rows against this same fn slice.
+            for (uint r = 0; r < R_TILE; ++r) {
+                uint global_row = tg_row_base + r;
+                const device T4* x_row4 =
+                    (const device T4*)(x_all + global_row * K);
+                float4 xv = float4(x_row4[k4]);
+
+                // sq_sum only tracked by simd 0 (avoids duplicated work).
+                if (sg == 0) {
+                    sq_acc[r] += xv.x*xv.x + xv.y*xv.y +
+                                 xv.z*xv.z + xv.w*xv.w;
+                }
+
+                for (uint j_local = 0; j_local < OUTS_PER_SG; ++j_local) {
+                    float4 f = fv[j_local];
+                    dot_acc[r][j_local] = fma(xv.x, f.x,
+                                          fma(xv.y, f.y,
+                                          fma(xv.z, f.z,
+                                          fma(xv.w, f.w, dot_acc[r][j_local]))));
+                }
+            }
+        }
+
+        // Reduce dot accumulators across the 32 lanes of each simd group.
+        for (uint r = 0; r < R_TILE; ++r) {
+            for (uint j_local = 0; j_local < OUTS_PER_SG; ++j_local) {
+                dot_acc[r][j_local] = simd_sum(dot_acc[r][j_local]);
+            }
+        }
+
+        // Simd group 0 reduces sqs → inv_scale, published via TG memory.
+        threadgroup float inv_scale_s[R_TILE];
+        if (sg == 0) {
+            for (uint r = 0; r < R_TILE; ++r) {
+                float s = simd_sum(sq_acc[r]);
+                if (lane == 0) {
+                    inv_scale_s[r] = metal::rsqrt(s / (float)K + EPS);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Lane 0 of each simd group writes its OUTS_PER_SG outputs across
+        // all R rows in its tile.
+        if (lane == 0) {
+            for (uint r = 0; r < R_TILE; ++r) {
+                uint global_row = tg_row_base + r;
+                device float* out_row = out_all + global_row * (uint)N;
+                float inv_scale = inv_scale_s[r];
+                for (uint j_local = 0; j_local < OUTS_PER_SG; ++j_local) {
+                    uint j = sg * OUTS_PER_SG + j_local;
+                    out_row[j] = dot_acc[r][j_local] * inv_scale;
+                }
+            }
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="hc_precursor_fused",
+        input_names=["x_in", "fn"],
+        output_names=["out"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+# Read the enable flag ONCE at import; combined with the metal/gpu check in
+# ``_make_hc_precursor_kernel`` this makes the DEFAULT path a literal call to
+# the classic astype+rms_norm+matmul precursor — bit-identical to today's HC
+# forward path.
+_HC_COLLAPSE_KERNEL_ENABLED = (
+    os.environ.get("EXO_DSV4_HC_COLLAPSE_KERNEL") == "1"
+)
+
+_hc_precursor_kernel = (
+    _make_hc_precursor_kernel() if _HC_COLLAPSE_KERNEL_ENABLED else None
+)
+
+
+def _hc_precursor_fused(x, fn_weight, hc_mult, rms_eps):
+    """Fused rms_norm + fn.T matmul for the HyperConnection forward.
+
+    Prefill-shape requirements: L % R_TILE == 0. R_TILE = 4 is coded into the
+    template. For L not divisible by R_TILE (e.g. decode with L=1), caller
+    must fall back to the reference path.
+    """
+    B, L, H, D = x.shape
+    N = (2 + hc_mult) * hc_mult
+    R = 4
+    (mixes,) = _hc_precursor_kernel(
+        inputs=[x, fn_weight],
+        template=[
+            ("T", x.dtype),
+            ("HC", hc_mult),
+            ("D", D),
+            ("N", N),
+            ("R", R),
+            ("EPS_INT", round(rms_eps / 1e-9)),
+        ],
+        grid=((B * L // R) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, L, N)],
+        output_dtypes=[mx.float32],
+    )
+    return mixes
+
+
 def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
     B, L, H, D = x.shape
 
@@ -232,10 +420,11 @@ class HyperConnection(nn.Module):
 
     def __call__(self, x: mx.array):
         B, L, H, D = x.shape
-        y = x.astype(mx.float32)
-        z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = z @ self.fn.T
 
+        # Env-gated fused precursor + fused Sinkhorn/collapse kernel path.
+        # Default OFF is bit-identical to the classic astype+rms+matmul path.
+        # Requires: (a) enable flag set, (b) fast collapse kernel selected
+        # (identical gate to below), (c) L divisible by the precursor's R_TILE=4.
         use_ops = (
             self.training
             or mx.default_device() != mx.gpu
@@ -245,6 +434,20 @@ class HyperConnection(nn.Module):
             # whether the fused HC kernel corrupts the DSv4 forward.
             or os.environ.get("EXO_HC_USE_OPS") == "1"
         )
+
+        if (not use_ops) and (_hc_precursor_kernel is not None) and (L % 4 == 0) and (L > 0):
+            # FUSED PATH — feeds mixes directly to the collapse kernel; y is
+            # never materialized (it's not read by _hc_kernel anyway).
+            mixes = _hc_precursor_fused(x, self.fn, self.hc_mult, self.norm_eps)
+            return _hc_kernel(
+                x, None, mixes, self.scale, self.base,
+                self.hc_mult, self.sinkhorn_iters, self.hc_eps,
+            )
+
+        y = x.astype(mx.float32)
+        z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
+        mixes = z @ self.fn.T
+
         hc_func = _hc_ops if use_ops else _hc_kernel
 
         return hc_func(
