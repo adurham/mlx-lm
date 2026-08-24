@@ -1266,6 +1266,53 @@ _POOL_DEFER_COPY_MAX_BYTES = int(
     _pool_os.environ.get("EXO_DSV4_POOL_DEFER_COPY_MAX_BYTES", str(32 * 1024 * 1024))
 )
 
+# ── BatchPoolingCache chunked growth (default ON since 2026-08-23) ──────────
+#
+# BatchPoolingCache.update_and_fetch_deferred used to grow ``self.pooled`` to
+# an EXACT fit on every flush: ``mx.concatenate([pooled, pad])`` reallocates
+# and copies the whole O(P*D) pool each time a new pooled column appears. At
+# ratio 4 that is every 4 decode tokens, and at 352.6K ctx the r=4 pool is
+# ~88,150 x 128 bf16 = ~22.6 MB per layer per flush. Rounding the target width
+# up to a _POOL_GROW_STEP boundary makes the realloc amortized (1 in
+# _POOL_GROW_STEP flushes) and the steady-state write a donated in-place
+# slice-assign. Live A/B (docs/p3-followup-poolgrow-ab-2026-08-23.md):
+# +3.46% tok/s @100K, +9.79% @352.6K (usage-based; +6.91% events-based).
+#
+# Padding is NOT free numerically: pad columns are always masked invalid by
+# make_mask's ``pool_idx < pool_lengths`` length mask, but a wider masked
+# softmax K differs from a narrower one by ulps. The codebase already
+# documents exactly this hazard at BatchPoolingCache.save_meta (the pooled-
+# width restore fix). Two gates keep the default flip numerically neutral
+# where it matters:
+#
+#   _POOL_GROW_MIN (512) — do not pad until max_pool exceeds the indexer's
+#     index_topk. Below that width, SparseCompressedAttention takes its
+#     "compressed" branch (deepseek_v4.py:4614, ``pooled.shape[1] <=
+#     index_topk``) and concatenates the FULL pool into SDPA with no top-k, so
+#     any pad would be attended (masked) and drift the result. Above it, both
+#     the padded and unpadded arms are > index_topk, both take the sparse
+#     branch, and the indexer's ``k = min(index_topk, P)`` top-k selects the
+#     same 512 real columns in both (pads score finfo.min and can never be
+#     selected while min(_pool_lengths) >= k) — so the SDPA that follows runs
+#     over exactly k columns of identical values either way.
+#
+#   _POOL_GROW_MAX_RATIO (4) — never pad a ratio-128 pool. The 20 r=128 layers
+#     use CompressedAttention (deepseek_v4.py:4249), which has NO top-k at ANY
+#     context: it concatenates the whole pool into SDPA unconditionally. An
+#     r=128 pool crosses 512 at ctx ~65.5K, so a width-only gate would still
+#     pad those layers at depth (2755 -> 2816 at 352.6K) and drift them. The
+#     ratio gate is what makes the flip bit-identical at EVERY context rather
+#     than only below 65K. It costs almost nothing: realloc byte-volume scales
+#     as 1/ratio^2 (both the pool size and the flush frequency scale as
+#     1/ratio), so the r=128 layers are ~0.1% of the copy volume this removes
+#     on a bytes model, ~3% on a pure realloc-event model.
+#
+# Escape hatch: EXO_DSV4_POOL_GROW_STEP=1 restores the bit-identical legacy
+# exact-fit growth (the A/B's arm A).
+_POOL_GROW_STEP = int(_pool_os.environ.get("EXO_DSV4_POOL_GROW_STEP", "256"))
+_POOL_GROW_MIN = int(_pool_os.environ.get("EXO_DSV4_POOL_GROW_MIN", "512"))
+_POOL_GROW_MAX_RATIO = int(_pool_os.environ.get("EXO_DSV4_POOL_GROW_MAX_RATIO", "4"))
+
 
 class PoolingCache(_BaseCache):
     """Cache for pooled (compressed) KV tokens with a remainder buffer.
@@ -1897,10 +1944,31 @@ class BatchPoolingCache(_BaseCache):
             self.pooled = mx.zeros((B, max_pool, D), dtype=px.dtype)
         else:
             if self.pooled.shape[1] < max_pool:
-                _grow_step = int(os.environ.get("EXO_DSV4_POOL_GROW_STEP", "1"))
-                _target = max_pool if _grow_step <= 1 else (
-                    ((max_pool + _grow_step - 1) // _grow_step) * _grow_step
-                )
+                # Chunked growth (see _POOL_GROW_* at module scope). Gates:
+                #   ratio <= _POOL_GROW_MAX_RATIO — r=128 pools feed
+                #     CompressedAttention, which never top-ks, so any pad is
+                #     attended (masked) and drifts. Never pad them.
+                #   min(_pool_lengths) >= _POOL_GROW_MIN — every stream must
+                #     already expose at least index_topk VALID columns. Then
+                #     both arms are > index_topk (sparse branch in both, no
+                #     branch flip) AND k = min(index_topk, P) never has to
+                #     reach past the valid columns into a masked/pad column,
+                #     so the top-k selects the same real columns in the same
+                #     order regardless of width. Using min(_pool_lengths)
+                #     rather than max_pool also keeps this true for a ragged
+                #     batch, where a short stream could otherwise be forced to
+                #     select finfo.min columns whose relative order among an
+                #     enlarged tie-set is not a documented MLX guarantee.
+                _target = max_pool
+                if (
+                    _POOL_GROW_STEP > 1
+                    and self.ratio <= _POOL_GROW_MAX_RATIO
+                    and min(self._pool_lengths) >= _POOL_GROW_MIN
+                ):
+                    _target = (
+                        ((max_pool + _POOL_GROW_STEP - 1) // _POOL_GROW_STEP)
+                        * _POOL_GROW_STEP
+                    )
                 pad = mx.zeros(
                     (B, _target - self.pooled.shape[1], D), dtype=px.dtype
                 )
