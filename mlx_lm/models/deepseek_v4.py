@@ -3489,6 +3489,17 @@ def _fused_topk(scores: mx.array, k: int):
 _EXACT_TOPK = os.environ.get("EXO_DSV4_EXACT_TOPK", "1") == "1"
 _EXACT_TOPK_KERNEL_CACHE: dict = {}
 _EXACT_TOPK_PARAM_CACHE: dict = {}
+# EXO_DSV4_EXACT_TOPK_PARAM_CAP (default 64): the (P, k) params-array cache
+# cap. P grows by 1 every compress_ratio decode tokens, so over a decode
+# window the (P, k) key sweeps a range of P values; when the cache exceeds
+# this cap it is CLEARED (see _exact_topk below), a mid-window Python-side
+# hiccup. Raising the cap (e.g. 65536) eliminates the clear-thrash — the
+# params array is 2 uint32s (8 bytes), so even 65536 entries is ~512 KB.
+# Investigation: docs/dspark-14k-cliff-investigation-2026-08-27.md
+# (Candidate 1). Default 64 = unchanged production behavior for A/B.
+_EXACT_TOPK_PARAM_CAP = int(
+    os.environ.get("EXO_DSV4_EXACT_TOPK_PARAM_CAP", "64")
+)
 
 
 def _exact_topk_source() -> str:
@@ -3661,7 +3672,7 @@ def _exact_topk(scores: mx.array, k: int):
     params = _EXACT_TOPK_PARAM_CACHE.get(pkey)
     if params is None:
         params = mx.array([P, k], dtype=mx.uint32)
-        if len(_EXACT_TOPK_PARAM_CACHE) >= 64:
+        if len(_EXACT_TOPK_PARAM_CACHE) >= _EXACT_TOPK_PARAM_CAP:
             _EXACT_TOPK_PARAM_CACHE.clear()
         _EXACT_TOPK_PARAM_CACHE[pkey] = params
     outs = kern(
