@@ -1646,6 +1646,19 @@ _VERIFY_ROWSEQ_ROWMASK = (
 # bf16 big projections fail 0-ulp. See docs/verify-batch-phase0-2026-08-26.md
 # for the 0-ulp table + decision.
 _VERIFY_BATCH = os.environ.get("EXO_DSV4_VERIFY_BATCH", "0") == "1"
+# EXO_DSV4_VERIFY_BATCH_MIN_CTX (default 8192, 2026-08-27 depth gate):
+# the verify-batch indexer-stream-sharing path only activates when the
+# current context length (cache offset) >= this threshold. Below it the
+# rowseq path runs unchanged — preserving byte-identity at short ctx
+# (where the base decode is deterministic and bitwise-identity is the
+# real correctness bar). At/above the threshold the base decode is
+# NONDETERMINISTIC at depth (proven: 100K temp=0 runs give 295/977
+# tokens, ~0.6-logit run-to-run drift from MLX Metal dispatch), so the
+# batched path's small drift is acceptable — the bar there is
+# cross-rank consistency + staying within the base's OWN run-to-run
+# drift envelope (G0''), NOT bitwise-identity. The 8192 default keeps
+# the degen set (<2K) and short prompts on the proven rowseq path.
+_VERIFY_BATCH_MIN_CTX = int(os.environ.get("EXO_DSV4_VERIFY_BATCH_MIN_CTX", "8192"))
 # Verify-batch side channel (like _TREE_VERIFY_CTX). Set ONCE per verify
 # forward (bracketing the per-row loop in the block/FULLBLOCK/_forward_steps
 # paths) when _VERIFY_BATCH is ON. Stores the verify width L and a generation
@@ -3962,6 +3975,34 @@ class Indexer(nn.Module):
                     self.scale,
                     self.n_heads**-0.5,
                 )
+        # EXO_DSV4_VERIFY_BATCH=1 pmask shape fix (2026-08-27, G0-fail doc):
+        # the indexer-stream-sharing path substitutes ``pooled`` with the
+        # row-0 snapshot for rows 1..L-1. The snapshot's pooled width
+        # (``pooled.shape[1]``, = ``scores.shape[-1]``) can be NARROWER than
+        # the current ``pool_cache`` width the pmask was built from (a
+        # compress window flushed mid-verify grew the committed pool, but
+        # the stale-safe check keyed on ``_pool_lengths`` not on the actual
+        # storage ``pooled.shape[1]``). The pmask built above from
+        # ``pool_cache`` carries the CURRENT (wider) P, so the broadcast
+        # ``mx.where(pmask[None], scores, ...)`` crashes with
+        # ``broadcast_shapes (1,1,P_pmask) vs (1,1,P_scores)``.
+        # Fix: when the verify-batch ctx is active and pmask is not None,
+        # slice pmask's last (P) axis to ``scores.shape[-1]`` so the where
+        # broadcast is shape-compatible. This is EXACT for the narrowed-
+        # snapshot case (the extra pmask columns correspond to pooled
+        # entries the snapshot does not contain — keeping only the prefix
+        # the snapshot has is the correct causal view for that row). When
+        # the snapshot was discarded (stale-safe fallback), pooled == the
+        # evolved pool and P_pmask == P_scores, so the slice is a no-op.
+        if (
+            pmask is not None
+            and _VERIFY_BATCH
+            and _VERIFY_BATCH_CTX["active"]
+        ):
+            _vb_scores_p = scores.shape[-1]
+            _vb_pmask_p = pmask.shape[-1]
+            if _vb_pmask_p > _vb_scores_p:
+                pmask = pmask[..., :_vb_scores_p]
         if pmask is not None:
             # OPT-12 (env-gated EXO_DSV4_TAIL_PMASK=1, default ON): tail-
             # restricted pmask apply. The row-causal pmask row j is
@@ -6862,10 +6903,21 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         # (L==1) do not enter the per-row verify path, so the ctx stays inert.
         # Cleared after the per-layer loop below. A stale ``active=True`` from a
         # prior forward is also cleared here defensively at entry.
+        #
+        # EXO_DSV4_VERIFY_BATCH_MIN_CTX depth gate (2026-08-27): the batched
+        # verify path only activates when the current context length
+        # (cache offset) >= _VERIFY_BATCH_MIN_CTX (default 8192). Below the
+        # threshold the rowseq path runs unchanged — preserving byte-identity
+        # at short ctx where the base decode is deterministic. At/above the
+        # threshold the base decode is nondeterministic at depth, so the
+        # batched path's small drift is acceptable (G0'' bar). This keeps the
+        # degen set (<2K) and short prompts on the proven rowseq path.
+        _vb_ctx_len = _rowseq_ctx(cache[0]) if cache is not None else 0
         _vb_active = (
             _VERIFY_BATCH
             and h.shape[0] == 1
             and 2 <= h.shape[1] <= _VERIFY_ROWSEQ_MAX_L
+            and _vb_ctx_len >= _VERIFY_BATCH_MIN_CTX
         )
         if _VERIFY_BATCH:
             _set_verify_batch_ctx(active=False)
