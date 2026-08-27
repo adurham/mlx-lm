@@ -4,7 +4,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Union, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1612,6 +1612,64 @@ _MOE_PARTS_ROWSEQ = frozenset(
 _VERIFY_ROWSEQ_ROWMASK = (
     os.environ.get("EXO_DSV4_ROWSEQ_ROWMASK", "0") == "1"
 )
+
+# EXO_DSV4_VERIFY_BATCH=1 (default OFF, 2026-08-26 verify-batching campaign):
+# indexer-stream-sharing. At each sparse layer's Indexer during a small-L
+# verify (B=1, 2<=L<=MAX_L), snapshot the pre-verify ``pooled`` (the
+# compressed-KV stream) ONCE (on row 0) and reuse it for rows 1..L-1's score
+# GEMMs (looped per-row, since the batched L=4 score GEMM is NOT 0-ulp -- see
+# bench/micro_batch_invariance.py). The compressor STILL runs per-row to
+# evolve the pool for the commit -- only the score-READ uses the snapshot.
+#
+# CORRECTNESS (bitwise-equivalent to the per-row rowseq path): the Indexer's
+# compressor (decode mode, L=1 per-row) buffers ``compress_ratio`` tokens
+# before producing a new pooled entry, so during a small-L verify the pool
+# grows by AT MOST one entry (only when a compress window flushes mid-verify).
+# When the pool did NOT change between row 0 and row j, the snapshot is
+# byte-identical to row j's evolved pool -> identical scores. When the pool
+# DID change (a window flushed), the snapshot is stale -> the stale-safe
+# fallback (snap_pool_len != current pool length) discards the snapshot and
+# uses row j's just-evolved pooled, matching the per-row rowseq path exactly.
+# The verify-time pmask is None (PoolingCache.make_mask returns None for
+# L<=_POOL_VERIFY_MAX_L=16 -- all valid pooled blocks precede the frontier
+# queries), so NO row-causal masking hides pool differences; the stale-safe
+# length check is what guarantees bit-exactness, not the pmask. G0 (cycle-level
+# 0-ulp) is the gate that validates this.
+#
+# The win: the compressed-KV stream is read ONCE per cycle (row 0), not
+# gamma+1 times -- targeting the Indexer top-k search that dominates per-row
+# cost (50-85% of 20.2ms/row @100K per the consults) and is the
+# context-scaling cliff source. Everything else (dense proj, MoE, lm-head,
+# attention core) stays on the current rowseq/FULLBLOCK path. The full Kimi
+# "batched M=4 forward" design (C_s~1.3) is infeasible: the fused fp32 SDPA
+# L_q=4 != L_q=1 bitwise (the attention core cannot batch) and the dense
+# bf16 big projections fail 0-ulp. See docs/verify-batch-phase0-2026-08-26.md
+# for the 0-ulp table + decision.
+_VERIFY_BATCH = os.environ.get("EXO_DSV4_VERIFY_BATCH", "0") == "1"
+# Verify-batch side channel (like _TREE_VERIFY_CTX). Set ONCE per verify
+# forward (bracketing the per-row loop in the block/FULLBLOCK/_forward_steps
+# paths) when _VERIFY_BATCH is ON. Stores the verify width L and a generation
+# counter (``gen``) that bumps on each activation so every Indexer instance
+# resets its per-layer row counter + snapshot at the start of a new verify
+# cycle. Per-layer state (row counter, snapshot, snap pool id/len) lives on
+# each Indexer instance -- the module ctx only carries the on/off + width +
+# generation, since one forward spans 21 independent Indexers each with its
+# own pool_cache.
+_VERIFY_BATCH_CTX: Dict[str, Any] = {"active": False, "L": 0, "gen": 0}
+
+
+def _set_verify_batch_ctx(active: bool, L: int = 0) -> None:
+    """Caller-side helper: install or clear the verify-batch side channel.
+
+    Bumps ``gen`` when activating so each Indexer instance detects a new
+    verify cycle and resets its per-layer row counter + snapshot. Clearing
+    (active=False) leaves ``gen`` unchanged; the Indexer only acts when
+    ``active`` is True, so a stale ``gen`` across an inactive span is inert.
+    """
+    _VERIFY_BATCH_CTX["active"] = active
+    _VERIFY_BATCH_CTX["L"] = L
+    if active:
+        _VERIFY_BATCH_CTX["gen"] = _VERIFY_BATCH_CTX["gen"] + 1
 
 # EXO_DSV4_ATTN_ALLSUM=0: skip the attention-tail all_sum on
 # sharding_group. DSv4 REPLICATES attention on every rank (MoE-only
@@ -3777,6 +3835,19 @@ class Indexer(nn.Module):
         self._topk_overlap_log = _os.environ.get("EXO_DSV4_TOPK_OVERLAP_LOG", "0") == "1"
         self._prev_topk_set: Optional[set[int]] = None
         self._topk_overlap_step = 0
+        # Per-layer verify-batch state (EXO_DSV4_VERIFY_BATCH=1). The module
+        # ctx (_VERIFY_BATCH_CTX) carries only the on/off + width + a
+        # generation counter; each Indexer owns its row counter + snapshot
+        # because one verify forward spans 21 independent Indexers each with
+        # its own pool_cache. ``_vb_gen`` tracks the ctx generation this
+        # Indexer last saw, so a new verify cycle (ctx gen bumped) resets the
+        # row counter + snapshot. Default-initialized to -1 so the first
+        # activation (gen 1) is detected as a new cycle.
+        self._vb_gen: int = -1
+        self._vb_row: int = 0
+        self._vb_snapshot: Optional[mx.array] = None
+        self._vb_snap_pool_id: Optional[int] = None
+        self._vb_snap_pool_len: int = 0
 
 
     def __call__(
@@ -3798,6 +3869,60 @@ class Indexer(nn.Module):
         pooled = self.compressor(x, pool_cache, offset)
         if pooled.shape[1] == 0:
             return None
+
+        # EXO_DSV4_VERIFY_BATCH=1 indexer-stream-sharing (2026-08-26): during a
+        # small-L rowseq verify, snapshot the pre-verify ``pooled`` (the
+        # compressed-KV stream) on row 0 and reuse it for rows 1..L-1's score
+        # GEMM. The compressor STILL runs per-row (above) to evolve the pool
+        # for the commit -- we only substitute the snapshot for the score READ.
+        # Per-layer state lives on this Indexer instance (one forward spans 21
+        # independent Indexers each with its own pool_cache); the module ctx
+        # carries the on/off + width + a generation counter.
+        #
+        # Bitwise-equivalent to the per-row rowseq path: the compressor in
+        # decode mode (L=1) buffers ``compress_ratio`` tokens before flushing
+        # a new pooled entry, so the pool grows by AT MOST one entry during a
+        # small-L verify (only when a compress window flushes mid-verify).
+        # When the pool did NOT change between row 0 and row j, the snapshot
+        # is byte-identical to row j's evolved pool -> identical scores. When
+        # it DID change (a window flushed), the stale-safe check
+        # (snap_pool_len != current pool length) discards the snapshot and
+        # uses row j's just-evolved pooled, matching rowseq exactly. The
+        # verify-time pmask is None (PoolingCache.make_mask returns None for
+        # L<=_POOL_VERIFY_MAX_L), so the length check -- not the pmask -- is
+        # what guarantees bit-exactness. See docs/verify-batch-phase0-2026-08-26.md.
+        if _VERIFY_BATCH and _VERIFY_BATCH_CTX["active"] and pool_cache is not None:
+            _vb_ctx = _VERIFY_BATCH_CTX
+            _vb_gen = cast(int, _vb_ctx["gen"])
+            if self._vb_gen != _vb_gen:
+                # New verify cycle: reset this layer's row counter + snapshot.
+                self._vb_gen = _vb_gen
+                self._vb_row = 0
+                self._vb_snapshot = None
+                self._vb_snap_pool_id = None
+                self._vb_snap_pool_len = 0
+            _pool_id = id(pool_cache)
+            _pool_len = int(getattr(pool_cache, "_pool_lengths", [0])[0]) if hasattr(pool_cache, "_pool_lengths") else pooled.shape[1]
+            if self._vb_row == 0:
+                # Row 0: build the snapshot from the just-returned pooled.
+                self._vb_snapshot = pooled
+                self._vb_snap_pool_id = _pool_id
+                self._vb_snap_pool_len = _pool_len
+            else:
+                # Rows 1..L-1: reuse the snapshot IF it is from the same
+                # pool_cache object AND the pool has not grown (no compress
+                # window flushed mid-verify). If the snapshot is stale (pool
+                # grew, or the pool_cache object changed after a
+                # rejection+restore), fall back to the per-row evolved pooled
+                # (the safe rowseq path) -- bitwise-identical to rowseq.
+                if (
+                    self._vb_snapshot is not None
+                    and self._vb_snap_pool_id == _pool_id
+                    and self._vb_snap_pool_len == _pool_len
+                ):
+                    pooled = self._vb_snapshot
+                # else: use the just-returned evolved pooled (per-row path).
+            self._vb_row = self._vb_row + 1
 
         # Build the full row-causal pmask first (row index == query position),
         # then slice to the band so the kept rows carry their correct masking.
@@ -4969,6 +5094,11 @@ class DeepseekV4Block(nn.Module):
             # M=1 except the MoE ffn, which is batched over the per-row
             # pre-ffn norms (bitwise M-invariant, incl. TP-sharded shapes).
             _fb_L = h.shape[1]
+            # EXO_DSV4_VERIFY_BATCH=1: the verify-batch side channel is
+            # activated once at the model level (_forward_steps) around the
+            # per-layer loop for the whole verify forward, so this layer's
+            # per-row loop inherits the active ctx; the Indexer snapshots the
+            # compressed-KV stream once (row 0) and reuses it for rows 1..L-1.
             _fb_rows = []
             for _fb_j in range(_fb_L):
                 _fb_h = h[:, _fb_j : _fb_j + 1]
@@ -5121,6 +5251,12 @@ class DeepseekV4Block(nn.Module):
             ):
                 x = self.attn.rowseq_vec(normed, cache)
             else:
+                # EXO_DSV4_VERIFY_BATCH=1: this layer's per-row attention loop
+                # inherits the active ctx set once at the model level
+                # (_forward_steps); the Indexer snapshots the compressed-KV
+                # stream once (row 0) and reuses it for rows 1..L-1. The
+                # vectorized rowseq_vec path above is already a single batched
+                # sdpa (no per-row loop), so the ctx is a no-op there.
                 x = mx.concatenate(
                     [
                         self.attn(
@@ -6717,6 +6853,24 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         # sets it) converts local->global so the tap check is correct in
         # both topologies.
         _pp_start = getattr(self, "pipeline_start_idx", 0)
+        # EXO_DSV4_VERIFY_BATCH=1: activate the verify-batch side channel once
+        # for the whole verify forward (B=1, 2<=L<=_VERIFY_ROWSEQ_MAX_L) so
+        # every sparse layer's Indexer snapshots the compressed-KV stream on
+        # row 0 and reuses it for rows 1..L-1 (indexer-stream-sharing; see the
+        # _VERIFY_BATCH header comment). The per-layer Indexer state resets via
+        # the ctx generation counter. Prefill (large L) and single-token decode
+        # (L==1) do not enter the per-row verify path, so the ctx stays inert.
+        # Cleared after the per-layer loop below. A stale ``active=True`` from a
+        # prior forward is also cleared here defensively at entry.
+        _vb_active = (
+            _VERIFY_BATCH
+            and h.shape[0] == 1
+            and 2 <= h.shape[1] <= _VERIFY_ROWSEQ_MAX_L
+        )
+        if _VERIFY_BATCH:
+            _set_verify_batch_ctx(active=False)
+            if _vb_active:
+                _set_verify_batch_ctx(active=True, L=h.shape[1])
         for _ap_i, (layer, layer_cache) in enumerate(zip(self.pipeline_layers, cache)):
             h = layer(h, mask, layer_cache, inputs)
             _global_i = _pp_start + _ap_i
@@ -6743,6 +6897,13 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                 yield ("layer", _ap_i, h)
         if _lhash_fh is not None:
             _lhash_fh.close()
+        # EXO_DSV4_VERIFY_BATCH=1: clear the verify-batch side channel after
+        # the per-layer loop. The model-level hc_head per-row loop below (if
+        # it runs for a verify) does not touch the Indexer (hc_head is a
+        # HyperConnection module, not an attention block), so the ctx is no
+        # longer needed past this point.
+        if _VERIFY_BATCH:
+            _set_verify_batch_ctx(active=False)
 
         if not _nop_pipeline and pipeline_rank != 0:
             with span("model.send"):
