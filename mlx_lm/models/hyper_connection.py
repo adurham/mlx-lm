@@ -410,6 +410,26 @@ class HyperConnection(nn.Module):
         super().__init__()
         self.hc_mult = config.hc_mult
         self.sinkhorn_iters = config.hc_sinkhorn_iters
+
+        # Tuning knob (2026-08-30): override the Sinkhorn iteration count
+        # from the environment, without touching the checkpoint config.
+        # P03 GPU trace (docs/p03-smallop-bucket-gputrace-2026-08-30.md)
+        # found the hc_sinkhorn_iters=20 loop is 30.4% of the production
+        # spec-ON decode cycle — pure sequential-barrier latency, since the
+        # comb matrix is only 4x4. Both execution paths already thread the
+        # count through (the fused kernel takes it as the ITERS template
+        # param), so only the count itself needs overriding. Off / unset /
+        # invalid values fall back to config.hc_sinkhorn_iters — bit-identical
+        # to today's behavior. Same pattern as EXO_HC_USE_OPS (2026-06-09).
+        env_iters = os.environ.get("EXO_HC_SINKHORN_ITERS")
+        if env_iters is not None:
+            try:
+                parsed = int(env_iters)
+            except ValueError:
+                parsed = 0  # invalid -> fall back to config below
+            if parsed > 0:
+                self.sinkhorn_iters = parsed
+
         self.hc_eps = config.hc_eps
         self.norm_eps = config.rms_norm_eps
 
