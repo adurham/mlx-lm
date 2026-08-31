@@ -578,6 +578,96 @@ def load_model(
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
 
+    # EXO_DSV4_LMHEAD_MXFP8=1 (default OFF): quantize the DSv4 lm_head to
+    # mxfp8 IN PLACE at load time — the same 32-group 8-bit scheme the
+    # model's attention/shared-expert weights already use on this fork.
+    # The P03 per-kernel capture (docs/p03-smallop-bucket-gputrace-
+    # 2026-08-30.md) found the lm_head family is ~27% of the spec-ON decode
+    # small-op bucket running at 92-94% of spec bandwidth — i.e. BYTE-
+    # limited — and lm_head alone is 1.059 GB/rank of UNQUANTIZED BF16,
+    # replicated on every rank. mxfp8 halves those bytes: the P05 studio
+    # microbench measured 1.64-1.84x at the production call shapes
+    # (M=1/3/4), projecting -2.7 ms/cycle ~ -0.84 ms/token.
+    #
+    # markov_w2 is deliberately NOT included (measured 1.00x — 253.9µs
+    # BF16 vs 254.7µs mxfp8, latency-bound, no byte win; see exo
+    # utils_mlx.py's note). Quantizes ONLY the top-level
+    # Model.lm_head, after load_weights, before any caller sharding.
+    # lm_head is TP-REPLICATED (exo's DSv4 sharding strategy never touches
+    # it) and identical on both ranks, so quantize-then-replicate is
+    # numerically identical on each rank.
+    #
+    # Numerics gate (P05, tmp/p05-lmhead-mxfp8-20260830/): per-row logit
+    # error mean 0.53 / rms 0.68 vs logit std 11.3; top-1 greedy flips
+    # ~13% on synthetic inputs, concentrated 100% in margin<3.6 near-ties
+    # (0% flips for margin>3.6). Real-generation margin distribution
+    # (2026-08-30 PM follow-up, real_margins/summary.json, n=3999
+    # committed tokens across 35/2.5K/6.3K/25K-ctx temp-0 generations,
+    # top1-vs-top2 logprob margins via /v1 logprobs): 42.7% of real
+    # tokens below 3.62 (n>=798 slice: 44.5%), implying an mxfp8 flip
+    # rate of ~11.5% via the synthetic band kernel (n>=798: ~12.8%) —
+    # an ESTIMATE, not a direct measurement. This knob is a
+    # THROUGHPUT-for-quality tradeoff candidate, NOT near-lossless;
+    # ship only if the live needle gate passes. (The earlier "~58%
+    # below 3.6 → ~16%" figures in this comment were asserted without
+    # data and are REFUTED by the first real measurement.)
+    #
+    # Gated exactly like EXO_HC_SINKHORN_ITERS (mlx-lm a6eb893): unset or
+    # any value other than "1" leaves the module untouched — bit-identical
+    # to today's behavior.
+    #
+    # 2026-08-30 live A/B re-attribution (LEAD 1 forensics, rootcause2/):
+    # the P05 Phase A "quant" zero-acceptance result (0.05-0.06x decode,
+    # ~550ms draft) was a WRONG-MODEL harness artifact, NOT a property of
+    # this knob. bench/ab_probe_tier1.py hardcoded MODEL='mlx-community/
+    # DeepSeek-V4-Flash' until de925720e; that 8-bit model's lm_head is
+    # already quantized (has .scales) so this knob no-ops on it, and it was
+    # JIT-loaded under single-node PIPELINE parallelism (a documented
+    # spec-decode collapse). The knob-quantized 0731 head was healthy at
+    # all measured contexts (trivial + 5.6K, rowseq verify: mean_accept
+    # ~1.89/3, draft ~9ms, decode ~200-223 tok/s). >=8K batched verify
+    # (VERIFY_BATCH/MIN_CTX=8192) and 100K remain UNMEASURED on the
+    # quantized head.
+    if os.environ.get("EXO_DSV4_LMHEAD_MXFP8", "0") == "1" and config.get(
+        "model_type", ""
+    ) == "deepseek_v4":
+        try:
+            def _p05_quant_head(root: nn.Module, attr: str) -> bool:
+                mod = getattr(root, attr, None)
+                if (
+                    isinstance(mod, nn.Linear)
+                    and mod is not None
+                    and mod.weight.shape[-1] % 32 == 0
+                    and not hasattr(mod, "scales")
+                ):
+                    qmod = mod.to_quantized(group_size=32, bits=8, mode="mxfp8")
+                    root.update_modules({attr: qmod})
+                    return True
+                return False
+
+            _p05_hits = []
+            # top-level Model.lm_head
+            if _p05_quant_head(model, "lm_head"):
+                _p05_hits.append("lm_head")
+            if _p05_hits:
+                import sys as _p05_sys
+
+                print(
+                    "[LMHEAD_MXFP8] quantized "
+                    f"{','.join(_p05_hits)} to mxfp8 (group=32, bits=8)",
+                    file=_p05_sys.stderr,
+                    flush=True,
+                )
+        except Exception as _p05_err:  # never break a model load
+            import sys as _p05_sys
+
+            print(
+                f"[LMHEAD_MXFP8] in-place quantization failed ({_p05_err}); "
+                "keeping BF16 head",
+                file=_p05_sys.stderr,
+                flush=True,
+            )
+
     if not lazy:
         mx.eval(model.parameters())
 

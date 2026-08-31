@@ -37,6 +37,12 @@ _BUILD_PROBE_ACC: Dict[str, float] = {
     "step_count": 0,
 }
 
+# EXO_DSV4_PRENORM_H_DUMP (P05 2026-08-30): mutable budget counter for the
+# pre-norm hidden-state dump in Model.__call__ (module-level list cell so
+# the __call__ site can mutate it without a global statement per call —
+# same pattern as _ALLSUM_PROBE_REMAINING above).
+_P05_H_DUMP_COUNT = [0]
+
 # Per-mlx-op CPU-dispatch probe (env-gated MLX_OP_PROBE=1).
 # Monkey-patches a curated set of hot mlx primitives at module load so every
 # call accumulates wall-time (Python wrapper + pybind cross + C++-side
@@ -3487,6 +3493,16 @@ def _fused_topk(scores: mx.array, k: int):
 # remains gated off and should NOT be enabled at k=512.
 
 _EXACT_TOPK = os.environ.get("EXO_DSV4_EXACT_TOPK", "1") == "1"
+# P08 Item 2 (2026-08-30): relax the L<=16 shape gate so PREFILL chunks
+# (L > 16) also take the exact top-k kernel when this knob is set to "1".
+# Default OFF: deploying the code changes NOTHING until the flag is set —
+# merely a revertible A/B gate for the live prefill experiment. Masked
+# exactness at L=1024 validated on-masked-inputs on m4-2
+# (tmp/p08-20260830/item2_phaseC_masked.py): 0/1024 mismatched rows on 5
+# cases incl. below-k unmasked rows (all finfo.min ties) and forced-tie+mask.
+_EXACT_TOPK_PREFILL = os.environ.get(
+    "EXO_DSV4_EXACT_TOPK_PREFILL", "0"
+) == "1"
 _EXACT_TOPK_KERNEL_CACHE: dict = {}
 _EXACT_TOPK_PARAM_CACHE: dict = {}
 # EXO_DSV4_EXACT_TOPK_PARAM_CAP (default 64): the (P, k) params-array cache
@@ -4018,12 +4034,16 @@ class Indexer(nn.Module):
             # deterministic lowest-index tie-breaking, no ``-scores``
             # negation pass. Masked scores (finfo.min fills from the pmask
             # path) map to the lowest key, so masking semantics carry
-            # through unchanged. Prefill chunks (L > 16) keep the landed
-            # argpartition path. Gate: EXO_DSV4_EXACT_TOPK (default 1);
+            # through unchanged — validated at L=1024 on real finfo.min-
+            # masked inputs incl. below-k rows (tmp/p08-20260830/
+            # item2_phaseC_masked.py, 2026-08-30).
+            # Prefill chunks (L > 16) keep the landed argpartition path
+            # UNLESS EXO_DSV4_EXACT_TOPK_PREFILL=1 (default 0; P08 Item 2
+            # live A/B gate). Gate: EXO_DSV4_EXACT_TOPK (default 1);
             # "exact_topk_off" in /tmp/dsv4_nop_targets disables live.
             if (_topk_result is None
                     and _EXACT_TOPK
-                    and scores.shape[1] <= 16
+                    and (scores.shape[1] <= 16 or _EXACT_TOPK_PREFILL)
                     and "exact_topk_off" not in _topk_targets):
                 exact = _exact_topk(scores, k)
                 if exact is not None:
@@ -7063,6 +7083,49 @@ class Model(nn.Module):
             L = inputs.shape[1] if inputs.ndim > 1 else 1
             return mx.zeros((B, L, self.args.vocab_size), dtype=mx.bfloat16)
         h = self.model(inputs, cache)
+        # EXO_DSV4_PRENORM_H_DUMP=<dir> (P05 2026-08-30, diagnostic, default
+        # unset = zero overhead): capture the REAL hidden states entering the
+        # model-level hc_head+norm+lm_head tail — the exact input distribution
+        # the P05 lm_head-mxfp8 offline numerics replay needs, and the real-x
+        # calibration for the Phase-B Sinkhorn analysis. Writes the FIRST
+        # EXO_DSV4_PRENORM_H_DUMP_BUDGET (default 24) calls' h as raw bf16
+        # .bin + a json sidecar, one file per call — decode- AND
+        # prefill-shaped (the tail sees both). Read-only wrt the forward:
+        # never blocks, never mutates h; a dump failure never breaks serving.
+        _p05_hdump = os.environ.get("EXO_DSV4_PRENORM_H_DUMP", "")
+        if _p05_hdump:
+            try:
+                _P05_H_DUMP_BUDGET = int(
+                    os.environ.get("EXO_DSV4_PRENORM_H_DUMP_BUDGET", "24")
+                )
+                if _P05_H_DUMP_COUNT[0] < _P05_H_DUMP_BUDGET:
+                    import json as _p05_json
+                    import uuid as _p05_uuid
+
+                    import numpy as _p05_np
+
+                    _P05_H_DUMP_COUNT[0] += 1
+                    _p05_hb = _p05_np.asarray(
+                        h.astype(mx.bfloat16), stream=mx.cpu
+                    )
+                    _p05_tag = _p05_uuid.uuid4().hex[:10]
+                    _p05_path = os.path.join(
+                        _p05_hdump,
+                        f"prenorm_h_{_P05_H_DUMP_COUNT[0]:03d}_{_p05_tag}.bin",
+                    )
+                    with open(_p05_path, "wb") as _p05_fh:
+                        _p05_fh.write(_p05_hb.tobytes())
+                    with open(_p05_path + ".json", "w") as _p05_fh:
+                        _p05_json.dump(
+                            {
+                                "shape": list(h.shape),
+                                "dtype": "bf16",
+                                "n": _P05_H_DUMP_COUNT[0],
+                            },
+                            _p05_fh,
+                        )
+            except Exception:
+                pass  # a dump must never break serving
         with span("model.lm_head"):
             if "lm_head" in _get_nop_targets():
                 # Return zeros of the expected output shape (B, L, vocab_size).
