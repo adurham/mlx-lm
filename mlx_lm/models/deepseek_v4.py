@@ -3503,8 +3503,87 @@ _EXACT_TOPK = os.environ.get("EXO_DSV4_EXACT_TOPK", "1") == "1"
 _EXACT_TOPK_PREFILL = os.environ.get(
     "EXO_DSV4_EXACT_TOPK_PREFILL", "0"
 ) == "1"
+# P09 Item 1 (2026-08-31): query-range tiled decomposition of the compressed
+# SDPA. The fused kernel ignores the causal structure of the (B,H,Lq,N) mask
+# (measured t_causal/t_dense = 1.0007 on M4 Max) while the production mask is
+# only ~47% dense, so ~53% of the fused work is discarded by masking. The
+# tiled variant splits the Lq query rows into blocks of
+# _QUERY_TILED_B rows and issues ONE fused SDPA per block over the block's
+# VISIBLE keys only — its local sliding-window slice (indices [i,
+# i+B-1+sw] of the local cache, clamped) followed by ALL pooled keys in
+# order. Each block is a complete attention (no log-sum-exp merge); the
+# per-block outputs concatenate along axis 2 and are bit-equivalent to the
+# single fused call by construction (same visible key set, same key order).
+# Reference: tmp/p08-20260830/p08_item1c_querytiled.py — measured 2.01x
+# isolated / 1.90x pipelined at the production prefill shape
+# (Lq=1024, 3894 keys, 1719 pooled, sw=128) with variant-vs-fused p50 rel
+# error 0.0%. Default OFF: unset = unchanged single fused SDPA call, no new
+# ops on the hot path. _QUERY_TILED_B = rows per block (default 64).
+_QUERY_TILED_SDPA = os.environ.get("EXO_DSV4_QUERY_TILED_SDPA", "0") == "1"
+# Parsed defensively: a malformed or non-positive value must not crash the
+# runner at import time (the flag may be OFF). Falls back to the default.
+
+
+def _parse_query_tiled_b(raw: str) -> int:
+    try:
+        _b = int(raw)
+        if _b > 0:
+            return _b
+    except ValueError:
+        pass
+    import warnings as _warnings
+
+    _warnings.warn(
+        "EXO_DSV4_QUERY_TILED_B must be a positive int, got "
+        f"{raw!r}; falling back to 64",
+        stacklevel=2,
+    )
+    return 64
+
+
+_QUERY_TILED_B = _parse_query_tiled_b(
+    os.environ.get("EXO_DSV4_QUERY_TILED_B", "64")
+)
 _EXACT_TOPK_KERNEL_CACHE: dict = {}
 _EXACT_TOPK_PARAM_CACHE: dict = {}
+
+
+def _pooled_len(pool_cache):
+    """Number of pooled keys currently in ``pool_cache`` (0 without one)."""
+    if pool_cache is None or getattr(pool_cache, "pooled", None) is None:
+        return 0
+    return pool_cache.pooled.shape[1]
+
+
+def _query_tiled_ok(attn_mod, q, kv, mask, pool_cache, local_cache) -> bool:
+    """Shape/geometry gate for the query-tiled compressed-SDPA branch.
+
+    Every condition is one the single fused SDPA call handles transparently,
+    so returning False just falls back to that unchanged call. Requires:
+    array mask sized to the query rows, batch 1, enough query rows to tile
+    (> 1 block), a populated pool, a local cache in steady-state rotation
+    (offset >= cache length) so ring row j == the mask's ring row j and the
+    trailing-slice coordinate frame aligns, and a last block that keeps at
+    least one visible local key.
+    """
+    if not isinstance(mask, mx.array) or q.shape[0] != 1:
+        return False
+    n_q = q.shape[2]
+    if n_q < 2 * _QUERY_TILED_B or mask.shape[-2] != n_q:
+        return False
+    pool = _pooled_len(pool_cache)
+    if kv.shape[2] <= pool:
+        return False
+    local_len = kv.shape[2] - pool
+    if local_cache is None or local_cache.offset < local_len:
+        return False
+    # The tail block has fewer rows; its window must still expose >= 1 key.
+    tail = n_q - (n_q // _QUERY_TILED_B) * _QUERY_TILED_B
+    return (
+        (tail or _QUERY_TILED_B) - 1 + attn_mod.config.sliding_window >= 1
+    )
+
+
 # EXO_DSV4_EXACT_TOPK_PARAM_CAP (default 64): the (P, k) params-array cache
 # cap. P grows by 1 every compress_ratio decode tokens, so over a decode
 # window the (P, k) key sweeps a range of P values; when the cache exceeds
@@ -4399,6 +4478,68 @@ class CompressedAttention(nn.Module):
             with span("attn.sdpa.compressed"):
                 if "compressed_attn" in _get_nop_targets():
                     out = mx.zeros(q.shape, dtype=q.dtype)
+                elif _QUERY_TILED_SDPA and _query_tiled_ok(
+                    self, q, kv, mask, pool_cache, local_cache
+                ):
+                    # P09 Item 1: query-range tiled SDPA. The causal mask here
+                    # is only ~47% dense at production prefill shapes, but the
+                    # fused kernel ignores mask structure (t_causal/t_dense =
+                    # 1.0007) and does full dense work per row. Splitting the
+                    # query rows into blocks and giving each block only its
+                    # VISIBLE keys recovers that: for query row r (cache row
+                    # r + offset) the block attends to local keys
+                    # [r, r + block - 1 + sw] (the trailing clamp in
+                    # _extend_mask guarantees the last key is local_len - 1,
+                    # the mask's last visible column) followed by ALL pooled
+                    # keys, in that order — the same [local | pooled] key
+                    # order the production mask uses. Each block is a
+                    # COMPLETE attention; outputs concatenate along the query
+                    # axis. Off-path unless EXO_DSV4_QUERY_TILED_SDPA=1.
+                    _sinks = _cached_sinks(self, q.dtype)
+                    _sw = self.config.sliding_window
+                    _n_q = q.shape[2]
+                    _b_q = _QUERY_TILED_B
+                    _pool_cache = cache[1] if cache is not None else None
+                    _local_len = kv.shape[2] - _pooled_len(_pool_cache)
+                    _pool_k = kv[:, :, _local_len:, :]
+                    _pool_m = mask[:, :, :, _local_len:]
+                    _outs = []
+                    for _r in range(0, _n_q, _b_q):
+                        _b1 = min(_r + _b_q, _n_q)
+                        # Tail block: fewer rows, so end the window slice at
+                        # the last row's mask-visible boundary.
+                        _b = _b1 - _r
+                        # Coordinate frames: under seq-split, _r/_b1 are
+                        # BAND-relative query-row indices (q and mask rows
+                        # were sliced to [seq_lo, seq_hi)), while kv is
+                        # FULL-WIDTH. So key slicing and mask COLUMN indexing
+                        # must use absolute key-space indices (_seq_lo + _r),
+                        # while mask ROW indexing stays band-relative. Without
+                        # seq-split, _seq_lo == 0 and both frames coincide.
+                        _key_lo = _seq_lo + _r
+                        _khi = min(_local_len, _key_lo + _b - 1 + _sw)
+                        _kb = mx.concatenate(
+                            [kv[:, :, _key_lo:_khi, :], _pool_k], axis=2
+                        )
+                        _mb = mx.concatenate(
+                            [
+                                mask[:, :, _r:_b1, _key_lo:_khi],
+                                _pool_m[:, :, _r:_b1, :],
+                            ],
+                            axis=3,
+                        )
+                        _outs.append(
+                            scaled_dot_product_attention(
+                                q[:, :, _r:_b1, :],
+                                _kb,
+                                _kb,
+                                cache=local_cache,
+                                scale=self.scale,
+                                mask=_mb,
+                                sinks=_sinks,
+                            )
+                        )
+                    out = finalize(mx.concatenate(_outs, axis=2))
                 else:
                     _sinks = _cached_sinks(self, q.dtype)
                     _Lq = q.shape[2]
