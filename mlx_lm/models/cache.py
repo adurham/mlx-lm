@@ -2047,6 +2047,20 @@ class BatchPoolingCache(_BaseCache):
         stored_gate = self._overlap_gate_carry
         if stored_kv is None or stored_gate is None:
             return zeros, neg_inf
+        if len(self._overlap_carry_valid) != batch_size:
+            # Invariant guard (defense in depth): the per-stream carry lists
+            # must always track the current decode batch width. A mismatch
+            # means a structural op (extend/filter) resized the batch without
+            # also resizing the overlap-carry structures — instead of an
+            # opaque MLX reshape error we surface this clearly, and instead of
+            # silently dropping a real carry we refuse to proceed.
+            raise ValueError(
+                "BatchPoolingCache overlap-carry invariant violated: "
+                f"_overlap_carry_valid has {len(self._overlap_carry_valid)} "
+                f"entries but the current decode batch width is {batch_size}. "
+                "extend()/filter() did not resize the overlap-carry structures "
+                "to match — this is a bug in the cache structural-op path."
+            )
         valid = mx.array(self._overlap_carry_valid).reshape(batch_size, 1, 1, 1)
         kv_carry = mx.where(valid, stored_kv.astype(dtype), zeros)
         gate_carry = mx.where(valid, stored_gate.astype(dtype), neg_inf)
@@ -2639,6 +2653,23 @@ class BatchPoolingCache(_BaseCache):
         self._lengths = [self._lengths[i] for i in idx_list]
         self._processed = [self._processed[i] for i in idx_list]
 
+        # The four overlap-carry structures must be reindexed to the SAME
+        # surviving stream set, so row i still corresponds to stream i (and
+        # the lists keep length == len(idx_list)). Not doing this here was
+        # the root cause of the mid-decode crash in fetch_overlap_carry when
+        # a stream exited the batch while an overlap carry was persisted: the
+        # stale, longer lists were reshaped to the narrower decode width.
+        self._overlap_carry_valid = [
+            self._overlap_carry_valid[i] for i in idx_list
+        ]
+        self._overlap_windows_this_call = [
+            self._overlap_windows_this_call[i] for i in idx_list
+        ]
+        if self._overlap_kv_carry is not None:
+            self._overlap_kv_carry = self._overlap_kv_carry[batch_indices]
+        if self._overlap_gate_carry is not None:
+            self._overlap_gate_carry = self._overlap_gate_carry[batch_indices]
+
     def extend(self, other):
         self.commit_pending()  # see filter()
         if hasattr(other, "commit_pending"):
@@ -2718,6 +2749,35 @@ class BatchPoolingCache(_BaseCache):
         self._pool_lengths = self._pool_lengths + other._pool_lengths
         self._lengths = self._lengths + other._lengths
         self._processed = self._processed + other._processed
+
+        # ---- overlap-carry structs: a newly admitted stream has no carry
+        # yet, so grow the valid/window-width lists with defaults and extend
+        # the (B, 1, ratio, half_dim) carry tensors with zero/-inf
+        # placeholder rows for the new streams (fetch_overlap_carry masks
+        # them out via _overlap_carry_valid). Rows of streams already in
+        # flight are preserved unchanged. If self never stored a carry, the
+        # tensor stays None — fetch_overlap_carry already returns the
+        # placeholder for that case, and store_overlap_carry reinitializes
+        # it at the full grown width on the first produced window.
+        num_new = len(other.remainder)
+        self._overlap_carry_valid = (
+            self._overlap_carry_valid + [False] * num_new
+        )
+        self._overlap_windows_this_call = (
+            self._overlap_windows_this_call + [0] * num_new
+        )
+        if self._overlap_kv_carry is not None:
+            ratio = self._overlap_kv_carry.shape[2]
+            half_dim = self._overlap_kv_carry.shape[3]
+            dtype = self._overlap_kv_carry.dtype
+            kv_pad = mx.zeros((num_new, 1, ratio, half_dim), dtype=dtype)
+            gate_pad = mx.full((num_new, 1, ratio, half_dim), -mx.inf, dtype=dtype)
+            self._overlap_kv_carry = mx.concatenate(
+                [self._overlap_kv_carry, kv_pad], axis=0
+            )
+            self._overlap_gate_carry = mx.concatenate(
+                [self._overlap_gate_carry, gate_pad], axis=0
+            )
 
     def extract(self, idx):
         self.commit_pending()  # see filter()
