@@ -102,6 +102,24 @@ _FENCE_ASYNC = bool(int(os.environ.get("EXO_DSV4_FENCE_ASYNC", "0")))
 # 8b7b5f9), not the fence, but batched arming has not been long-soaked.
 _FENCE_ASYNC_MAX_B = max(1, int(os.environ.get("EXO_DSV4_FENCE_ASYNC_C2", "0") or "0") or 1)
 
+# Perf-campaign-2 round-3 Task 2 (A2-JACCL-DEPENDENCY.md, "The cheap
+# experiment that would settle Q3 outright"). Q3 concluded the 2026-06-26
+# `mlx-lm@9bc2206` regression was a plain algebra bug (the reorder moved
+# the only all_sum ahead of where the unreduced shared_experts partial
+# gets added), not a fence/ordering/determinism problem. This flag
+# re-tests that reorder correctly: all_sum the switch_mlp partial
+# immediately after it's produced (instead of after post_combine), and
+# add a SECOND, independent all_sum on the shared_experts partial before
+# combining. If both partials are reduced before the weighted-sum +
+# shared-add, the combine result should be identical to the current
+# (single, late) all_sum ordering. Purely a settling experiment for
+# whether the early-all_sum reorder is bit-identical at temp=0 once the
+# missing shared-expert reduction is restored — NOT validated for
+# throughput. Default OFF. EXO_DSV4_MOE_EARLY_ALLSUM=1 to enable. Only
+# takes effect on the non-row-sequential MoE path (empty _prs); row-seq
+# verify paths keep the original single-late-all_sum behavior.
+_MOE_EARLY_ALLSUM = os.environ.get("EXO_DSV4_MOE_EARLY_ALLSUM", "0") == "1"
+
 # Runner-controlled arming for the async fence (side channel like
 # _EAGLE_CTX; single-threaded per worker process). The env var enables the
 # FEATURE; the fence goes async only when EVERY key below is True. Two
@@ -3038,6 +3056,20 @@ class DeepseekV4MoE(nn.Module):
                 else:
                     y = finalize(self.switch_mlp(x, inds))
 
+                # EXO_DSV4_MOE_EARLY_ALLSUM=1 (see flag comment above):
+                # all_sum the switch_mlp partial right here instead of
+                # after post_combine. Only on the non-row-seq path.
+                _early_allsum_done = (
+                    _MOE_EARLY_ALLSUM
+                    and self.sharding_group is not None
+                    and not _prs
+                )
+                if _early_allsum_done:
+                    with span("moe.all_sum_early"):
+                        y = mx.distributed.all_sum(
+                            y, group=self.sharding_group
+                        )
+
             with span("moe.post_combine"):
                 # Phase H: fused weighted_reduce + shared_experts add via
                 # @mx.compile (_moe_post_combine). Was two separate spans
@@ -3054,6 +3086,17 @@ class DeepseekV4MoE(nn.Module):
                     )
                 else:
                     shared_out = self.shared_experts(x)
+
+                # Second all_sum, independent of the first: reduces the
+                # shared_experts partial (also sharded-to-all, see
+                # auto_parallel.py) before it's added into the combine.
+                # This is what the reverted 9bc2206 patch was missing.
+                if _early_allsum_done:
+                    with span("moe.all_sum_shared"):
+                        shared_out = mx.distributed.all_sum(
+                            shared_out, group=self.sharding_group
+                        )
+
                 if "combine" in _prs:
                     y = finalize(
                         mx.concatenate(
@@ -3073,7 +3116,16 @@ class DeepseekV4MoE(nn.Module):
 
             if self.sharding_group is not None:
                 with span("moe.all_sum"):
-                    y = mx.distributed.all_sum(y, group=self.sharding_group)
+                    if not _early_allsum_done:
+                        y = mx.distributed.all_sum(
+                            y, group=self.sharding_group
+                        )
+                    # else: already reduced via the two early all_sums
+                    # above (moe.all_sum_early + moe.all_sum_shared); y
+                    # here is the post-combine result of two
+                    # already-fully-reduced partials, so this collective
+                    # would be redundant (and wrong — y is no longer a
+                    # partial sum, all_sum-ing it again would double it).
                     # Phase H Lever 1 (2026-05-06): force evaluation of the
                     # collective output before any subsequent layer reads
                     # `y`. The all_sum itself is bit-deterministic across
