@@ -81,6 +81,53 @@ _OP_PROBE_ENABLED = bool(os.environ.get("MLX_OP_PROBE"))
 _ALLSUM_PROBE_ENABLED = bool(os.environ.get("EXO_DSV4_ALLSUM_PROBE"))
 _ALLSUM_PROBE_LOG_EVERY = int(os.environ.get("EXO_DSV4_ALLSUM_PROBE_LOG_EVERY", "50"))
 
+# ── TEMP ROUND-4 PROBE (2026-09-03, env-gated EXO_DSV4_ALLSUM_IDENTITY_PROBE=1) ──
+# GPU-identity all_sum substitute. A TIMING PROBE ONLY — must never be left
+# enabled by accident and must never appear in start_cluster.sh defaults.
+#
+# What it measures: with the probe on, the per-layer MoE
+# `mx.distributed.all_sum(y, group=self.sharding_group)` collective is
+# skipped entirely and `y` is returned unchanged (a no-op / "identity"
+# stand-in for the real collective). The fence gate immediately below
+# (async_eval / eval + the EXO_DSV4_FENCE_GATE_DIAG diag) still runs on
+# that (unchanged) `y` exactly as it does today, so the probe isolates the
+# cost of the all_sum collective + cross-rank wire handoff specifically,
+# while keeping the fence/handoff mechanism cost (part of what Q2 prices)
+# in the measurement. This lets a round-4 A/B attribute time to "the
+# collective itself" vs "the fence mechanism around it" separately.
+#
+# Output is NUMERICALLY WRONG whenever this is on: skipping the all_sum
+# means each rank keeps only its own local partial-sum contribution to
+# `y` instead of the true cross-rank sum. This is never a valid inference
+# configuration — timing probe only.
+#
+# OFF by default: when EXO_DSV4_ALLSUM_IDENTITY_PROBE is unset, this branch
+# is never taken and behavior is byte-identical to before this probe existed.
+# Do NOT add EXO_DSV4_ALLSUM_IDENTITY_PROBE to start_cluster.sh — it is set
+# explicitly per-run for round-4 timing probes only.
+#
+# See tmp/perf-campaign-2/round4/ for the round-4 campaign this probe
+# supports.
+_ALLSUM_IDENTITY_PROBE_ENABLED = bool(
+    int(os.environ.get("EXO_DSV4_ALLSUM_IDENTITY_PROBE", "0"))
+)
+# Module-level one-shot flag so the loud activation warning fires at most
+# once per process, not once per layer per forward pass.
+_ALLSUM_IDENTITY_PROBE_WARNED: bool = False
+
+
+def _allsum_identity_probe_warn_once() -> None:
+    """Emit the mandatory loud stderr warning exactly once per process."""
+    global _ALLSUM_IDENTITY_PROBE_WARNED
+    if _ALLSUM_IDENTITY_PROBE_WARNED:
+        return
+    _ALLSUM_IDENTITY_PROBE_WARNED = True
+    _bp_sys.stderr.write(
+        "*** ALLSUM IDENTITY PROBE ACTIVE — output is NUMERICALLY WRONG; "
+        "timing probe only; unset EXO_DSV4_ALLSUM_IDENTITY_PROBE ***\n"
+    )
+
+
 # 2026-07-02 decode-fence overlap experiment. The Phase H Lever 1 fence
 # below is a BLOCKING mx.eval(y): the CPU waits for the GPU to finish each
 # layer before encoding the next, so a decode cycle pays
@@ -3073,7 +3120,19 @@ class DeepseekV4MoE(nn.Module):
 
             if self.sharding_group is not None:
                 with span("moe.all_sum"):
-                    y = mx.distributed.all_sum(y, group=self.sharding_group)
+                    # TEMP ROUND-4 PROBE (2026-09-03, EXO_DSV4_ALLSUM_IDENTITY_PROBE=1):
+                    # skip the collective entirely and keep `y` unchanged
+                    # (numerically WRONG — timing probe only). See the
+                    # module-level comment block near
+                    # _ALLSUM_IDENTITY_PROBE_ENABLED above and
+                    # tmp/perf-campaign-2/round4/. The fence gate below
+                    # still runs on this (unchanged) `y` exactly as today,
+                    # so only the collective+wire cost is removed, not the
+                    # fence/handoff mechanism cost.
+                    if _ALLSUM_IDENTITY_PROBE_ENABLED:
+                        _allsum_identity_probe_warn_once()
+                    else:
+                        y = mx.distributed.all_sum(y, group=self.sharding_group)
                     # Phase H Lever 1 (2026-05-06): force evaluation of the
                     # collective output before any subsequent layer reads
                     # `y`. The all_sum itself is bit-deterministic across
