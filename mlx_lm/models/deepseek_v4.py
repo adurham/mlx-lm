@@ -3,7 +3,7 @@
 import math
 import os
 from dataclasses import dataclass, field
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -929,6 +929,22 @@ class ModelArgs(BaseModelArgs):
     dspark_markov_rank: int = 256
     dspark_target_layer_ids: List[int] = field(default_factory=lambda: [40, 41, 42])
     n_mtp_layers: int = 3
+    # Vision tower (DeepSeek-V4-Flash-Vision). These live at the TOP LEVEL of
+    # the HF config.json — there is no nested `vision_config` sub-dict — so the
+    # field names below are the literal config.json keys and must not be
+    # renamed. `vision_n_layers = 0` (the default) means "text-only
+    # checkpoint": no ViT/Aligner/sentinel parameters are constructed at all,
+    # which is what every existing mlx-community DSv4 conversion needs.
+    vision_n_layers: int = 0
+    vision_dim: int = 1024
+    vision_n_heads: int = 16
+    vision_inter_dim: int = 2816
+    vision_patch_size: int = 14
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: int = 3
+    vision_max_n_token: int = 384
+    vision_min_pixels: int = 147456
+    vision_max_wh_ratio: int = 8
 
     def __post_init__(self):
         if not self.compress_ratios:
@@ -949,11 +965,46 @@ class ModelArgs(BaseModelArgs):
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
 
 
+#: Module-path prefixes whose parameters ship as plain bf16 in the
+#: DeepSeek-V4-Flash-Vision checkpoint and must NEVER be quantized.
+#:
+#: The vision tower is the one part of this checkpoint that is not
+#: fp8-block-quantized: its 263 tensors carry zero ``.scale``/``.scale_inv``
+#: companions on disk (verified against model.safetensors.index.json), unlike
+#: every text-side weight which pairs ``.weight`` with ``.scale``. Quantizing
+#: it would therefore be a lossy re-quantization of already-bf16 data rather
+#: than a faithful reproduction of the checkpoint's own format.
+#:
+#: This is not hypothetical: ``vision.blocks.N.attn.wqkv`` and
+#: ``vision.blocks.N.attn.wo`` both contain the substring ``".attn.w"`` that
+#: the attention override below tests for, so without this exclusion the ViT
+#: would be silently swept into mxfp8 — and ``vision.patch_embed.proj``,
+#: ``aligner.w1``, ``aligner.w2`` would be swept into the catch-all affine
+#: default. ~466M params / ~0.9 GB, all of it wrong.
+_UNQUANTIZED_PREFIXES = ("vision.", "aligner.")
+
+#: Top-level sentinel embedding parameters (each shape ``(hidden_size,)``).
+#: These are ``mx.array`` parameters rather than modules, so they never appear
+#: in ``leaf_modules()`` and ``nn.quantize`` cannot reach them today. They are
+#: listed anyway so the exclusion stays correct if they are ever wrapped in a
+#: module, and so the intent is explicit rather than incidental.
+_UNQUANTIZED_EXACT = ("image_start", "image_end", "image_newline", "image_pad")
+
+
+def _is_unquantized_key(key: str) -> bool:
+    """True for keys that must keep the checkpoint's native bf16 precision."""
+    return key.startswith(_UNQUANTIZED_PREFIXES) or key in _UNQUANTIZED_EXACT
+
+
 def make_quantization_config(model):
     mxfp4 = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
     mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 
-    flat_modules = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+    flat_modules = [
+        (k, m)
+        for k, m in tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+        if not _is_unquantized_key(k)
+    ]
     experts = {
         k: mxfp4
         for k, _ in flat_modules
@@ -973,6 +1024,25 @@ def make_quantization_config(model):
         if k.startswith("model.mtp.") and (k.endswith(".e_proj") or k.endswith(".h_proj"))
     }
 
+    # Filtering `flat_modules` above keeps the vision tower out of the three
+    # pattern overrides, but the returned dict also carries a top-level
+    # group_size/bits/mode that mlx_lm.utils applies as the CATCH-ALL default
+    # to any quantizable leaf without its own entry. An opt-out therefore has
+    # to be explicit: `nn.quantize`'s class_predicate contract treats a falsey
+    # per-key value as "do not quantize this module" (same mechanism
+    # mlx_lm/quant/awq.py uses to exclude layers), so emit False per key.
+    #
+    # Emitted for EVERY vision/aligner leaf, not just the ones that currently
+    # define `to_quantized()`. The norms happen to be unquantizable today so
+    # nn.quantize would skip them anyway, but relying on that would make the
+    # config's correctness depend on an unrelated implementation detail of a
+    # different module. This way the dict states the intent for every key.
+    unquantized = {
+        k: False
+        for k, _ in tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+        if _is_unquantized_key(k)
+    }
+
     return {
         "group_size": 64,
         "bits": 8,
@@ -981,7 +1051,224 @@ def make_quantization_config(model):
         **shared_experts,
         **attn,
         **mtp_proj,
+        **unquantized,
     }
+
+
+# ---------------------------------------------------------------------------
+# Vision tower (DeepSeek-V4-Flash-Vision): ViT + Aligner
+#
+# Ported from the reference PyTorch implementation (inference/vision.py in the
+# upstream release). The checkpoint ships this whole subtree as plain bf16 —
+# see _UNQUANTIZED_PREFIXES above for why it must stay that way.
+#
+# Module/parameter names below are chosen to match the checkpoint's own tensor
+# names EXACTLY (vision.patch_embed.proj, vision.blocks.N.attn.wqkv,
+# vision.blocks.N.mlp.w1, vision.norm, aligner.w1, ...), so no key remapping is
+# needed in Model.sanitize.
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(8)
+def _vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float):
+    """2D (height, width) RoPE tables for an ``n_h x n_w`` patch grid.
+
+    ``dim`` is the ROPE dim = ``vision_dim // vision_n_heads // 2`` (=32 for
+    the shipped config), i.e. HALF the attention head_dim (=64). The h and w
+    position frequencies are INTERLEAVED in pairs -- ``freqs`` is built as
+    ``(N, 2, dim//2)`` and then flattened, so channel ``2*i`` is an h-frequency
+    and ``2*i+1`` is the matching w-frequency. Returns two ``(N, 1, dim)``
+    float32 arrays, shaped to broadcast over the head axis of ``(N, n_heads,
+    head_dim//2)``.
+    """
+    inv_freq = 1.0 / (theta ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
+    hpos = mx.broadcast_to(mx.arange(n_h)[:, None], (n_h, n_w))
+    wpos = mx.broadcast_to(mx.arange(n_w)[None, :], (n_h, n_w))
+    freqs = mx.stack([hpos, wpos], axis=-1).reshape(-1, 2, 1).astype(mx.float32)
+    freqs = (freqs * inv_freq).reshape(n_h * n_w, -1)
+    return mx.cos(freqs)[:, None, :], mx.sin(freqs)[:, None, :]
+
+
+def _vision_apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+    """HALF-SPLIT rotary (first half / second half), NOT interleaved even/odd.
+
+    ``cos``/``sin`` are width ``head_dim // 2``, which is exactly what makes
+    the half-split formulation the right one here. Computed in float32 and
+    cast back, matching the reference's ``x.float().chunk(2, -1)``.
+    """
+    dtype = x.dtype
+    x1, x2 = mx.split(x.astype(mx.float32), 2, axis=-1)
+    return mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(
+        dtype
+    )
+
+
+class VisionRMSNorm(nn.Module):
+    """RMSNorm with a float32 weight, computed in float32.
+
+    Deliberately NOT ``nn.RMSNorm``: the vision tower uses the reference
+    constructor default ``eps=1e-6``, which is 14 orders of magnitude away from
+    the text model's ``rms_norm_eps=1e-20``. Wiring ``args.rms_norm_eps`` in
+    here would be silently wrong.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = mx.ones((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        dtype = x.dtype
+        xf = x.astype(mx.float32)
+        xf = xf * mx.rsqrt(mx.mean(mx.square(xf), axis=-1, keepdims=True) + self.eps)
+        return (self.weight * xf).astype(dtype)
+
+
+class VisionPatchEmbed(nn.Module):
+    """Linear over FLATTENED patches -- not a Conv2d.
+
+    Input is ``(n_patches, 3, patch_size, patch_size)``; it is flattened to
+    ``(n_patches, 3 * patch_size**2)`` and projected. There is no NHWC layout
+    concern because no convolution is involved.
+    """
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.proj = nn.Linear(3 * config.vision_patch_size**2, config.vision_dim)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.proj(x.reshape(x.shape[0], -1))
+
+
+class VisionAttention(nn.Module):
+    """Full bidirectional self-attention over one image's patches.
+
+    No causal mask and no padding mask: every patch of a single image attends
+    to every other patch.
+    """
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.n_heads = config.vision_n_heads
+        self.head_dim = config.vision_dim // config.vision_n_heads
+        self.scale = self.head_dim**-0.5
+        self.wqkv = nn.Linear(config.vision_dim, 3 * config.vision_dim)
+        self.wo = nn.Linear(config.vision_dim, config.vision_dim)
+
+    def __call__(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+        n = x.shape[0]
+        q, k, v = (
+            t.reshape(n, self.n_heads, self.head_dim)
+            for t in mx.split(self.wqkv(x), 3, axis=-1)
+        )
+        # RoPE on q and k only; v is untouched.
+        q = _vision_apply_rotary(q, cos, sin)
+        k = _vision_apply_rotary(k, cos, sin)
+        # (n, H, D) -> (1, H, n, D); MLX's SDPA requires rank 4.
+        o = mx.fast.scaled_dot_product_attention(
+            q.transpose(1, 0, 2)[None],
+            k.transpose(1, 0, 2)[None],
+            v.transpose(1, 0, 2)[None],
+            scale=self.scale,
+            mask=None,
+        )
+        return self.wo(o[0].transpose(1, 0, 2).reshape(n, -1))
+
+
+class VisionMLP(nn.Module):
+    """SwiGLU with a FUSED gate+up projection (w1 emits 2 * inter_dim)."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.w1 = nn.Linear(config.vision_dim, 2 * config.vision_inter_dim, bias=False)
+        self.w2 = nn.Linear(config.vision_inter_dim, config.vision_dim, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        gate, up = mx.split(self.w1(x), 2, axis=-1)
+        return self.w2(nn.silu(gate) * up)
+
+
+class VisionBlock(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.norm1 = VisionRMSNorm(config.vision_dim)
+        self.attn = VisionAttention(config)
+        self.norm2 = VisionRMSNorm(config.vision_dim)
+        self.mlp = VisionMLP(config)
+
+    def __call__(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+        x = x + self.attn(self.norm1(x), cos, sin)
+        return x + self.mlp(self.norm2(x))
+
+
+class VisionTransformer(nn.Module):
+    """DeepSeek ViT: full bidirectional attention over one image with 2D RoPE."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.rope_dim = config.vision_dim // config.vision_n_heads // 2
+        self.rope_theta = config.vision_rope_theta
+        self.patch_embed = VisionPatchEmbed(config)
+        self.blocks = [VisionBlock(config) for _ in range(config.vision_n_layers)]
+        self.norm = VisionRMSNorm(config.vision_dim)
+
+    def __call__(self, patches: mx.array, n_h: int, n_w: int) -> mx.array:
+        x = self.patch_embed(patches)
+        # One cos/sin table, shared by every block.
+        cos, sin = _vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        return self.norm(x)
+
+
+def _vision_unfold(x: mx.array, r: int) -> mx.array:
+    """``F.unfold(x_chw.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)``.
+
+    MLX has no ``F.unfold``, so this reproduces it with reshape/transpose.
+
+    Takes ``x`` already in ``(H, W, C)`` layout (H and W both divisible by
+    ``r``) and returns ``(H//r * W//r, C * r * r)``.
+
+    The output channel ordering is the load-bearing detail: PyTorch's unfold
+    emits C-major, then kernel-row, then kernel-col, i.e. flat index
+    ``c * (r*r) + kh * r + kw``. That is why the transpose puts the channel
+    axis (2) BEFORE the two kernel axes (1, 3). Swapping them produces a
+    plausible-looking but silently wrong result; `test_unfold_matches_torch`
+    pins this bitwise.
+    """
+    h, w, c = x.shape
+    nbh, nbw = h // r, w // r
+    #        (nbh, r, nbw, r, C) -> (nbh, nbw, C, r, r)
+    return x.reshape(nbh, r, nbw, r, c).transpose(0, 2, 4, 1, 3).reshape(nbh * nbw, -1)
+
+
+class VisionAligner(nn.Module):
+    """Projects ViT patch features into the text model's embedding space.
+
+    Downsamples the patch grid by ``r x r`` (r=3) by concatenating each ``r x
+    r`` neighbourhood's features, then applies a 2-layer GELU MLP whose output
+    width is the text ``hidden_size``.
+    """
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.downsample_ratio = config.vision_downsample_ratio
+        in_dim = config.vision_dim * self.downsample_ratio**2
+        self.w1 = nn.Linear(in_dim, config.hidden_size)
+        self.w2 = nn.Linear(config.hidden_size, config.hidden_size)
+
+    def __call__(self, x: mx.array, n_h: int, n_w: int) -> mx.array:
+        r = self.downsample_ratio
+        x = x.reshape(n_h, n_w, -1)
+        # Zero-pad RIGHT and BOTTOM up to a multiple of r, matching the
+        # reference's F.pad(x_chw, (0, -n_w % r, 0, -n_h % r)) on a (C, H, W)
+        # tensor -- last pad pair is W, second-to-last is H.
+        pad_h, pad_w = -n_h % r, -n_w % r
+        if pad_h or pad_w:
+            x = mx.pad(x, [(0, pad_h), (0, pad_w), (0, 0)])
+        x = _vision_unfold(x, r)
+        # F.gelu default is the EXACT erf GELU, so nn.gelu (not gelu_approx).
+        return self.w2(nn.gelu(self.w1(x)))
 
 
 def _score_func(scores: mx.array, func: str) -> mx.array:
@@ -7276,6 +7563,28 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.model = DeepseekV4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Vision tower — constructed only for a vision checkpoint
+        # (vision_n_layers > 0), matching the reference model.py's own gate.
+        # Attribute names `vision`/`aligner` and the four sentinel embeddings
+        # are TOP-LEVEL and match the checkpoint's tensor keys verbatim, so
+        # sanitize() needs no remapping for them.
+        if config.vision_n_layers > 0:
+            self.vision = VisionTransformer(config)
+            self.aligner = VisionAligner(config)
+            self.image_start = mx.zeros((config.hidden_size,))
+            self.image_end = mx.zeros((config.hidden_size,))
+            self.image_newline = mx.zeros((config.hidden_size,))
+            self.image_pad = mx.zeros((config.hidden_size,))
+
+    def encode_image(self, patches: mx.array, n_vit_h: int, n_vit_w: int) -> mx.array:
+        """Patches -> text-embedding-space tokens for one image.
+
+        ``patches`` is ``(n_h * n_w, 3, patch_size, patch_size)``; the result is
+        ``(ceil(n_h/r) * ceil(n_w/r), hidden_size)``.
+        """
+        return self.aligner(
+            self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w
+        )
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
         if "model_call" in _get_nop_targets():
