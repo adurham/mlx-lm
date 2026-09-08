@@ -136,7 +136,18 @@ FP32_MAX_TOL = 1e-4
 # the exact fp32 answer as torch's own bf16 result is -- see
 # test_bf16_no_worse_than_torch_bf16. BF16_MAX_TOL is only a loose sanity
 # ceiling to catch gross breakage.
-BF16_MAX_TOL = 1e-1
+#
+# Measured max_abs_diff across both GRID_SHAPES: ViT 3.9e-2 to 4.7e-2,
+# Aligner 5.9e-3 to 7.8e-3 (see test_bf16_parity output). ViT is the larger
+# of the two and drives the ceiling. 8e-2 gives ~1.7x headroom above the
+# highest observed ViT value (4.7e-2) -- comfortable margin for legitimate
+# bf16-rounding variance across mlx versions/hardware, while still catching
+# an order-of-magnitude regression (e.g. a mis-wired eps produces errors in
+# the 1e-3-to-3.0 range at the tiny-magnitude scale used elsewhere in this
+# file, and an interleaved-vs-half-split rotary mixup diverges by ~6.7 --
+# both would blow straight through 8e-2). The old 1e-1 ceiling sat 2.1x-13x
+# above reality and would not have caught either.
+BF16_MAX_TOL = 8e-2
 
 # MLX's bf16 error may exceed torch's by at most this factor before we treat it
 # as a real regression rather than rounding. Measured ratio is ~0.79-0.95
@@ -325,7 +336,7 @@ class TestVisionParity(unittest.TestCase):
                     ("ViT", g_vit, tb_vit, mb_vit),
                     ("Aligner", g_al, tb_al, mb_al),
                 ):
-                    torch_err, _ = _diffs(truth, mx.array(
+                    torch_err, torch_err_mean = _diffs(truth, mx.array(
                         t_bf.detach().to(torch.float32).numpy()
                     ))
                     mlx_err, mlx_err_mean = _diffs(truth, m_bf)
@@ -334,12 +345,24 @@ class TestVisionParity(unittest.TestCase):
                         np.abs(truth.detach().to(torch.float32).numpy()).max()
                     )
                     ratio = mlx_err / torch_err if torch_err else 0.0
+                    # Mean-of-errors ratio alongside the existing max-of-max
+                    # ratio: max-of-max is a single noisy order statistic, so
+                    # report the mean too rather than only the flattering
+                    # extremum. Measured mean_ratio is ~1.004-1.041 here (MLX
+                    # is very slightly WORSE than torch on mean error, even
+                    # though it is better on max) -- this assertion does NOT
+                    # gate on mean_ratio, it only makes the printed number
+                    # honest.
+                    mean_ratio = (
+                        mlx_err_mean / torch_err_mean if torch_err_mean else 0.0
+                    )
                     print(
                         f"\n[bf16-truth] grid=({n_h},{n_w}) {name} "
                         f"output_scale={scale:.4f}"
                     )
                     print(
-                        f"  torch_bf16 vs fp32 truth: max={torch_err:.6e}"
+                        f"  torch_bf16 vs fp32 truth: max={torch_err:.6e} "
+                        f"mean={torch_err_mean:.6e}"
                     )
                     print(
                         f"  mlx_bf16   vs fp32 truth: max={mlx_err:.6e} "
@@ -350,8 +373,10 @@ class TestVisionParity(unittest.TestCase):
                         f"mean={cross_mean:.6e}"
                     )
                     print(
-                        f"  -> mlx_err / torch_err = {ratio:.3f} "
-                        f"({'MLX more accurate' if ratio <= 1 else 'MLX less accurate'})"
+                        f"  -> mlx_err / torch_err: max_ratio={ratio:.3f} "
+                        f"({'MLX more accurate' if ratio <= 1 else 'MLX less accurate'}) "
+                        f"mean_ratio={mean_ratio:.3f} "
+                        f"({'MLX more accurate' if mean_ratio <= 1 else 'MLX less accurate'})"
                     )
                     self.assertLess(
                         ratio,
@@ -419,6 +444,99 @@ class TestVisionParity(unittest.TestCase):
                         "this input is not eps-sensitive, so the test cannot "
                         "distinguish 1e-6 from 1e-20",
                     )
+
+    def test_full_model_parity_at_eps_sensitive_magnitude(self):
+        """End-to-end parity through a CONSTRUCTED VisionTransformer at input
+        magnitude ~1e-4, where the first block's norm1 operates on
+        mean(x^2) ~ 1e-8 -- well below eps=1e-6.
+
+        test_rmsnorm_eps_matches_reference_default above pins eps only on a
+        FRESH STANDALONE VisionRMSNorm; it says nothing about the eps of the
+        norm instances actually living inside a constructed VisionTransformer.
+        A mis-wired eps=1e-20 at any of the three VisionBlock/
+        VisionTransformer call sites (leaving the constructor default alone)
+        diverges from the torch reference's eps=1e-6 output at THIS input
+        magnitude -- unlike the N(0,1)-scale inputs used by test_fp32_parity,
+        where mean(x^2) ~ 1 swamps eps and the divergence is invisible (see
+        the BF16_MAX_TOL / FP32_MAX_TOL comments above). This is a numerical
+        trip-wire on the constructed model, not merely a metadata check.
+        """
+        for n_h, n_w in GRID_SHAPES:
+            with self.subTest(grid=(n_h, n_w)):
+                t_vit, t_align, m_vit, m_align = self._build(4, "fp32")
+                p = _RefArgs.vision_patch_size
+                rng = np.random.default_rng(n_h * 1000 + n_w)
+                patches = (
+                    rng.standard_normal((n_h * n_w, 3, p, p)).astype(np.float32)
+                    * 1e-4
+                )
+
+                t_in = torch.from_numpy(patches)
+                m_in = mx.array(patches)
+                with torch.inference_mode():
+                    t_vit_out = t_vit(t_in, n_h, n_w)
+                    t_align_out = t_align(t_vit_out, n_h, n_w)
+                m_vit_out = m_vit(m_in, n_h, n_w)
+                m_align_out = m_align(m_vit_out, n_h, n_w)
+                mx.eval(m_vit_out, m_align_out)
+
+                vit_max, vit_mean = _diffs(t_vit_out, m_vit_out)
+                al_max, al_mean = _diffs(t_align_out, m_align_out)
+                print(
+                    f"\n[tiny-magnitude parity] grid=({n_h},{n_w}) "
+                    f"ViT max={vit_max:.6e} mean={vit_mean:.6e}  "
+                    f"Aligner max={al_max:.6e} mean={al_mean:.6e}"
+                )
+                self.assertLess(vit_max, FP32_MAX_TOL)
+                self.assertLess(al_max, FP32_MAX_TOL)
+
+    def test_all_norms_in_constructed_tower_use_reference_eps(self):
+        """Walk a CONSTRUCTED VisionTransformer and assert eps==1e-6 on EVERY
+        VisionRMSNorm reachable from it -- not just the constructor default.
+
+        test_rmsnorm_eps_matches_reference_default only pins the DEFAULT on a
+        fresh standalone VisionRMSNorm(dim); it says nothing about what eps
+        the norm instances actually wired into a real model got. This test
+        walks the module tree programmatically (named_modules(), not three
+        hardcoded attribute paths) so norm1/norm2 on every block plus the
+        final top-level norm are all covered, and any future added norm is
+        covered automatically too.
+        """
+        cfg = _mlx_config(n_layers=6)
+        vit = dsv4.VisionTransformer(cfg)
+
+        norms = {
+            name: mod
+            for name, mod in vit.named_modules()
+            if isinstance(mod, dsv4.VisionRMSNorm)
+        }
+        # Sanity: this must actually enumerate something, and specifically
+        # norm1/norm2 for every block plus the top-level norm, or the walk
+        # itself is broken and the assertion below would vacuously pass.
+        expected_names = {"norm"} | {
+            f"blocks.{i}.{which}"
+            for i in range(cfg.vision_n_layers)
+            for which in ("norm1", "norm2")
+        }
+        self.assertEqual(
+            set(norms.keys()),
+            expected_names,
+            "module walk did not find exactly the expected VisionRMSNorm "
+            "instances -- the walk itself may be broken",
+        )
+        print(f"\n[eps-wiring] {len(norms)} VisionRMSNorm instances found in tower")
+        for name, mod in sorted(norms.items()):
+            with self.subTest(norm=name):
+                self.assertEqual(
+                    mod.eps,
+                    1e-6,
+                    f"{name}.eps = {mod.eps!r}, must be the reference default "
+                    "1e-6, NOT the text model's rms_norm_eps=1e-20",
+                )
+        print(
+            "[eps-wiring] all eps == 1e-6: "
+            f"{sorted(name for name in norms)}"
+        )
 
     def test_rope_tables_match_reference(self):
         dim = _RefArgs.vision_dim // _RefArgs.vision_n_heads // 2
