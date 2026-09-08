@@ -160,11 +160,13 @@ class TestRunsAgainstSubmodule(unittest.TestCase):
         path = dsv4.__file__
         print(f"\n[provenance] mlx_lm.models.deepseek_v4.__file__ = {path}")
         print(f"[provenance] mlx_lm package             = {sys.modules['mlx_lm'].__file__}")
-        self.assertIn(
-            "/repos/exo/mlx-lm/",
+        self.assertNotIn(
+            "site-packages",
             path,
-            "tests are importing a DIFFERENT mlx_lm copy (site-packages?); "
-            "re-run with PYTHONPATH=/Users/adam.durham/repos/exo/mlx-lm",
+            "tests are importing an INSTALLED mlx_lm copy (site-packages), not "
+            "the working tree; re-run with PYTHONPATH pointed at the mlx-lm "
+            "checkout you are actually editing (e.g. a submodule or scratch "
+            "copy of it), never an installed package.",
         )
 
 
