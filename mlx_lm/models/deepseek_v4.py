@@ -1329,6 +1329,123 @@ def _hash_gate_route(
     return inds, weights
 
 
+# ─────────────────── Phase 3a: bias_vl (vision routing bias) ──────────────────
+# DeepSeek-V4-Flash-Vision-Exp adds a SECOND MoE routing bias, `bias_vl`, used
+# for image tokens (`input_ids >= vocab_size`) while text tokens keep `bias`.
+# Reference: DeepSeek's inference/model.py `Gate.forward` in the Vision-Exp
+# repo (diffed against -0731; the vision diff is the authoritative spec).
+#
+# These are SEPARATE compiled functions from `_gate_route` / `_hash_gate_route`
+# above, which are left BYTE-FOR-BYTE UNTOUCHED. That is deliberate and is the
+# structural guarantee behind the text-only no-regression requirement: a
+# text-only checkpoint (`vision_n_layers == 0`, i.e. every mlx-community DSv4
+# conversion and the -0731 the cluster serves every day) has no `bias_vl`
+# parameter, so `MoEGate.__call__` dispatches to the SAME function object with
+# the SAME compile cache entry it did before this change. There is no shared
+# code path to regress and no new branch on the production hot path.
+#
+# Dispatch is CONFIG-driven (does this checkpoint have a bias_vl?), never
+# DATA-driven (does this batch contain image tokens?) — exactly as in the
+# reference, where the switch is `self.bias_vl is not None`. A data-driven
+# switch would need a device→host sync per layer per forward to evaluate
+# `(input_ids >= vocab_size).any()`. The vl variants are nonetheless
+# BITWISE-IDENTICAL to the plain ones when no image token is present, because
+# `mx.where` on an all-False mask is a pure select that reproduces its `False`
+# operand exactly; that identity is asserted by test_deepseek_v4_gate.py.
+
+
+@mx.compile
+def _gate_route_vl(
+    input_ids: mx.array,
+    x: mx.array,
+    weight: mx.array,
+    e_score_correction_bias: mx.array,
+    e_score_correction_bias_vl: mx.array,
+    vocab_size: int,
+    top_k: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    scoring_func: str,
+) -> Tuple[mx.array, mx.array]:
+    """Vision-aware `_gate_route`: per-token routing bias.
+
+    Reference (non-hash branch)::
+
+        scores = scores + torch.where(image_mask.unsqueeze(-1), self.bias_vl, self.bias)
+        indices = scores.topk(self.topk, dim=-1)[1]
+
+    Note the fork uses ``argpartition`` where the reference uses ``topk``: the
+    selected SET is identical, the within-row ORDER is not (argpartition is
+    unordered, torch.topk is sorted descending). ``weights`` is gathered with
+    the same ``inds``, so the (expert, weight) PAIRING is preserved and the
+    downstream MoE combine — a sum over experts — is order-invariant. This is
+    pre-existing fork behavior shared with `_gate_route`, not new here.
+    """
+    logits = (x @ weight.T).astype(mx.float32)
+    scores = _score_func(logits, scoring_func)
+    image_mask = (input_ids >= vocab_size)[..., None]
+    bias = mx.where(image_mask, e_score_correction_bias_vl, e_score_correction_bias)
+    biased = scores + bias
+    inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k]
+    weights = mx.take_along_axis(scores, inds, axis=-1)
+    if scoring_func != "softmax" and norm_topk_prob:
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    weights = weights * routed_scaling_factor
+    return inds, weights
+
+
+@mx.compile
+def _hash_gate_route_vl(
+    input_ids: mx.array,
+    x: mx.array,
+    weight: mx.array,
+    tid2eid: mx.array,
+    e_score_correction_bias_vl: mx.array,
+    vocab_size: int,
+    top_k: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    scoring_func: str,
+) -> Tuple[mx.array, mx.array]:
+    """Vision-aware `_hash_gate_route`: image tokens BYPASS the hash table.
+
+    Reference (hash branch)::
+
+        indices = self.tid2eid[torch.where(image_mask, 0, input_ids)]
+        vl_indices = (scores + self.bias_vl).topk(self.topk, dim=-1)[1]
+        indices = torch.where(image_mask.unsqueeze(-1), vl_indices.to(indices.dtype), indices)
+
+    Three things the reference does that are easy to get wrong and are
+    reproduced verbatim here:
+
+    1. The id is CLAMPED TO 0 before the ``tid2eid`` gather. Image token ids
+       are ``vocab_size + {0..4}`` and would index out of bounds otherwise
+       (MLX would silently clamp; torch would fault). The gathered value is
+       then discarded for those rows by the ``where``.
+    2. ``bias`` is NOT applied on the hash path — not before the branch (as
+       -0731 did, where hash layers had ``bias = None`` so it was a no-op),
+       and not inside it. Only ``bias_vl`` participates, and only for the
+       image rows' real top-k. A vision checkpoint DOES allocate ``bias`` on
+       hash layers (the reference's ``if self.hash and not vl`` split), but
+       ``Gate.forward`` never reads it there.
+    3. ``weights`` is gathered from the UNBIASED ``scores`` for both text and
+       image rows — the bias shifts expert SELECTION only, never the routing
+       weight, which is why ``original_scores`` exists in the reference.
+    """
+    logits = (x @ weight.T).astype(mx.float32)
+    scores = _score_func(logits, scoring_func)
+    image_mask = input_ids >= vocab_size
+    text_inds = tid2eid[mx.where(image_mask, mx.zeros_like(input_ids), input_ids)]
+    vl_biased = scores + e_score_correction_bias_vl
+    vl_inds = mx.argpartition(-vl_biased, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.where(image_mask[..., None], vl_inds.astype(text_inds.dtype), text_inds)
+    weights = mx.take_along_axis(scores, inds, axis=-1)
+    if scoring_func != "softmax" and norm_topk_prob:
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    weights = weights * routed_scaling_factor
+    return inds, weights
+
+
 @mx.compile
 def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
     if limit and limit > 0:
@@ -1724,6 +1841,156 @@ def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int
     full_mask = mx.concatenate([mask, pool_mask], axis=-1)
 
     return full_mask
+
+
+# ──────────────── Phase 3b: image-span attention visibility ───────────────────
+# DeepSeek-V4-Flash-Vision-Exp lets every token inside an
+# [IMAGE_START … IMAGE_END] span attend to that ENTIRE span (bounded by
+# vision_max_n_token = 384) IN ADDITION to the normal 128-token sliding window.
+# Reference: model.py's `get_image_visible` + `get_window_topk_idxs_visible`,
+# threaded into `MLA.forward` via a `visible` kwarg and computed once in
+# `Transformer.forward` when `start_pos == 0`.
+#
+# READ docs/dsv4-vision-phase3b-window-geometry-inventory.md FIRST. Summary of
+# why this does not look like the reference: the fork has NO
+# `get_window_topk_idxs` and no integer window geometry to swap out. The
+# reference feeds an int32 index matrix to DeepSeek's proprietary `sparse_attn`
+# kernel; the fork expresses the identical geometry as a BOOLEAN MASK
+# (`create_causal_mask(N, offset, window_size=128)`) consumed by
+# `mx.fast.scaled_dot_product_attention`, with the pooled/compressed axis kept
+# separate as the Indexer's `topk` (which visibility does not touch — the
+# reference only replaces the window half of its `cat([topk_idxs,
+# compress_topk_idxs])`). So the faithful port is extra True bits in the local
+# mask, and `_get_window_topk_idxs_visible` below exists to PROVE the mask
+# carries exactly the reference's visible set (see
+# test_deepseek_v4_attention_visibility.py, which derives one from the other).
+#
+# Gated by EXO_DSV4_IMAGE_VISIBILITY, DEFAULT OFF.
+_IMAGE_VISIBILITY = os.environ.get("EXO_DSV4_IMAGE_VISIBILITY", "0") == "1"
+
+#: Set for the duration of a forward whose local mask carries image-span
+#: visibility. Read by `_query_tiled_ok` to decline the query-tiled SDPA, which
+#: re-derives its key slice from `config.sliding_window` rather than from the
+#: mask and would therefore silently drop span keys. See inventory item C7.
+_IMAGE_VISIBILITY_CTX = {"active": False}
+
+#: `IMAGE_START, IMAGE_PAD, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(5)` from
+#: DeepSeek's image_processor.py; token id is `vocab_size + <sentinel>`.
+#: Mirrored by exo's vendored port (deepseek_v4_image_processor.py:72-76).
+_IMAGE_START_SENTINEL = 0
+_IMAGE_END_SENTINEL = 4
+
+
+def _get_image_visible(
+    input_ids: mx.array, vocab_size: int, max_image_tokens: int
+) -> Tuple[mx.array, mx.array]:
+    """MLX port of the reference's `get_image_visible` (model.py:283-294).
+
+    Per-token visible counts to the left/right within each
+    [IMAGE_START, IMAGE_END] span. Integer-valued; asserted EXACTLY equal to
+    the torch reference (0 tolerance) by the Phase 3 tests.
+
+    Op-for-op transcription. The two non-obvious pieces:
+
+    * ``valid = (is_start.cumsum > is_end.cumsum) | is_end`` marks the
+      half-open span ``[start, end)`` and then re-adds the end token itself,
+      so both delimiters count as inside the span.
+    * ``ends`` uses a reversed cummin to get each position's NEXT end token,
+      defaulting to ``seqlen`` where there is none. MLX has no ``cummin``
+      keepdim/indices tuple, so ``mx.cummin`` is used directly (it returns the
+      values, which is all the reference uses via ``[0]``).
+    """
+    seqlen = input_ids.shape[1]
+    idx = mx.arange(seqlen, dtype=mx.int32)[None]
+    is_start = input_ids == (vocab_size + _IMAGE_START_SENTINEL)
+    is_end = input_ids == (vocab_size + _IMAGE_END_SENTINEL)
+    valid = (
+        mx.cumsum(is_start.astype(mx.int32), axis=1)
+        > mx.cumsum(is_end.astype(mx.int32), axis=1)
+    ) | is_end
+    valid_i = valid.astype(mx.int32)
+    starts = mx.cummax(mx.where(is_start, idx, mx.zeros_like(idx)), axis=1)
+    left = (idx - starts) * valid_i
+    ends = mx.cummin(
+        mx.where(is_end, idx, mx.full(idx.shape, seqlen, dtype=mx.int32))[:, ::-1],
+        axis=1,
+    )[:, ::-1]
+    right = (ends - idx) * valid_i
+    return (
+        mx.minimum(left, max_image_tokens - 1),
+        mx.minimum(right, max_image_tokens),
+    )
+
+
+def _get_window_topk_idxs_visible(
+    window_size: int,
+    seqlen: int,
+    left: mx.array,
+    right: mx.array,
+    max_image_tokens: int,
+) -> mx.array:
+    """MLX port of the reference's `get_window_topk_idxs_visible` (model.py:297-305).
+
+    Returns the reference's int32 ``(B, seqlen, width)`` index matrix, ``-1``
+    marking invalid slots. The fork's attention does NOT consume this — see the
+    module comment above and `_image_visible_mask`, which is what actually runs.
+    It is kept, exercised, and parity-tested because it is the authoritative
+    statement of the visible set: the mask is proven equivalent to it rather
+    than independently re-derived, so the two cannot drift.
+    """
+    width = min(seqlen, window_size + max_image_tokens)
+    idx = mx.arange(seqlen, dtype=mx.int32)[None]
+    left_add = mx.maximum(left - (window_size - 1), 0)
+    starts = mx.maximum(idx - (window_size - 1) - left_add, 0)
+    matrix = starts[..., None] + mx.arange(width, dtype=mx.int32)
+    matrix = mx.where(matrix > (idx + right)[..., None], -1, matrix)
+    return matrix.astype(mx.int32)
+
+
+def _image_visible_mask(
+    left: mx.array,
+    right: mx.array,
+    window_size: int,
+    seqlen: int,
+    kv_len: int,
+    max_image_tokens: int,
+) -> mx.array:
+    """The reference's visible set, expressed as the boolean mask the fork uses.
+
+    ``result[b, i, j]`` is True iff key ``j`` appears in row ``i`` of
+    ``_get_window_topk_idxs_visible`` — i.e. iff
+
+        start_i <= j <= i + right_i   and   j < start_i + width
+
+    with ``start_i = max(0, i - (window_size - 1) - left_add_i)``,
+    ``left_add_i = max(0, left_i - (window_size - 1))`` and
+    ``width = min(seqlen, window_size + max_image_tokens)`` — the same three
+    quantities, computed the same way, as the index function above.
+
+    Two properties this relies on and that the tests assert:
+
+    1. With NO image tokens (``left == right == 0``) it reduces EXACTLY to
+       ``create_causal_mask(seqlen, 0, window_size=window_size)``: ``start_i``
+       becomes ``max(0, i - window_size + 1)``, the upper bound becomes ``j <=
+       i``, and the ``width`` clause is never binding. So OR-ing this into the
+       existing mask is a no-op on text-only input — bitwise, not approximately.
+    2. Inside a span the set is deliberately NOT causal (``j`` runs to
+       ``i + right_i > i``): span tokens attend bidirectionally within their own
+       span. That is the reference's behavior, not an artifact.
+
+    ``kv_len`` clamps the column axis to the keys physically present. For the
+    only case visibility runs in — a from-scratch prefill, ``offset == 0`` —
+    ``kv_len == seqlen`` and the clamp is inert. It exists so a malformed
+    (unterminated) span, where the reference itself would emit indices at
+    ``seqlen``, cannot index past the KV.
+    """
+    width = min(seqlen, window_size + max_image_tokens)
+    i = mx.arange(seqlen, dtype=mx.int32)[None, :, None]
+    j = mx.arange(kv_len, dtype=mx.int32)[None, None, :]
+    left_add = mx.maximum(left - (window_size - 1), 0)[..., None]
+    start = mx.maximum(i - (window_size - 1) - left_add, 0)
+    upper = i + right[..., None]
+    return (j >= start) & (j <= upper) & (j < start + width)
 
 
 @partial(mx.compile, shapeless=True)
@@ -3167,10 +3434,27 @@ class MoEGate(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.norm_topk_prob = config.norm_topk_prob
         self.weight = mx.zeros((self.num_experts, self.hidden_dim))
+        # Phase 3a. `vl` mirrors the reference's `vl = args.vision_n_layers > 0`.
+        # Text-only checkpoints (the default, and everything the cluster serves
+        # today) leave this False and the parameter set below is EXACTLY what it
+        # was before the vision port — same attributes, same shapes, same dtypes.
+        self.vocab_size = config.vocab_size
+        self.vl = config.vision_n_layers > 0
         if self.hash:
             self.tid2eid = mx.zeros((config.vocab_size, self.top_k), dtype=mx.int32)
-        else:
+        # Reference: `if self.hash and not vl: self.bias = None else: <allocate>`.
+        # So a VISION checkpoint allocates `bias` on hash layers too (it is in
+        # the checkpoint) even though `Gate.forward` never reads it on the hash
+        # path. Allocated here for load fidelity; never used in the hash branch.
+        if not (self.hash and not self.vl):
             self.e_score_correction_bias = mx.zeros(
+                (self.num_experts,), dtype=mx.float32
+            )
+        if self.vl:
+            # Checkpoint key `layers.N.ffn.gate.bias_vl`. `Model.sanitize`'s
+            # existing `.ffn.gate.bias` -> `.ffn.gate.e_score_correction_bias`
+            # substring rename maps it onto this name automatically.
+            self.e_score_correction_bias_vl = mx.zeros(
                 (self.num_experts,), dtype=mx.float32
             )
 
@@ -3178,25 +3462,57 @@ class MoEGate(nn.Module):
         if self.hash:
             if input_ids is None:
                 raise ValueError("DeepSeek-V4 hash routing requires input_ids.")
-            inds, weights = _hash_gate_route(
-                input_ids,
-                x,
-                self.weight,
-                self.tid2eid,
-                self.routed_scaling_factor,
-                self.norm_topk_prob,
-                self.scoring_func,
-            )
+            if self.vl:
+                inds, weights = _hash_gate_route_vl(
+                    input_ids,
+                    x,
+                    self.weight,
+                    self.tid2eid,
+                    self.e_score_correction_bias_vl,
+                    self.vocab_size,
+                    self.top_k,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
+            else:
+                inds, weights = _hash_gate_route(
+                    input_ids,
+                    x,
+                    self.weight,
+                    self.tid2eid,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
         else:
-            inds, weights = _gate_route(
-                x,
-                self.weight,
-                self.e_score_correction_bias,
-                self.top_k,
-                self.routed_scaling_factor,
-                self.norm_topk_prob,
-                self.scoring_func,
-            )
+            if self.vl:
+                if input_ids is None:
+                    raise ValueError(
+                        "DeepSeek-V4 vision routing (bias_vl) requires input_ids."
+                    )
+                inds, weights = _gate_route_vl(
+                    input_ids,
+                    x,
+                    self.weight,
+                    self.e_score_correction_bias,
+                    self.e_score_correction_bias_vl,
+                    self.vocab_size,
+                    self.top_k,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
+            else:
+                inds, weights = _gate_route(
+                    x,
+                    self.weight,
+                    self.e_score_correction_bias,
+                    self.top_k,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
 
         return inds, weights
 
@@ -3913,6 +4229,19 @@ def _query_tiled_ok(attn_mod, q, kv, mask, pool_cache, local_cache) -> bool:
     least one visible local key.
     """
     if not isinstance(mask, mx.array) or q.shape[0] != 1:
+        return False
+    # Phase 3b (inventory item C7): this path re-derives each block's visible
+    # key slice from `config.sliding_window` (`_khi = min(_local_len, _key_lo +
+    # _b - 1 + _sw)`) instead of reading the mask. Under image-span visibility
+    # a row's visible keys can start up to `vision_max_n_token` positions
+    # earlier than the sliding window allows, so that slice would silently drop
+    # span keys and produce a wrong — not merely slower — result. Decline
+    # LOUDLY and fall back to the unchanged single fused SDPA call, which reads
+    # the mask and is correct by construction. Making this path visibility-aware
+    # means re-deriving `_key_lo`/`_khi` from the mask's per-row visible span;
+    # that is a second optimization port with its own A/B burden and is
+    # deliberately not in Phase 3's scope.
+    if _IMAGE_VISIBILITY_CTX["active"]:
         return False
     n_q = q.shape[2]
     if n_q < 2 * _QUERY_TILED_B or mask.shape[-2] != n_q:
@@ -7146,6 +7475,84 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = HyperHead(config)
 
+    def _apply_image_visibility(
+        self,
+        mask: Optional[mx.array],
+        inputs: mx.array,
+        mask_cache: Optional[Any],
+    ) -> Optional[mx.array]:
+        """Phase 3b: widen ``mask`` with image-span visibility, or return it as-is.
+
+        Returns the SAME object it was given (``is`` identity, not merely an
+        equal value) on every path that is not an active vision prefill, so a
+        text-only forward cannot be perturbed even in principle.
+
+        Corresponds to the reference's ``Transformer.forward``::
+
+            if images is not None:
+                if start_pos == 0:
+                    visible = get_image_visible(input_ids, self.vocab_size, self.max_image_tokens)
+                else:
+                    assert (input_ids < self.vocab_size).all(), \\
+                        "image spans must be prefilled in a single chunk"
+
+        The reference gates on ``start_pos == 0``; the fork's equivalent is
+        ``offset == 0`` on the local cache. The ``start_pos > 0`` assert is
+        reproduced too, because it is a real correctness invariant here and not
+        merely a reference quirk: the local KV is a ``RotatingKVCache`` capped at
+        ``sliding_window`` (128), so a span reaching up to 384 positions back is
+        only retrievable while the whole span is inside the current chunk. exo's
+        prefill chunker (``EXO_PREFILL_STEP_SIZE=2048``) is what must guarantee
+        that; Phase 4d is chartered to enforce it at the boundary. Until then
+        this raises loudly rather than attending to overwritten ring slots.
+        """
+        # Ordered cheapest-first: two Python constants, then a device sync.
+        if not _IMAGE_VISIBILITY or self.args.vision_n_layers <= 0:
+            return mask
+        vocab_size = self.args.vocab_size
+        has_image = bool(mx.any(inputs >= vocab_size).item())
+        offset = getattr(mask_cache, "offset", 0) if mask_cache is not None else 0
+        if not has_image:
+            # No image token in THIS chunk. Nothing to widen; also nothing to
+            # assert — a text chunk following a fully-prefilled image span is
+            # the normal decode case.
+            _IMAGE_VISIBILITY_CTX["active"] = False
+            return mask
+        if offset != 0:
+            raise ValueError(
+                "DeepSeek-V4 vision: image spans must be prefilled in a single "
+                f"chunk (got image tokens at cache offset {offset}). The local "
+                "KV ring holds only sliding_window="
+                f"{self.args.sliding_window} keys, so a span split across "
+                "prefill chunks cannot be attended. Raise the prefill step size "
+                "or snap the chunk boundary off the span."
+            )
+        B, L = inputs.shape
+        if mask is None:
+            # create_attention_mask returns None only for L == 1, which cannot
+            # co-occur with a full [START … END] span; nothing to widen.
+            _IMAGE_VISIBILITY_CTX["active"] = False
+            return mask
+        left, right = _get_image_visible(
+            inputs, vocab_size, self.args.vision_max_n_token
+        )
+        visible = _image_visible_mask(
+            left,
+            right,
+            self.args.sliding_window,
+            L,
+            mask.shape[-1],
+            self.args.vision_max_n_token,
+        )
+        # `create_causal_mask(..., return_array=True)` yields a 2-D (L, S) bool
+        # array at offset 0. Broadcast to the visible mask's (B, L, S) and OR:
+        # visibility only ever ADDS keys (it is a superset of the causal window
+        # on span rows and exactly equal to it elsewhere), so a union is both
+        # sufficient and the safest composition.
+        base = mask if mask.ndim >= 3 else mask[None]
+        _IMAGE_VISIBILITY_CTX["active"] = True
+        return mx.broadcast_to(base, (B, L, mask.shape[-1])) | visible
+
     def _forward_steps(
         self,
         inputs: mx.array,
@@ -7270,6 +7677,20 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
                     window_size=self.args.sliding_window,
                     return_array=True,
                 )
+                # Phase 3b: widen the local mask so every token inside an
+                # [IMAGE_START … IMAGE_END] span sees the whole span, on top of
+                # the normal sliding window. See _image_visible_mask and
+                # docs/dsv4-vision-phase3b-window-geometry-inventory.md.
+                #
+                # THREE independent conditions must ALL hold, and any one being
+                # false leaves `mask` byte-identically what it is today:
+                #   1. EXO_DSV4_IMAGE_VISIBILITY=1 (default OFF),
+                #   2. a vision checkpoint (vision_n_layers > 0),
+                #   3. an image token actually present in this chunk.
+                # (3) costs one device→host sync, so (1) and (2) — both pure
+                # Python constants — are checked first and short-circuit it
+                # away entirely on every text-only forward.
+                mask = self._apply_image_visibility(mask, inputs, mask_cache)
                 if mask is not None:
                     finalize(mask)
         if _bp:
