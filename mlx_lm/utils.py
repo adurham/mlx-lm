@@ -456,7 +456,15 @@ def load_model(
                     # uint8 (true mxfp packing). bf16/fp16/fp32 -> affine.
                     return scales is not None and scales.dtype == mx.uint8
                 for k, v in dsv4_cfg.items():
-                    if isinstance(v, dict) and _is_mxfp_override(k, v):
+                    # `False` is an explicit "never quantize this module"
+                    # opt-out (DSv4-Flash-Vision's bf16 ViT/Aligner tower).
+                    # It is not a quantization override, so it must bypass
+                    # the mxfp-vs-affine scale check and be honored as-is —
+                    # otherwise the top-level affine default below would
+                    # still sweep the vision tower in.
+                    if v is False:
+                        config["quantization"].setdefault(k, False)
+                    elif isinstance(v, dict) and _is_mxfp_override(k, v):
                         config["quantization"].setdefault(k, v)
             except Exception:
                 # Best-effort — never block loading on this.
