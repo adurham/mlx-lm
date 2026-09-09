@@ -119,12 +119,22 @@ def _clamp_embed_input(model, vocab_size):
 
     Only ``embed_tokens`` sees clamped ids; ``inputs`` reaching the layers,
     the gate and ``_apply_image_visibility`` keep the TRUE sentinel values.
+
+    This is a stand-in for exo's real ``patch_embed_tokens`` splice, which
+    performs the identical clamp-before-gather. Marked
+    ``handles_out_of_range_ids = True`` so ``DeepseekV4Model._forward_steps``'s
+    ``_assert_embeddable`` defense-in-depth check defers to it, exactly as it
+    would for the real splice -- without the marker the RAW sentinel ids
+    this test deliberately preserves in ``inputs`` (for the mask/gate) would
+    trip that check.
     """
     inner = model.model
     original_embed = inner.embed_tokens
 
     def _clamped(input_ids):
         return original_embed(mx.minimum(input_ids, vocab_size - 1))
+
+    _clamped.handles_out_of_range_ids = True
 
     inner.embed_tokens = _clamped
     return model
@@ -341,10 +351,10 @@ class TestC8SparseFusedSdpaIsReachableAndCorrect(unittest.TestCase):
 
             mod._sparse_fused_sdpa = spy
             ids = _span_ids(seqlen=16, spans=((4, 6),), seed=32)
-            model = mod.Model(
-                _cfg(mod, 2, (0, 4), head_dim=self.D, index_topk=self.K)
-            )
+            cfg = _cfg(mod, 2, (0, 4), head_dim=self.D, index_topk=self.K)
+            model = mod.Model(cfg)
             _fill(model, 4242, mod, dtype=mx.bfloat16)
+            _clamp_embed_input(model, cfg.vocab_size)
             logits = model(mx.array(ids), cache=model.make_cache())
             mx.eval(logits)
             active = mod._IMAGE_VISIBILITY_CTX["active"]

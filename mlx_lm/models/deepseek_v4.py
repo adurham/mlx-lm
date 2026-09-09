@@ -7442,6 +7442,52 @@ class DeepseekV4DSparkModule(nn.Module):
         return draft_tokens, corrected, confidence
 
 
+def _assert_embeddable(inputs: mx.array, vocab_size: int) -> None:
+    """Defense-in-depth bounds check for the real ``embed_tokens`` gather.
+
+    MLX's array-index gather (``nn.Embedding.__call__`` -> ``self.weight[x]``)
+    does NOT bounds-check: an index at or past ``weight.shape[0]`` silently
+    returns a zero row instead of raising. DeepSeek-V4's vision scheme
+    represents image tokens as five SENTINEL ids at ``vocab_size + {0..4}`` --
+    deliberately outside the table, because the reference never looks them
+    up; the vision tower's embeddings are computed separately and spliced in
+    (see ``deepseek_v4_vision.build_embeddings`` / exo's
+    ``patch_embed_tokens``). Any caller that reaches this gather with a raw
+    sentinel id still in ``inputs`` has a bug: it should have clamped (like
+    ``build_embeddings`` does) or routed around the gather entirely (like
+    ``patch_embed_tokens`` splicing pre-computed embeddings).
+
+    Cost: one ``mx.any(...).item()`` device sync per call to
+    ``DeepseekV4Model._forward_steps``, i.e. once per forward, not once per
+    layer. On a text-only request this array has no sentinel ids in it either
+    way, so the branch reduces to a single boolean reduction over the
+    already-materialized ``inputs`` array plus one small host sync --
+    negligible next to a single transformer layer, let alone the whole
+    forward. Not gated further (unlike ``_apply_image_visibility``, which
+    additionally gates behind cheap Python-constant checks) because this
+    check is meant to run unconditionally on every real gather, including on
+    checkpoints with no vision tower at all -- vocab_size is always a hard
+    ceiling regardless of ``vision_n_layers``.
+    """
+    highest = int(mx.max(inputs).item()) if inputs.size else -1
+    if highest < vocab_size:
+        return
+    offending = sorted({int(t) for t in inputs.reshape(-1).tolist() if t >= vocab_size})
+    raise ValueError(
+        f"DeepSeek-V4: embed_tokens gather received {len(offending)} token "
+        f"id(s) at or past the embedding table's {vocab_size} rows "
+        f"(offending ids: {offending[:8]}"
+        f"{', ...' if len(offending) > 8 else ''}; highest={highest}). "
+        "These look like DSv4 image sentinel tokens (vocab_size + {0..4}), "
+        "which must never be gathered directly -- their embeddings are "
+        "computed by the vision tower and spliced in afterward. Either "
+        "clamp them before this call (see "
+        "deepseek_v4_vision.build_embeddings) or splice in pre-computed "
+        "embeddings instead of passing raw token ids through this gather "
+        "(see exo's patch_embed_tokens)."
+    )
+
+
 class DeepseekV4Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -7616,6 +7662,17 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if _bp:
             _bp_t_start = _BUILD_PROBE_PERF()
         with span("model.embed"):
+            # Defense-in-depth: reject raw sentinel ids at the real gather,
+            # UNLESS `self.embed_tokens` has been monkeypatched by exo's
+            # `patch_embed_tokens` (marked via `handles_out_of_range_ids`).
+            # That splice installs a callable that internally routes around
+            # the gather for sentinel positions (pre-computed vision-tower
+            # embeddings), so the same input that would be a bug for the
+            # plain `nn.Embedding` gather is exactly what that callable
+            # exists to handle correctly. See `_assert_embeddable` for the
+            # cost/rationale of the check itself.
+            if not getattr(self.embed_tokens, "handles_out_of_range_ids", False):
+                _assert_embeddable(inputs, self.vocab_size)
             h = self.embed_tokens(inputs)
             # Batch-invariance fix (EXO_DSV4_FP32_ACT=1): compute the whole
             # forward with fp32 ACTIVATIONS (weights stay bf16/quantized — same

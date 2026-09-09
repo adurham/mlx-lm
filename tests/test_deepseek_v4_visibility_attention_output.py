@@ -471,7 +471,19 @@ class TestFullModelForwardWithRealSpan(unittest.TestCase):
             # sentinel values, which is what this test exercises.
             _inner = model.model
             _orig_embed = _inner.embed_tokens
-            _inner.embed_tokens = lambda i: _orig_embed(mx.minimum(i, VOCAB - 1))
+
+            def _clamped_embed(i, _orig_embed=_orig_embed):
+                return _orig_embed(mx.minimum(i, VOCAB - 1))
+
+            # This harness lambda is a stand-in for exo's real
+            # `patch_embed_tokens` splice: it clamps ids before the real
+            # gather, exactly what that splice does, so it must carry the
+            # same marker telling `DeepseekV4Model._forward_steps`'s
+            # `_assert_embeddable` defense-in-depth check to defer to it
+            # (the check would otherwise correctly reject the RAW sentinel
+            # ids this test deliberately keeps in `ids` for the mask/gate).
+            _clamped_embed.handles_out_of_range_ids = True
+            _inner.embed_tokens = _clamped_embed
             logits = model(mx.array(ids), cache=model.make_cache())
             mx.eval(logits)
             arr = np.asarray(logits)
