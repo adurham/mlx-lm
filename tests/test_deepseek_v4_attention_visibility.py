@@ -578,6 +578,41 @@ class TestFullModelForwardBitwiseIdentity(unittest.TestCase):
             importlib.reload(dsv4)
             self.assertTrue(dsv4._IMAGE_VISIBILITY)
             on = self._forward_logits(777, ids)
+
+            # GAP CLOSED (verification pass, 2026-09-09): pin, rather than
+            # merely infer from `_config()`'s literal `vision_n_layers=32`,
+            # that this bitwise-identity claim is proven on a model that
+            # ACTUALLY exercises the vision-checkpoint code paths under flag
+            # ON -- the MoE gate's `_vl` routing variant (`gate.vl`, which
+            # selects `_gate_route_vl`/`_hash_gate_route_vl` over the plain
+            # `_gate_route`/`_hash_gate_route`) and a real vision tower. A
+            # config with `vision_n_layers=0` would ALSO pass this test
+            # (nothing here would exercise the vl gate at all), so this
+            # assertion is what makes "text-only input, flag ON" mean "the
+            # vl-aware code paths ran and produced the same bytes anyway",
+            # not "the vl paths were never reached in the first place".
+            _probe = dsv4.Model(self._config())
+            self.assertTrue(
+                hasattr(_probe, "vision"),
+                "test model must be a REAL vision checkpoint (vision tower "
+                "present), not a text-only config -- otherwise flag ON is "
+                "trivially a no-op and this test proves nothing about the "
+                "vl gate path",
+            )
+            gate_vl_flags = [layer.ffn.gate.vl for layer in _probe.model.layers]
+            print(
+                f"\n[3b END-TO-END BITWISE GUARD -- vl-path coverage check] "
+                f"gate.vl per layer: {gate_vl_flags} (all True means every "
+                f"layer's MoE gate is genuinely routing through "
+                f"_gate_route_vl/_hash_gate_route_vl under flag ON, not the "
+                f"plain pre-Phase-3 _gate_route/_hash_gate_route)"
+            )
+            self.assertTrue(
+                all(gate_vl_flags),
+                "every layer's gate must be in vl mode (vision_n_layers>0) "
+                "for this bitwise-identity claim to say anything about the "
+                "vl gate path",
+            )
         finally:
             del os.environ["EXO_DSV4_IMAGE_VISIBILITY"]
             importlib.reload(dsv4)
