@@ -462,6 +462,16 @@ class TestFullModelForwardWithRealSpan(unittest.TestCase):
                 return t
 
             model.update(fill(model.parameters()))
+            # Clamp ONLY the embedding's input ids. Sentinel ids are
+            # `vocab_size + {0..4}`, outside the embedding table; the real
+            # pipeline never looks them up (the reference's
+            # merge_image_embeddings — and exo's Phase 4 patch_embed_tokens —
+            # overwrite those rows wholesale). `inputs` reaching the layers,
+            # the MoE gate and `_apply_image_visibility` keeps the TRUE
+            # sentinel values, which is what this test exercises.
+            _inner = model.model
+            _orig_embed = _inner.embed_tokens
+            _inner.embed_tokens = lambda i: _orig_embed(mx.minimum(i, VOCAB - 1))
             logits = model(mx.array(ids), cache=model.make_cache())
             mx.eval(logits)
             arr = np.asarray(logits)

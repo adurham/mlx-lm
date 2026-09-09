@@ -98,10 +98,44 @@ def _fill(model, seed, mod, dtype=mx.float32):
     return model
 
 
+def _clamp_embed_input(model, vocab_size):
+    """Clamp the EMBEDDING's input ids to ``< vocab_size``, in place.
+
+    Image sentinel ids are ``vocab_size + {0..4}`` — deliberately OUTSIDE the
+    embedding table, because the real pipeline never looks them up: DeepSeek's
+    reference overwrites those rows wholesale in ``merge_image_embeddings``
+    (and exo's Phase 4 path does the same via ``patch_embed_tokens``). The RAW
+    ids must still reach the layers, since both the MoE gate
+    (``input_ids >= vocab_size`` selects ``bias_vl``) and the visibility mask
+    are derived from them.
+
+    Without this, the test harness fed out-of-range ids straight into
+    ``nn.Embedding``. MLX 0.32.1 happens to return deterministic ZEROS for an
+    out-of-range gather (measured: 20 repeats x 3 processes, 1 distinct digest,
+    all-zero=True), so it did not actually flake — but zero rows are NOT what
+    the product feeds the model, and out-of-bounds gather behaviour is not a
+    documented guarantee. Clamping makes the harness depend on defined
+    behaviour only, and mirrors what the real path does.
+
+    Only ``embed_tokens`` sees clamped ids; ``inputs`` reaching the layers,
+    the gate and ``_apply_image_visibility`` keep the TRUE sentinel values.
+    """
+    inner = model.model
+    original_embed = inner.embed_tokens
+
+    def _clamped(input_ids):
+        return original_embed(mx.minimum(input_ids, vocab_size - 1))
+
+    inner.embed_tokens = _clamped
+    return model
+
+
 def _forward_logits(mod, ids, *, seed=4242, ratios=(0, 4, 128, 0), index_topk=8):
     """Full model forward on ``ids`` (image sentinels included) -> logits."""
-    model = mod.Model(_cfg(mod, len(ratios), ratios, index_topk=index_topk))
+    cfg = _cfg(mod, len(ratios), ratios, index_topk=index_topk)
+    model = mod.Model(cfg)
     _fill(model, seed, mod)
+    _clamp_embed_input(model, cfg.vocab_size)
     out = model(mx.array(ids), cache=model.make_cache())
     mx.eval(out)
     return np.asarray(out)
