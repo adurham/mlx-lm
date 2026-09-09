@@ -7679,6 +7679,16 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             # to (1, 1, L_q, L_k) so it works with mx.fast.scaled_dot_product_attention.
             _tree_mask = _TREE_VERIFY_CTX.get("mask")
             if _tree_mask is not None:
+                # Phase 3b: this branch bypasses `_apply_image_visibility`
+                # entirely, so the visibility context would otherwise stay
+                # STALE at whatever the last prefill left it. Tree drafting is
+                # decode-time and image visibility is prefill-only, so the
+                # correct state here is always "inactive". Leaving it True
+                # would keep `_query_tiled_ok` declining on every subsequent
+                # tree-verify — a silent performance leak, not a wrong answer
+                # (the fallback path reads the mask and is correct), but it
+                # would persist for the rest of the process.
+                _IMAGE_VISIBILITY_CTX["active"] = False
                 # Shape into the broadcast-friendly 4D layout SDPA expects.
                 if _tree_mask.ndim == 2:
                     mask = _tree_mask[None, None, :, :]
