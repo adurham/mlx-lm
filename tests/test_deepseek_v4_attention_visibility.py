@@ -433,7 +433,16 @@ class TestModelWiringDefaultOff(unittest.TestCase):
             ref_m = get_window_topk_idxs_visible(
                 WINDOW, seqlen, ref_l, ref_r, MAX_IMAGE_TOKENS
             ).numpy()
-            out_np = np.asarray(out)[0]
+            out_np = np.asarray(out)[0, 0]
+            self.assertEqual(
+                out.ndim,
+                4,
+                "the visibility mask must be 4-D (B, H, L, S) -- every "
+                "downstream consumer (_extend_mask, _cached_verify_mask, "
+                "_sparse_pooled_attention) unpacks exactly 4 dims and a 3-D "
+                "mask raises 'not enough values to unpack' on the first "
+                "CompressedAttention layer of a real vision prefill",
+            )
             causal = np.asarray(mask)
             mismatched = 0
             for i in range(seqlen):

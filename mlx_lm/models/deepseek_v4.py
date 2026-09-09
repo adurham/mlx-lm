@@ -7536,7 +7536,7 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         left, right = _get_image_visible(
             inputs, vocab_size, self.args.vision_max_n_token
         )
-        visible = _image_visible_mask(
+        _visible = _image_visible_mask(
             left,
             right,
             self.args.sliding_window,
@@ -7545,13 +7545,28 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             self.args.vision_max_n_token,
         )
         # `create_causal_mask(..., return_array=True)` yields a 2-D (L, S) bool
-        # array at offset 0. Broadcast to the visible mask's (B, L, S) and OR:
-        # visibility only ever ADDS keys (it is a superset of the causal window
-        # on span rows and exactly equal to it elsewhere), so a union is both
-        # sufficient and the safest composition.
-        base = mask if mask.ndim >= 3 else mask[None]
+        # array at offset 0. OR the visible set into it: visibility only ever
+        # ADDS keys (it is a superset of the causal window on span rows and
+        # exactly equal to it elsewhere), so a union is both sufficient and the
+        # safest composition.
+        #
+        # THE RESULT MUST BE 4-D (B, H, L, S), NOT 3-D. Every downstream mask
+        # consumer in this file accepts exactly two ranks — 2-D (L, S), which it
+        # promotes via `mask[None, None]`, or 4-D (B, H, L, S). A 3-D mask hits
+        # `B, H, L, S = mask.shape` in `_extend_mask` (and the same unpack in
+        # `_cached_verify_mask` / `_sparse_pooled_attention`) and raises
+        # "not enough values to unpack (expected 4, got 3)" — i.e. it crashes on
+        # the FIRST CompressedAttention layer of any real vision prefill. The
+        # head axis is a broadcast singleton because visibility is head-uniform,
+        # matching what `mask[None, None]` produces for the 2-D case.
+        _visible = _visible[:, None] if _visible.ndim == 3 else _visible
+        base = mask
+        if base.ndim == 2:
+            base = base[None, None]
+        elif base.ndim == 3:
+            base = base[:, None]
         _IMAGE_VISIBILITY_CTX["active"] = True
-        return mx.broadcast_to(base, (B, L, mask.shape[-1])) | visible
+        return mx.broadcast_to(base, (B, 1, L, mask.shape[-1])) | _visible
 
     def _forward_steps(
         self,
