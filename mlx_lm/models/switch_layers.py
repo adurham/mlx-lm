@@ -1,7 +1,6 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import math
-from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -179,14 +178,13 @@ class SwitchGLU(nn.Module):
 
         # When we have many tokens, then sort them to make sure that the access
         # of different experts is in order.
+        indices = mx.stop_gradient(indices)
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
         if do_sort:
             with span("switch.gather_sort"):
                 x, idx, inv_order = _gather_sort(x, indices)
-        if self.training:
-            idx = mx.stop_gradient(idx)
         with span("switch.up_proj"):
             x_up = self.up_proj(x, idx, sorted_indices=do_sort)
         with span("switch.gate_proj"):
@@ -277,13 +275,15 @@ class BatchedSwitchGLU(SwitchGLU):
             return super().__call__(x, indices)
 
         x = mx.expand_dims(x, (-2, -3))
+        # Match upstream SwitchGLU: detach the routing indices up front so
+        # LoRA/backward through MoE routing works (ml-explore/mlx-lm#1787,
+        # #1795, #1856). Previously gated on ``self.training``.
+        indices = mx.stop_gradient(indices)
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
-        if self.training:
-            idx = mx.stop_gradient(idx)
 
         n_inter = self._fused_n_inter
 
@@ -333,13 +333,12 @@ class SwitchMLP(nn.Module):
 
         # When we have many tokens, then sort them to make sure that the access
         # of different experts is in order.
+        indices = mx.stop_gradient(indices)
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
-        if self.training:
-            idx = mx.stop_gradient(idx)
         x = self.fc1(x, idx, sorted_indices=do_sort)
         x = self.activation(x)
         x = self.fc2(x, idx, sorted_indices=do_sort)
