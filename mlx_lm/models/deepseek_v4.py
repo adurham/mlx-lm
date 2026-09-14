@@ -387,6 +387,38 @@ _INDEXER_PBLOCK = int(os.environ.get("EXO_DSV4_INDEXER_PBLOCK", "0"))
 _LMHEAD_LASTROW_MIN_L = int(os.environ.get("EXO_DSV4_LMHEAD_LASTROW_MIN_L", "32"))
 
 
+# --- DO NOT re-attempt a per-row conditional mxfp8/BF16 lm_head fallback
+# without reading this first (investigated + ruled out 2026-09-14) ---
+# A "compute lm_head via fast mxfp8, redo only low-margin rows in exact
+# BF16 via mx.where(mask, bf16_logits, mxfp8_logits)" fallback was built
+# for real (a `_lmhead_mxfp8_fallback()` function spliced into
+# Model.__call__, gated by EXO_DSV4_LMHEAD_MXFP8_FALLBACK, plus a stashed
+# un-quantized weight in mlx_lm.utils's load_model) and live-tested on
+# production. It failed BOTH bars it needed to clear:
+#   - Correctness: DSpark's speculative draft head calls `lm_head` DIRECTLY
+#     in DSparkStage.draft() (search this file for "base_logits = lm_head"),
+#     bypassing Model.__call__ entirely -- so a splice only in __call__
+#     never touches the draft-path logits that seed DSpark's whole
+#     accept/reject chain. Still 10/10 defect rate live.
+#   - Throughput: slower than plain BF16 (37.38 vs 39.06 tok/s), because
+#     mx.where over an array-valued mask computes BOTH the mxfp8 AND the
+#     bf16 branches unconditionally before selecting -- confirmed via a
+#     real isolated microbenchmark at production shapes (M=1/3/4/5): cost
+#     tracked 95.9-97.8% of the SUM of both matmuls' separate costs, at
+#     every M, independent of the margin/trigger-rate data. This is a
+#     structural fact about how MLX composes mx.where with lazy
+#     evaluation, not a tuning problem -- it holds at ANY margin
+#     threshold and ANY call site (including a since-checked variant that
+#     also patches the DSpark draft-head call site above: same result).
+# Full investigation (three rounds, real numbers, why each fails): see
+# docs/lmhead-mxfp8-defect-and-fallback-investigations-2026-09-14.md in
+# the parent exo repo. Do not re-attempt this mechanism without genuinely
+# new information (a different quantization scheme, or evidence MLX has
+# gained a true lazy gather/scatter conditional-compute primitive that
+# can skip both the read AND the compute for untouched rows, not just
+# their output value).
+
+
 # FFN sub-attribution (same gate): expert compute vs the cross-rank all_sum
 # (RDMA reduction). Quantifies how much of the ~50%-of-prefill MoE bucket is
 # communication — i.e. the upside ceiling of switching to Pipeline sharding
