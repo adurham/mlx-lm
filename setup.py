@@ -35,11 +35,16 @@ setup(
     packages=[
         "mlx_lm",
         "mlx_lm.models",
+        "mlx_lm.models.exl3",
+        "mlx_lm.models.exl3.ref",
         "mlx_lm.quant",
         "mlx_lm.tuner",
         "mlx_lm.tool_parsers",
         "mlx_lm.chat_templates",
     ],
+    package_data={
+        "mlx_lm.models.exl3": ["LICENSE", "NOTICE", "README.md"],
+    },
     python_requires=">=3.8",
     extras_require={
         "test": ["datasets", "lm-eval"],
