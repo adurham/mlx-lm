@@ -37,6 +37,7 @@ setup(
         "mlx_lm.models",
         "mlx_lm.models.exl3",
         "mlx_lm.models.exl3.ref",
+        "mlx_lm.models.deepseek_v41",
         "mlx_lm.quant",
         "mlx_lm.tuner",
         "mlx_lm.tool_parsers",
@@ -44,6 +45,7 @@ setup(
     ],
     package_data={
         "mlx_lm.models.exl3": ["LICENSE", "NOTICE", "README.md"],
+        "mlx_lm.models.deepseek_v41": ["LICENSE", "README.md"],
     },
     python_requires=">=3.8",
     extras_require={
