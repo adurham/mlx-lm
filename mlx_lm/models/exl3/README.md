@@ -28,6 +28,11 @@ closure: 12 modules under `mlx/` plus 4 numpy reference modules under `ref/`
 3. `__init__.py` reduced to the two-class import surface (upstream's pulled
    in `forward`/`linear`/`generate` modules that are not vendored).
 4. `ref/__init__.py` reduced correspondingly.
+5. **`loader.py` is a LOCAL ADDITION, not vendored** — a checkpoint loader
+   for exllamav3-style EXL3 safetensors directories that builds the stacked
+   buffers the kernels consume, including the tensor-parallel intermediate
+   slice (`load_experts(..., rank=r, world=2)`) proven in the exo repo's
+   phase-12 doc. See its module docstring for the format contract.
 
 **Numerical code is unchanged** except as noted in the headers, i.e. the
 three changes already present in the node's patched tree:
@@ -55,6 +60,18 @@ checkpoint tensors (layer 1 experts, the k=6 quantized head group):
 Verdict: the vendored tree is bit-identical to upstream `ponyexl3` on every
 tested path. Test script: `exl3_vendor_equiv.py` (kept in the phase-2
 scratch area, not in this tree).
+
+## Loader gate (PASSED)
+
+`loader.py` (local addition) was gated on the same checkpoint tensors:
+
+| check | result |
+|---|---|
+| loader-built module vs hand-built reference, R=1/4/8 | bit-identical |
+| `rank=0/1, world=2` slice partials summed vs full | cos 1.0000000 (R=1) / 0.9999999 (R=4) |
+| dense head group via `EXL3Linear` vs reconstruct+matmul | cos 0.9999996 |
+
+Test script: `p43_loader_gate.py` (phase-12 scratch, not in this tree).
 
 ## Env knobs carried over
 
