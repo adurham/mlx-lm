@@ -186,6 +186,10 @@ class Model(nn.Module):
         for layer in self.layers:
             if layer.engram is not None:
                 h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index])
+            # the draft head reads the INPUT of its target layers (reference
+            # Transformer.forward), not their output
+            if layer.layer_id in tap_ids:
+                taps[layer.layer_id] = h.mean(axis=2)
             if self._break_sharing and not layer.attn.is_kv_source and layer.attn.ratio:
                 shared_use = SharedState()           # sever the link: consumers see nothing
                 shared_use.kv_src_cache = shared.kv_src_cache
@@ -198,8 +202,6 @@ class Model(nn.Module):
                 h, pre_mix = layer(h, pre_mix, start_pos, cache, shared)
             if _ASYNC_EVAL:
                 mx.async_eval(h, pre_mix)
-            if layer.layer_id in tap_ids:
-                taps[layer.layer_id] = h.mean(axis=2)
 
         h = hc_pre(h, pre_mix)                       # collapse with the last ffn_pre
         h = self.norm(h)

@@ -122,8 +122,8 @@ class Exl3Checkpoint:
     def text_config(self) -> dict[str, Any]:
         return self.config.get("text_config", self.config)
 
-    def n_experts(self, layer_id: int) -> int:
-        pre = f"layers.{layer_id}.ffn.experts."
+    def n_experts(self, layer_id: int, prefix: str | None = None) -> int:
+        pre = prefix or f"layers.{layer_id}.ffn.experts."
         ids = set()
         for k in self.index:
             if k.startswith(pre):
@@ -217,6 +217,7 @@ def load_experts(
     world: int = 1,
     activation: str = "silu_clamp",
     mul1: bool = True,
+    prefix: str | None = None,
 ) -> EXL3SwitchGLU:
     """Build the stacked ``EXL3SwitchGLU`` for one MoE layer of the checkpoint.
 
@@ -226,14 +227,14 @@ def load_experts(
     """
     import mlx.core as mx
 
-    total = ckpt.n_experts(layer_id)
+    total = ckpt.n_experts(layer_id, prefix)
     if n_experts is not None:
         if not (1 <= n_experts <= total):
             raise ValueError(f"n_experts={n_experts} outside 1..{total}")
         total_e = n_experts
     else:
         total_e = total
-    pre = f"layers.{layer_id}.ffn.experts."
+    pre = prefix or f"layers.{layer_id}.ffn.experts."
 
     h_w1 = ckpt.header(pre + "0.w1.trellis")
     h_w2 = ckpt.header(pre + "0.w2.trellis")

@@ -530,3 +530,62 @@ def build_model(model_dir: str, *, native_dir: str | None = None,
         raise ValueError(f"unconsumed top-level tensors: {sorted(stray)}")
     args.n_mtp_layers = n_mtp
     return model, {"layers": reports, "n_mtp_layers_skipped": n_mtp}
+
+
+_MTP_TOP = {
+    "main_norm.weight": "main_norm.weight",
+    "norm.weight": "norm.weight",
+    "markov_head.embed.weight": "markov_embed.weight",
+    "markov_head.head.weight": "markov_head.weight",
+    "confidence_head.proj.weight": "confidence_proj.weight",
+}
+
+
+def build_mtp(ck: Exl3Checkpoint, args: ModelArgs, *, rank: int = 0, world: int = 1,
+              group=None):
+    """DSpark draft head (``mtp.*``) with EXL3 projections.
+
+    Routed draft experts take the same intermediate-width rank slice as the
+    body (one all_sum per stage); everything else is replicated, so the draft
+    runs identically on every rank. Strict accounting like ``build_block``."""
+    from .mtp import DSparkHead
+    head = DSparkHead(args)
+    for s_i, stage in enumerate(head.stages):
+        pre = f"mtp.{s_i}."
+        stage.ffn.experts = Exl3Experts(load_experts(
+            ck, 0, prefix=pre + "ffn.experts.", rank=rank, world=world))
+        if world > 1:
+            stage.ffn.group = group
+        dense = {g for g in _groups(ck, pre) if ".ffn.experts." not in g}
+        wo_a = sorted((g for g in dense if ".attn.wo_a.slice." in g),
+                      key=lambda g: int(g.rsplit(".", 1)[1]))
+        if wo_a:
+            stage.attn.wo_a = _Grouped([_dense(ck, g) for g in wo_a])
+        for g in sorted(set(dense) - set(wo_a)):
+            tail = g[len(pre):]
+            if tail == "main_proj":
+                head.main_proj = _dense(ck, g)
+            else:
+                _set(stage, tail, _dense(ck, g))
+        if _FUSE_GROUPS and DENSE_MODE == "exl3":
+            _fuse_block(stage, pre, ck)
+
+    expected = {k for k, _ in tree_flatten(head.parameters())}
+    have = {}
+    for k in ck.index:
+        if not k.startswith("mtp.") or ".ffn.experts." in k:
+            continue
+        if k.rsplit(".", 1)[-1] in ("trellis", "suh", "svh", "mul1"):
+            continue
+        s_i, tail = k[4:].split(".", 1)
+        have[_MTP_TOP.get(tail, f"stages.{s_i}.{tail}")] = k
+    missing = {t for t in expected - set(have) if not t.endswith("gate.bias_vl")}
+    unexpected = set(have) - expected
+    if missing or unexpected:
+        raise ValueError(f"mtp: missing={sorted(missing)[:20]} unexpected={sorted(unexpected)[:20]}")
+    fp32 = ("norm.weight", "attn_sink", "hc_", "gate.bias")
+    items = [(t, _plain(ck, n, mx.float32 if any(f in t for f in fp32) else None))
+             for t, n in have.items()]
+    head.load_weights(items, strict=False)
+    mx.eval([v for _, v in items])
+    return head

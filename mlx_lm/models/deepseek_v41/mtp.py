@@ -38,9 +38,16 @@ import mlx.nn as nn
 
 from .config import ModelArgs
 from .hyper_connections import hc_mixes, hc_post, hc_pre, make_identity_pre_mix
+from .fakequant import fake_quant_fp8_ue8m0
 from .layers import RMSNorm, precompute_freqs_cis, rope_tail
 from .moe import ClampedSwiGLU, Gate, SharedExpert
 from mlx_lm.models.switch_layers import SwitchGLU
+
+import os
+
+from .hc_fused import hc_expand, mixes_and_collapse
+
+_HC_FUSED = os.environ.get("DSV41_HC_FUSED", "1") == "1"
 
 
 class DraftWindow:
@@ -62,13 +69,9 @@ class DraftWindow:
         """Append L context KV rows into the ring; returns the current ring."""
         b, l, _ = kv.shape
         pos = self.n_ctx
-        slots = (pos + mx.arange(l)) % self.window
-        # scatter through a take/put pair so wrap-around is correct
-        cur = self.win_kv
-        for i in range(l):
-            idx = int(slots[i])
-            cur[:, idx] = kv[:, i]
-        self.win_kv = cur
+        keep = min(l, self.window)
+        slots = (pos + l - keep + mx.arange(keep)) % self.window
+        self.win_kv[:, slots] = kv[:, l - keep:].astype(self.dtype)
         self.n_ctx = pos + l
         return self.win_kv
 
@@ -126,7 +129,8 @@ class DraftAttention(nn.Module):
         cos, sin = self._freqs(start + x.shape[1])
         c, s = cos[start:start + x.shape[1]], sin[start:start + x.shape[1]]
         kv = self.kv_norm(self.wkv(x))
-        return rope_tail(kv, rd, c, s)
+        kv = rope_tail(kv, rd, c, s)
+        return fake_quant_fp8_ue8m0(kv, 32)      # reference act_quant on draft KV
 
     def append_ctx(self, main_x: mx.array, cache: DraftWindow):
         """Push context KV (from projected target hiddens) into the window."""
@@ -160,8 +164,11 @@ class DraftAttention(nn.Module):
 
         o = rope_tail(o, rd, cos[start:start + l], sin[start:start + l], inverse=True)
         o = o.reshape(b, l, self.n_groups, -1)
-        wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
-        o = mx.einsum("blgd,grd->blgr", o.astype(mx.float32), wo_a.astype(mx.float32))
+        if isinstance(self.wo_a, nn.Linear):
+            wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
+            o = mx.einsum("blgd,grd->blgr", o.astype(mx.float32), wo_a.astype(mx.float32))
+        else:
+            o = self.wo_a(o.astype(x.dtype))
         return self.wo_b(o.reshape(b, l, -1).astype(x.dtype))
 
 
@@ -177,6 +184,7 @@ class DraftMoE(nn.Module):
         self.experts = SwitchGLU(args.dim, args.moe_inter_dim, self.n_experts,
                                  activation=ClampedSwiGLU(args.swiglu_limit), bias=False)
         self.shared_experts = SharedExpert(args.dim, args.moe_inter_dim, args.swiglu_limit)
+        self.group = None
 
     def __call__(self, x: mx.array) -> mx.array:
         shape = x.shape
@@ -184,6 +192,8 @@ class DraftMoE(nn.Module):
         weights, indices = self.gate(xf)
         y = self.experts(xf, indices)
         y = mx.sum(y.astype(mx.float32) * weights[..., None], axis=-2)
+        if self.group is not None:          # experts hold one rank's width slice
+            y = mx.distributed.all_sum(y, group=self.group)
         y = y + self.shared_experts(xf).astype(mx.float32)
         return y.reshape(shape).astype(x.dtype)
 
@@ -214,6 +224,18 @@ class DraftStage(nn.Module):
         self.hc_ffn_scale = mx.zeros((3,), dtype=mx.float32)
 
     def __call__(self, x, pre_mix, cache):
+        if _HC_FUSED and self.hc_mult == 4:
+            h, attn_pre, attn_post, attn_comb = mixes_and_collapse(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, pre_mix,
+                self.hc_iters, self.norm_eps, self.hc_eps)
+            h = self.attn.draft_block(self.attn_norm(h), cache)
+            x = hc_expand(h, x, attn_post, attn_comb)
+            h, ffn_pre, ffn_post, ffn_comb = mixes_and_collapse(
+                x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, attn_pre,
+                self.hc_iters, self.norm_eps, self.hc_eps)
+            h = self.ffn(self.ffn_norm(h))
+            x = hc_expand(h, x, ffn_post, ffn_comb)
+            return x, ffn_pre
         residual = x
         attn_pre, attn_post, attn_comb = hc_mixes(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
