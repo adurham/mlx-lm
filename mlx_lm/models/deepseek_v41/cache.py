@@ -25,6 +25,8 @@ import mlx.core as mx
 from .compressor import CompressorState
 from .config import ModelArgs
 
+NEG_INF = float("-inf")
+
 
 class LayerCache:
     def __init__(self, bsz: int, args: ModelArgs, layer_id: int, max_seq_len: int,
@@ -67,6 +69,34 @@ class LayerCache:
         tail = kv[:, n - keep:]
         slots = (pos + n - keep + mx.arange(keep)) % self.window
         self.win_kv[:, slots] = tail.astype(self.dtype)
+
+    # ---- session reuse (workstream E): exact-state snapshot / restore ----
+
+    def ring_snapshot(self):
+        """Materialized copy of the window ring.
+
+        The ring is the one position-addressed buffer a rollback cannot
+        reconstruct on its own: slots alias every ``window`` positions, so a
+        discarded write at ``q`` silently corrupts a live read of ``q -
+        window``. A session checkpoint therefore keeps a copy (~256 KB at
+        window 128 / head_dim 512 fp32)."""
+        return mx.array(self.win_kv)
+
+    def ring_restore(self, snap) -> None:
+        """Rebind the ring to a fresh copy of ``snap`` (never aliases it)."""
+        self.win_kv = mx.array(snap)
+
+    def reset_carry(self) -> None:
+        """Canonicalize the open-group carry to "no carried rows" (a group
+        boundary): ``kv`` rows zeroed, ``score`` rows back to NEG_INF, exactly
+        as a freshly allocated cache has them. A rollback to a group boundary
+        needs no carry history because the next compressor call writes every
+        row it reads."""
+        cs = self.comp_state
+        if cs is None:
+            return
+        cs.kv_state = mx.zeros_like(cs.kv_state)
+        cs.score_state = mx.full(cs.score_state.shape, NEG_INF, dtype=cs.score_state.dtype)
 
 
 class ModelCache:

@@ -55,11 +55,31 @@ _MOE_MM = os.environ.get("EXL3_MOE_MM", "1") == "1"
 _MOE_KERNELS: dict[tuple[int, int] | tuple[int, int, str], tuple[Any, Any]] = {}
 _SEG_BM = 64
 # Hybrid crossover: above this many sorted (token, slot) rows the steel
-# gather_mm over expert-grouped decoded W out-runs the v19c kernel — steel's
-# mma pipeline beats ours at huge M, while v19c wins below by skipping the
-# fixed decode-all and W materialization (1.25-1.8x at S=512; gather ahead
-# from ~S=2048 once the rhs is contiguous; measured Phase 19).
+# gather_mm over expert-grouped decoded W out-runs the v19c/v19e kernel —
+# steel's mma pipeline beats ours at huge M, while the segmented kernel wins
+# below by skipping the fixed decode-all and W materialization (1.25-1.8x at
+# S=512; measured Phase 19). The crossover is only reachable when the fallback
+# can actually allocate its rhs — see _mm_fallback_viable.
 _MM_MAX_ROWS = int(os.environ.get("EXL3_MM_MAX_ROWS", str(9 * 1024)))
+
+
+def _mm_fallback_bytes(E: int, D: int, H: int) -> int:
+    """Bytes the gather_mm fallback would materialize for one MoE layer."""
+    return max(E * H * D, 2 * E * D * H) * 2
+
+
+# MLX builds tensor shapes/offsets in int32; a buffer over this cannot allocate.
+_INT32_MAX = 2**31 - 1
+
+
+def _mm_fallback_viable(E: int, D: int, H: int) -> bool:
+    """Whether the decode-all + gather_mm path can allocate for this geometry.
+
+    The DSv4.1 MoE (E=384, D=5120, H=1152) cannot: the rhs is decode_full_eg's
+    fp16 W, 4.53 GB (dn) + 9.06 GB (gu), both past MLX's int32 buffer limit. The
+    failure is an uncaught nanobind OverflowError that kills the process, so the
+    cap must be decided by geometry, not by the mma crossover."""
+    return _mm_fallback_bytes(E, D, H) <= _INT32_MAX
 # A2 out-tiles per threadgroup (1 = one 16-wide out-tile, the v3 default).
 # >1 reuses each loaded trellis word across several out-tiles; must divide
 # gu_tiles (hidden/16) so a group stays inside one projection.
@@ -844,7 +864,22 @@ class EXL3SwitchGLU(nn.Module):
         idx = sidx.reshape(N, 1).astype(mx.uint32)
         tok = (mx.arange(N, dtype=mx.uint32) // kk)[order]
 
-        use_mm = _MOE_MM and H % 64 == 0 and D % 64 == 0 and N <= _MM_MAX_ROWS
+        # Path selection. The segmented kernel needs H,D % 64; the gather_mm
+        # fallback needs the decode-all rhs to fit in an int32-shaped buffer
+        # (it does NOT at DSv4.1 dims -- see _mm_fallback_viable). Where the
+        # fallback is impossible the cap must not send work to it: the failure
+        # mode is an uncaught OverflowError, not a slow path.
+        seg_ok = _MOE_MM and H % 64 == 0 and D % 64 == 0
+        fb_viable = _mm_fallback_viable(E, D, H)
+        if not seg_ok and not fb_viable:
+            raise ValueError(
+                f"EXL3SwitchGLU: no viable prefill path (seg needs H,D %64: "
+                f"H={H} D={D}; gather fallback needs "
+                f"{_mm_fallback_bytes(E, D, H)/1e9:.2f} GB rhs <= int32)"
+            )
+        # Stock rule: segmented below the crossover, gather_mm above it. When the
+        # rhs cannot allocate, the crossover is unreachable -> stay segmented.
+        use_mm = seg_ok and (N <= _MM_MAX_ROWS or not fb_viable)
         tab: mx.array = mx.array([])
         nbr: mx.array = mx.array([])
         if use_mm:

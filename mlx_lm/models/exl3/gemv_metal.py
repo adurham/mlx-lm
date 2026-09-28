@@ -1568,7 +1568,185 @@ _MM_BM = 64  # token rows per block
 _MM_BN = 64  # out cols per threadgroup
 _MM_WS = 72  # wblk row stride in halfs (32 rows x 64 cols, padded)
 
-_mm_seg_kernels: dict[tuple[int, int], Callable[..., Any]] = {}
+# DSv4.1 (384 experts x top-6) at R=512 puts only ~8 live token rows in each
+# 64-row block, so 7/8 of the token-row fragments and 4/5 of the mma issue are
+# dead work: the store loop already discards every row >= blk_len, and the
+# A-fragment loads for those rows are pure latency. Measured on layer 20
+# (E=384, D=5120, H=1152, N=3072, m4-1): 74.6 -> 32.5 ms for gu+dn, bit-exact
+# on the live rows; the gain holds from N=510 (2.6x) down to N=24576 (1.2x).
+# EXL3_MM_SEG=v19c restores the stock kernel.
+_MM_SEG_VERSION = os.environ.get("EXL3_MM_SEG", "v19d")
+
+_mm_seg_kernels: dict[tuple[int, int, str], Callable[..., Any]] = {}
+
+_WBLK_ANCHOR = "    threadgroup half wblk[32u * 72u];   // 2 in-tiles x 4 out-tiles"
+_MMA_BLOCK = """        for (uint k2 = 0u; k2 < 4u; k2++) {
+            simdgroup_half8x8 bf0;
+            simdgroup_half8x8 bf1;
+            simdgroup_half8x8 bf2;
+            simdgroup_half8x8 bf3;
+            const threadgroup half* wrow =
+                &wblk[k2 * 8u * 72u + sgc * 32u];
+            simdgroup_load(bf0, wrow, 72u);
+            simdgroup_load(bf1, wrow + 8u, 72u);
+            simdgroup_load(bf2, wrow + 16u, 72u);
+            simdgroup_load(bf3, wrow + 24u, 72u);
+            for (uint r = 0u; r < 4u; r++) {
+                simdgroup_half8x8 a;
+                simdgroup_load(
+                    a, xrow + (ulong)(r * 8u) * in_features + ks * 32u + k2 * 8u,
+                    in_features);
+                simdgroup_multiply_accumulate(C[r][0], a, bf0, C[r][0]);
+                simdgroup_multiply_accumulate(C[r][1], a, bf1, C[r][1]);
+                simdgroup_multiply_accumulate(C[r][2], a, bf2, C[r][2]);
+                simdgroup_multiply_accumulate(C[r][3], a, bf3, C[r][3]);
+            }
+        }"""
+
+# rlive: how many of this simdgroup-row's four 8-token fragments are live.
+# Fragment r covers rows [sgr*32 + r*8, +8); the store loop drops every row
+# >= blk_len, so a fragment past blk_len contributes nothing to `out`. That is
+# what makes the guard a pure work elimination: it cannot change a live value.
+_GUARD = """    uint rlive = 0u;
+    if (blk_len > sgr * 32u) {
+        uint rrem = blk_len - sgr * 32u;
+        rlive = (rrem > 32u) ? 4u : ((rrem + 7u) >> 3u);
+    }
+"""
+
+def _mma_r_blocks(hoist: bool, indent: str = "            ") -> str:
+    """Four guarded copies of the row-fragment body with a LITERAL row index.
+
+    A runtime `for (r = 0; r < rlive; r++)` makes `C[r][...]` a dynamic index
+    into the simdgroup accumulator array, which costs the compiler the static
+    register allocation: measured 2.4x SLOWER at N=18432 (segments fill their
+    blocks, rlive=4 everywhere) versus the stock loop. Emitting one block per
+    row keeps the indexing static. Accumulation order per accumulator is
+    unchanged (k2 ascending), so results stay bit-exact.
+    """
+    blocks = []
+    for r in range(4):
+        if hoist:
+            body = f"""if (rlive > {r}u) {{
+            simdgroup_half8x8 af[4];
+            for (uint k2 = 0u; k2 < 4u; k2++) {{
+                simdgroup_load(
+                    af[k2],
+                    xrow + (ulong)({r}u * 8u) * in_features + ks * 32u + k2 * 8u,
+                    in_features);
+            }}
+            for (uint k2 = 0u; k2 < 4u; k2++) {{
+                simdgroup_half8x8 bf0;
+                simdgroup_half8x8 bf1;
+                simdgroup_half8x8 bf2;
+                simdgroup_half8x8 bf3;
+                const threadgroup half* wrow =
+                    &wblk[k2 * 8u * {_MM_WS}u + sgc * 32u];
+                simdgroup_load(bf0, wrow, {_MM_WS}u);
+                simdgroup_load(bf1, wrow + 8u, {_MM_WS}u);
+                simdgroup_load(bf2, wrow + 16u, {_MM_WS}u);
+                simdgroup_load(bf3, wrow + 24u, {_MM_WS}u);
+                simdgroup_multiply_accumulate(C[{r}][0], af[k2], bf0, C[{r}][0]);
+                simdgroup_multiply_accumulate(C[{r}][1], af[k2], bf1, C[{r}][1]);
+                simdgroup_multiply_accumulate(C[{r}][2], af[k2], bf2, C[{r}][2]);
+                simdgroup_multiply_accumulate(C[{r}][3], af[k2], bf3, C[{r}][3]);
+            }}
+        }}
+"""
+        else:
+            body = f"""if (rlive > {r}u) {{
+            for (uint k2 = 0u; k2 < 4u; k2++) {{
+                simdgroup_half8x8 bf0;
+                simdgroup_half8x8 bf1;
+                simdgroup_half8x8 bf2;
+                simdgroup_half8x8 bf3;
+                const threadgroup half* wrow =
+                    &wblk[k2 * 8u * {_MM_WS}u + sgc * 32u];
+                simdgroup_load(bf0, wrow, {_MM_WS}u);
+                simdgroup_load(bf1, wrow + 8u, {_MM_WS}u);
+                simdgroup_load(bf2, wrow + 16u, {_MM_WS}u);
+                simdgroup_load(bf3, wrow + 24u, {_MM_WS}u);
+                simdgroup_half8x8 a;
+                simdgroup_load(
+                    a, xrow + (ulong)({r}u * 8u) * in_features + ks * 32u + k2 * 8u,
+                    in_features);
+                simdgroup_multiply_accumulate(C[{r}][0], a, bf0, C[{r}][0]);
+                simdgroup_multiply_accumulate(C[{r}][1], a, bf1, C[{r}][1]);
+                simdgroup_multiply_accumulate(C[{r}][2], a, bf2, C[{r}][2]);
+                simdgroup_multiply_accumulate(C[{r}][3], a, bf3, C[{r}][3]);
+            }}
+        }}
+"""
+        blocks.append(indent + body.replace("\n", "\n" + indent).rstrip() + "\n")
+    return "".join(blocks)
+
+
+# Full blocks (the large-N / long-segment regime) run the ORIGINAL loop verbatim
+# so the hot path stays byte-identical to the stock kernel; short blocks take
+# the per-row form. One dispatch per stage instead of one test per row keeps
+# the large-N cost at ~0 (measured 6% -> within noise).
+_MMA_FULL = """            for (uint k2 = 0u; k2 < 4u; k2++) {
+            simdgroup_half8x8 bf0;
+            simdgroup_half8x8 bf1;
+            simdgroup_half8x8 bf2;
+            simdgroup_half8x8 bf3;
+            const threadgroup half* wrow =
+                &wblk[k2 * 8u * %(ws)du + sgc * 32u];
+            simdgroup_load(bf0, wrow, %(ws)du);
+            simdgroup_load(bf1, wrow + 8u, %(ws)du);
+            simdgroup_load(bf2, wrow + 16u, %(ws)du);
+            simdgroup_load(bf3, wrow + 24u, %(ws)du);
+            for (uint r = 0u; r < 4u; r++) {
+                simdgroup_half8x8 a;
+                simdgroup_load(
+                    a, xrow + (ulong)(r * 8u) * in_features + ks * 32u + k2 * 8u,
+                    in_features);
+                simdgroup_multiply_accumulate(C[r][0], a, bf0, C[r][0]);
+                simdgroup_multiply_accumulate(C[r][1], a, bf1, C[r][1]);
+                simdgroup_multiply_accumulate(C[r][2], a, bf2, C[r][2]);
+                simdgroup_multiply_accumulate(C[r][3], a, bf3, C[r][3]);
+            }
+        }
+""" % {"ws": _MM_WS}
+
+
+def _mma_guarded(hoist: bool) -> str:
+    """Dispatch once per stage: full blocks -> stock loop, short -> per-row."""
+    body = _mma_r_blocks(hoist)
+    return (
+        "        if (rlive == 4u) {\n"
+        + _MMA_FULL
+        + "        } else if (rlive > 0u) {\n"
+        + body
+        + "        }\n"
+    )
+
+
+_MMA_GUARDED = _mma_guarded(hoist=False)
+_MMA_HOISTED = _mma_guarded(hoist=True)
+
+
+def _mm_seg_guarded(src: str) -> str:
+    """Drop the dead token-row fragments (pure work elimination)."""
+    if "uint rlive" in src:
+        return src
+    if _WBLK_ANCHOR not in src:
+        raise ValueError("_mm_seg_guarded: wblk anchor not found")
+    src = src.replace(_WBLK_ANCHOR, _GUARD + _WBLK_ANCHOR, 1)
+    if _MMA_BLOCK not in src:
+        raise ValueError("_mm_seg_guarded: mma block not found")
+    return src.replace(_MMA_BLOCK, _MMA_GUARDED, 1)
+
+
+def _mm_seg_hoisted(src: str) -> str:
+    """Guarded source + A-fragment loads issued ahead of the mma chain."""
+    if "simdgroup_half8x8 af[4]" in src:
+        return src
+    src = _mm_seg_guarded(src)
+    if _MMA_GUARDED not in src:
+        # a previously-hoisted or foreign source: nothing to do
+        return src
+    return src.replace(_MMA_GUARDED, _MMA_HOISTED, 1)
 
 
 def _mm_seg_source(k: int, cb: CodebookMode) -> str:
@@ -1740,14 +1918,21 @@ def inner_mm_seg_mlx(
         raise ValueError("in_tiles must be even")
     if int(xh_sorted.shape[0]) < n_rows + _MM_BM:
         raise ValueError("xh_sorted must be padded by one block")
-    key = (k, int(cb))
+    key = (k, int(cb), _MM_SEG_VERSION)
     kernel = _mm_seg_kernels.get(key)
     if kernel is None:
+        src = _mm_seg_source(k, cb)
+        if _MM_SEG_VERSION in ("v19d", "v19e"):
+            src = _mm_seg_hoisted(src) if _MM_SEG_VERSION == "v19e" else _mm_seg_guarded(src)
+        elif _MM_SEG_VERSION != "v19c":
+            raise ValueError(
+                f"EXL3_MM_SEG={_MM_SEG_VERSION!r} is not one of v19c/v19d/v19e"
+            )
         kernel = _mm_seg_kernels[key] = mx.fast.metal_kernel(
-            name=f"exl3_mm_seg_k{k}_cb{int(cb)}_v19c",
+            name=f"exl3_mm_seg_k{k}_cb{int(cb)}_{_MM_SEG_VERSION}",
             input_names=["xh", "trellis", "inv_perm", "blk_tab", "nbr", "dims"],
             output_names=["out"],
-            source=_mm_seg_source(k, cb),
+            source=src,
             header="#include <metal_simdgroup_matrix>\n#include <metal_stdlib>\nusing namespace metal;\n",
         )
     dims = mx.array(

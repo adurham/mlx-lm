@@ -48,10 +48,16 @@ _FUSE_HAD = os.environ.get("EXL3_FUSE_HAD", "0") == "1"
 _WCACHE = os.environ.get("EXL3_WCACHE", "0") == "1"
 
 HUGE_WEIGHT_BYTES = 64 * 1024 * 1024
-# Above this batch, decode-once (v13) + native matmul beats the fused GEMM,
-# which re-reads the trellis once per M_TILE (8) rows (measured ~64-row
-# crossover on M5 Max for 27B-scale layers).
-FUSED_GEMM_ROW_LIMIT = 64
+# Above this batch the fused GEMM (which re-reads the trellis once per M_TILE=8
+# rows) starts losing to one-dispatch decode-once + native matmul. Measured on
+# DSv4.1 rank-0 prefill shapes at 2.9 bpw (m4-1, layer 20): the crossover sits
+# between 16 and 17 rows for every real projection — at R=17 the fused path is
+# already 1.14-1.46x behind fullW and the gap grows to 1.9-2.3x by R=64
+# (the 17..64 band costs 1.4x on attn.wq_a/wq_b, 1.1-1.4x on the MLP). The
+# v20 devx kernel already covers rows <= 16, so 16 is the whole small-batch
+# band. (The old 64 was measured on M5 Max 27B shapes whose layers are far
+# wider per row; DSv4.1's 5120x512 wkv tiles amortize much sooner.)
+FUSED_GEMM_ROW_LIMIT = int(os.environ.get("EXL3_FUSED_ROW_LIMIT", "16"))
 # Don't materialize transient fp16 W beyond this (lm_head-scale layers keep
 # the striped path).
 DECODE_FULL_MAX_BYTES = 1536 * 1024 * 1024

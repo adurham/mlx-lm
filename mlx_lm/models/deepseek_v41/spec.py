@@ -118,13 +118,38 @@ class GammaPolicy:
 
 
 def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
-             adaptive: bool = True, eos_id: int = 1, policy=None):
-    """Greedy speculative decode with one host sync per round.
+             adaptive: bool = True, eos_id: int = 1, policy=None,
+             temperature: float = 0.0, top_p: float = 1.0, top_k: int = 0,
+             seed: int | None = None, sampler=None, sp=None):
+    """Speculative decode with one host sync per round.
 
     The draft is NOT evaluated on its own: its tokens feed the verify forward
-    lazily and both are read back in a single sync. Returns (tokens, stats)."""
+    lazily and both are read back in a single sync. Returns (tokens, stats).
+
+    ``temperature <= 0`` (the default) is the greedy path: argmax targets,
+    argmax drafts, no RNG, no logits gather -- byte-for-byte the behaviour this
+    function had before sampling existed.  Any ``temperature > 0`` switches to
+    proper speculative sampling in :mod:`.sampling`, which keeps the same round
+    structure and cache handling: draft tokens are drawn from the filtered
+    draft distribution and accepted with probability ``min(1, p_target/p_draft)``,
+    rejections resample from the normalised residual ``(p_target - p_draft)+``,
+    and a fully accepted round takes its bonus token from the target.  That
+    path needs the full-vocab rows the sharded head does not otherwise produce,
+    so it gathers them (see the sampling module) and returns the same keys plus
+    ``rejects`` / ``drafted`` / ``accept_rate``.
+    """
     import numpy as np
     import time
+
+    if temperature and temperature > 0.0:
+        from . import sampling as _sampling
+
+        return _sampling.spec_generate(
+            model, head, prompt_ids, max_new, gamma=gamma, adaptive=adaptive,
+            eos_id=eos_id, temperature=temperature, top_p=top_p, top_k=top_k,
+            seed=_sampling.DEFAULT_SEED if seed is None else seed,
+            sampler=sampler, policy=policy, sp=sp)
+
     taps_ids = list(model.args.dspark_target_layer_ids)
 
     def tapcat(t):

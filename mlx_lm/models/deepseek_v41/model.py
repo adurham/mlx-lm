@@ -139,6 +139,10 @@ class Model(nn.Module):
             self.set_token_map(token_map)
         # test hook: remap which source each consumer reads (negative control)
         self._break_sharing = False
+        # prefill orchestration (prefill.py): commit the chunk every N layers of
+        # a multi-row forward by evaluating (h, pre_mix). 0 disables. Set only
+        # by prefill.prefill()/warmup(); single-row forwards are never fenced.
+        self._fence_every = 0
 
     def set_token_map(self, token_map):
         self.engram_hasher = EngramHasher(self.args, token_map)
@@ -184,6 +188,12 @@ class Model(nn.Module):
         shared = SharedState()
         tap_ids = set(self.args.dspark_target_layer_ids) if return_taps else set()
         taps = {}
+        # Prefill fence (prefill.py): during a multi-row forward, commit the
+        # chunk every ``_fence_every`` layers. Same ops, same dtypes -- only the
+        # command-buffer boundaries move, so results are bit-identical to an
+        # unfenced run; the point is to bound the transient memory a chunk's
+        # lazy graph holds (indexer scores / sparse-attn gathers).
+        fence = getattr(self, "_fence_every", 0) if n > 1 else 0
         for layer in self.layers:
             if layer.engram is not None:
                 h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index])
@@ -203,6 +213,8 @@ class Model(nn.Module):
                 h, pre_mix = layer(h, pre_mix, start_pos, cache, shared)
             if _ASYNC_EVAL:
                 mx.async_eval(h, pre_mix)
+            if fence and layer.layer_id % fence == fence - 1:
+                mx.eval(h, pre_mix)
 
         h = hc_pre(h, pre_mix)                       # collapse with the last ffn_pre
         h = self.norm(h)
