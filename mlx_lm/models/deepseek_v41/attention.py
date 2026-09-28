@@ -78,6 +78,9 @@ class Attention(nn.Module):
                               self.n_groups * self.o_lora_rank, bias=False)
         self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=False)
 
+        # Tensor-parallel group; set when heads / wo_a groups / wo_b inputs
+        # hold one rank's slice (n_heads and n_groups are then per-rank).
+        self.group = None
         self.is_kv_source = layer_id in args.kv_source_layers
         self.is_index_source = layer_id in args.index_source_layers
         if self.is_kv_source:
@@ -102,7 +105,7 @@ class Attention(nn.Module):
         if self._cos is None or self._cos.shape[0] < upto:
             rd, orig_len, theta, factor, bf, bs = self._rope
             self._cos, self._sin = precompute_freqs_cis(
-                rd, max(upto, 64), orig_len, theta, factor, bf, bs)
+                rd, max(upto * 2, 4096), orig_len, theta, factor, bf, bs)
         return self._cos, self._sin
 
     def __call__(self, x: mx.array, start_pos: int, cache, shared) -> mx.array:
@@ -181,4 +184,7 @@ class Attention(nn.Module):
             o = mx.einsum("bsgd,grd->bsgr", o.astype(mx.float32), wo_a.astype(mx.float32))
         else:
             o = self.wo_a(o)                                     # grouped module -> [b, s, g, r]
-        return self.wo_b(o.reshape(bsz, n, -1).astype(x.dtype))
+        out = self.wo_b(o.reshape(bsz, n, -1).astype(x.dtype))
+        if self.group is not None:                   # heads sharded: sum partials
+            out = mx.distributed.all_sum(out, group=self.group)
+        return out

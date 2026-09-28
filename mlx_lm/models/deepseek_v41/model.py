@@ -32,6 +32,14 @@ from .engram import Engram, EngramHasher
 from .hyper_connections import hc_mixes, hc_post, hc_pre, make_identity_pre_mix
 from .layers import RMSNorm
 from .moe import MoE
+from .hc_fused import hc_expand, mixes_and_collapse
+
+import os
+
+# Fused hyper-connection kernels (hc_fused.py). "0" selects the reference ops.
+_HC_FUSED = os.environ.get("DSV41_HC_FUSED", "1") == "1"
+# Queue each block's GPU work as soon as it is built (same results, earlier start).
+_ASYNC_EVAL = os.environ.get("DSV41_ASYNC_EVAL", "1") == "1"
 
 
 class SharedState:
@@ -78,6 +86,8 @@ class Block(nn.Module):
                  cache, shared):
         """x [b, s, hc, d]; pre_mix [b, s, hc] from the previous sub-layer.
         Returns (x, ffn_pre) — ffn_pre feeds the next layer (or the head)."""
+        if _HC_FUSED and self.hc_mult == 4:
+            return self._fused_call(x, pre_mix, start_pos, cache, shared)
         residual = x
         attn_pre, attn_post, attn_comb = hc_mixes(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
@@ -93,6 +103,19 @@ class Block(nn.Module):
         h = hc_pre(x, attn_pre)
         h = self.ffn(self.ffn_norm(h))
         x = hc_post(h, residual, ffn_post, ffn_comb)
+        return x, ffn_pre
+
+    def _fused_call(self, x, pre_mix, start_pos, cache, shared):
+        h, attn_pre, attn_post, attn_comb = mixes_and_collapse(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, pre_mix,
+            self.hc_iters, self.norm_eps, self.hc_eps)
+        h = self.attn(self.attn_norm(h), start_pos, cache, shared)
+        x = hc_expand(h, x, attn_post, attn_comb)
+        h, ffn_pre, ffn_post, ffn_comb = mixes_and_collapse(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, attn_pre,
+            self.hc_iters, self.norm_eps, self.hc_eps)
+        h = self.ffn(self.ffn_norm(h))
+        x = hc_expand(h, x, ffn_post, ffn_comb)
         return x, ffn_pre
 
 
@@ -141,7 +164,13 @@ class Model(nn.Module):
         if self.engram_hasher is not None:
             ids_np = np.array(input_ids, dtype=np.int64)
             hashes = self.engram_hasher(ids_np, start_pos, cache.engram_ids)
-            hashes = mx.array(hashes)                # [b, n, n_engram_layers, cols]
+            if getattr(self, "_host_engram", False):
+                for layer in self.layers:
+                    emb = getattr(layer.engram, "embed", None) if layer.engram is not None else None
+                    if hasattr(emb, "prefetch"):
+                        emb.prefetch(hashes[:, :, layer.engram.layer_hash_index])
+            else:
+                hashes = mx.array(hashes)            # [b, n, n_engram_layers, cols]
         elif self.args.engram_layer_ids:
             raise RuntimeError(
                 "model has engram layers but no token map — call "
@@ -167,6 +196,8 @@ class Model(nn.Module):
                 h, pre_mix = layer(h, pre_mix, start_pos, cache, shared_use)
             else:
                 h, pre_mix = layer(h, pre_mix, start_pos, cache, shared)
+            if _ASYNC_EVAL:
+                mx.async_eval(h, pre_mix)
             if layer.layer_id in tap_ids:
                 taps[layer.layer_id] = h.mean(axis=2)
 

@@ -116,6 +116,7 @@ class MoE(nn.Module):
         # Tensor-parallel group. Set when the routed experts hold one rank's
         # intermediate-width slice; the shared expert stays replicated.
         self.group = None
+        self.shared_sharded = False
 
     def __call__(self, x: mx.array) -> mx.array:
         shape = x.shape
@@ -123,7 +124,12 @@ class MoE(nn.Module):
         weights, indices = self.gate(xf)
         y = self.experts(xf, indices)                            # [tokens, topk, dim]
         y = mx.sum(y.astype(mx.float32) * weights[..., None], axis=-2)
-        if self.group is not None:
+        if self.group is not None and self.shared_sharded:
+            y = y + self.shared_experts(xf).astype(mx.float32)
             y = mx.distributed.all_sum(y, group=self.group)
-        y = y + self.shared_experts(xf).astype(mx.float32)
+        elif self.group is not None:
+            y = mx.distributed.all_sum(y, group=self.group)
+            y = y + self.shared_experts(xf).astype(mx.float32)
+        else:
+            y = y + self.shared_experts(xf).astype(mx.float32)
         return y.reshape(shape).astype(x.dtype)

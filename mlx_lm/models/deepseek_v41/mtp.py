@@ -118,7 +118,7 @@ class DraftAttention(nn.Module):
         if self._cos is None or self._cos.shape[0] < upto:
             rd, orig_len, theta, factor, bf, bs = self._rope
             self._cos, self._sin = precompute_freqs_cis(
-                rd, max(upto, 256), orig_len, theta, factor, bf, bs)
+                rd, max(upto * 2, 4096), orig_len, theta, factor, bf, bs)
         return self._cos, self._sin
 
     def _kv(self, x: mx.array, start: int):
