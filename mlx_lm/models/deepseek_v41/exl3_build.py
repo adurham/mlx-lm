@@ -33,7 +33,7 @@ class Exl3Proj(nn.Module):
 
     def __init__(self, lin):
         super().__init__()
-        self._lin = lin
+        self._lin = lin.release_source()
 
     def __call__(self, x: mx.array) -> mx.array:
         return self._lin(x).astype(x.dtype)
@@ -44,7 +44,7 @@ class Exl3GroupedProj(nn.Module):
 
     def __init__(self, lins):
         super().__init__()
-        self._lins = list(lins)
+        self._lins = [lin.release_source() for lin in lins]
 
     def __call__(self, x: mx.array) -> mx.array:
         outs = [lin(x[..., g, :]) for g, lin in enumerate(self._lins)]
