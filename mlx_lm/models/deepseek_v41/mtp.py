@@ -311,7 +311,8 @@ class DSparkHead(nn.Module):
             x, pre_mix = stage(x, pre_mix, c)
         x = hc_pre(x, pre_mix)            # collapse with the last stage's ffn_pre
 
-        base_logits = head(self.norm(x))  # [b, bs, V]
+        sharded = getattr(self, "vocab_sharded", False) and hasattr(head, "combine_argmax")
+        base_logits = head.local(self.norm(x)) if sharded else head(self.norm(x))
 
         # sequential first-order Markov sampling left -> right
         prev = anchor_tokens
@@ -319,7 +320,10 @@ class DSparkHead(nn.Module):
         for k in range(bs):
             m_emb = self.markov_embed(prev)
             step_logits = base_logits[:, k, :] + self.markov_head(m_emb)
-            nxt = mx.argmax(step_logits, axis=-1)
+            if sharded:
+                nxt = head.combine_argmax(step_logits.astype(mx.float32))
+            else:
+                nxt = mx.argmax(step_logits, axis=-1)
             toks.append(nxt)
             m_embeds.append(m_emb[:, None, :])
             prev = nxt

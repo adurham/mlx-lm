@@ -119,3 +119,11 @@ def fake_quant_fp4_e4m3(x: mx.array, block: int = 16) -> mx.array:
     s = mx.from_fp8(mx.to_fp8(amax / FP4_MAX), mx.float32)
     q = _e2m1_round(mx.clip(xb / s, -FP4_MAX, FP4_MAX)) * s
     return q.reshape(shape).astype(dtype)
+
+
+import os as _os
+
+if _os.environ.get("DSV41_COMPILE_OPS", "1") == "1":
+    fake_quant_fp8_ue8m0 = mx.compile(fake_quant_fp8_ue8m0)
+    fake_quant_fp4_ue8m0 = mx.compile(fake_quant_fp4_ue8m0)
+    fake_quant_fp4_e4m3 = mx.compile(fake_quant_fp4_e4m3)

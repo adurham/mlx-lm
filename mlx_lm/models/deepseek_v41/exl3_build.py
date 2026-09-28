@@ -293,8 +293,30 @@ class ShardedHead(nn.Module):
         super().__init__()
         self._p = Exl3Proj(lin)
         self._group = group
+        self._rank, self._world = rank, world
         self._lo = rank * (vocab // world)
         self._vocab = vocab
+
+    def local(self, h: mx.array) -> mx.array:
+        """This rank's vocab slice of the logits, fp32."""
+        return self._p(h).astype(mx.float32)
+
+    def combine_argmax(self, y: mx.array) -> mx.array:
+        """Exact global argmax from per-rank slices: each rank contributes its
+        (max, index) pair; ties go to the lowest vocab index, same as
+        ``mx.argmax`` over the full row."""
+        shp = y.shape[:-1]
+        flat = y.reshape(-1, y.shape[-1])
+        pair = mx.stack([mx.max(flat, axis=-1),
+                         mx.argmax(flat, axis=-1).astype(mx.float32) + self._lo], axis=-1)
+        buf = mx.pad(pair[None], [(self._rank, self._world - self._rank - 1), (0, 0), (0, 0)])
+        allp = mx.distributed.all_sum(buf, group=self._group)          # [world, rows, 2]
+        best = mx.argmax(allp[..., 0], axis=0)                          # first max = lowest idx
+        idx = mx.take_along_axis(allp[..., 1], best[None], axis=0)[0]
+        return idx.astype(mx.int32).reshape(shp)
+
+    def argmax(self, h: mx.array) -> mx.array:
+        return self.combine_argmax(self.local(h))
 
     def __call__(self, h: mx.array) -> mx.array:
         y = self._p(h).astype(mx.float32)
@@ -305,6 +327,7 @@ class ShardedHead(nn.Module):
 
 _SHARD_SHARED = os.environ.get("DSV41_TP_SHARED", "1") == "1"
 _SHARD_ATTN = os.environ.get("DSV41_TP_ATTN", "1") == "1"
+_DRAFT_SHARD = os.environ.get("DSV41_DRAFT_SHARD", "1") == "1"
 _SHARD_HEAD = os.environ.get("DSV41_TP_HEAD", "1") == "1"
 
 
@@ -587,5 +610,11 @@ def build_mtp(ck: Exl3Checkpoint, args: ModelArgs, *, rank: int = 0, world: int 
     items = [(t, _plain(ck, n, mx.float32 if any(f in t for f in fp32) else None))
              for t, n in have.items()]
     head.load_weights(items, strict=False)
+    if world > 1 and _SHARD_HEAD and group is not None and _DRAFT_SHARD:
+        v = args.vocab_size // world
+        w = head.markov_head.weight[rank * v:(rank + 1) * v]
+        head.markov_head = nn.Linear(w.shape[1], w.shape[0], bias=False)
+        head.markov_head.weight = mx.contiguous(w)
+        head.vocab_sharded = True
     mx.eval([v for _, v in items])
     return head

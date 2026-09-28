@@ -148,7 +148,8 @@ class Model(nn.Module):
         return ModelCache(self.args, bsz, max_seq_len, dtype)
 
     def __call__(self, input_ids: mx.array, cache: ModelCache,
-                 last_logit_only: bool = False, return_taps: bool = False):
+                 last_logit_only: bool = False, return_taps: bool = False,
+                 argmax: bool = False):
         """input_ids [b, n] continue the sequence at cache.offset. Advances the cache.
 
         ``return_taps`` additionally returns ``{layer_id: hc_mean_hidden}`` for
@@ -207,7 +208,12 @@ class Model(nn.Module):
         h = self.norm(h)
         if last_logit_only:
             h = h[:, -1:]
-        logits = self.head(h.astype(mx.float32))   # fp32 logits, as the reference
+        if argmax and hasattr(self.head, "argmax"):
+            logits = self.head.argmax(h.astype(mx.float32))   # token ids [b, n]
+        elif argmax:
+            logits = mx.argmax(self.head(h.astype(mx.float32)), axis=-1).astype(mx.int32)
+        else:
+            logits = self.head(h.astype(mx.float32))   # fp32 logits, as the reference
         cache.offset = start_pos + n
         if return_taps:
             return logits, taps

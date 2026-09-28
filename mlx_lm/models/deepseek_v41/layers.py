@@ -15,8 +15,13 @@ from __future__ import annotations
 
 import math
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
+
+# Compile the small elementwise helpers (same ops, fewer launches; bit-exact).
+_COMPILE = os.environ.get("DSV41_COMPILE_OPS", "1") == "1"
 
 
 class RMSNorm(nn.Module):
@@ -28,11 +33,17 @@ class RMSNorm(nn.Module):
         self.weight = mx.ones((dim,), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        dtype = x.dtype
-        xf = x.astype(mx.float32)
-        var = mx.mean(mx.square(xf), axis=-1, keepdims=True)
-        xf = xf * mx.rsqrt(var + self.eps)
-        return (self.weight * xf).astype(dtype)
+        if _COMPILE:
+            return _rms_c(x, self.weight, self.eps)
+        return _rms(x, self.weight, self.eps)
+
+
+def _rms(x, weight, eps):
+    dtype = x.dtype
+    xf = x.astype(mx.float32)
+    var = mx.mean(mx.square(xf), axis=-1, keepdims=True)
+    xf = xf * mx.rsqrt(var + eps)
+    return (weight * xf).astype(dtype)
 
 
 def precompute_freqs_cis(dim: int, seqlen: int, original_seq_len: int, base: float,
@@ -94,3 +105,9 @@ def clamped_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
         u = mx.clip(u, -limit, limit)
         g = mx.minimum(g, limit)
     return (g * mx.sigmoid(g)) * u
+
+
+_rms_c = mx.compile(_rms)
+if _COMPILE:
+    _rope_tail_ref = rope_tail
+    rope_tail = mx.compile(_rope_tail_ref)
