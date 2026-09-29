@@ -97,6 +97,7 @@ _PV32 = os.environ.get("DSV41_SPARSE_PV32", "1") == "1"
 # 1.3 GB live). This is the knob that actually delivers the bounded-memory
 # property; tile_bytes() alone does not.
 _FENCE = os.environ.get("DSV41_SPARSE_FENCE", "qtile")
+_FENCE_MIN_ROWS = int(os.environ.get("DSV41_SPARSE_FENCE_MIN_ROWS", "16"))
 # Ceiling on any SINGLE intermediate a (query, key) tile may hold, in MB: the
 # gathered K/V tile, the fp32 logits, the softmax weights or the fp32 output
 # accumulator. The tile plan shrinks the key tile and then the query tile until
@@ -223,6 +224,12 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
     if kv.dtype != wdtype:
         kv = kv.astype(wdtype)
     qt, kt = plan_tiles(h, d, kdim, chunk, wdtype)
+    # The fence bounds prefill memory (many query tiles live at once). A decode
+    # or verify call (m <= _FENCE_MIN_ROWS, one small tile) has nothing to bound,
+    # and an mx.eval here would force a host sync in EVERY layer of every decode
+    # step, defeating the per-layer async_eval pipeline (measured on the full
+    # two-node model: ~124 vs ~110 ms per spec round).
+    fence_ok = m > _FENCE_MIN_ROWS
     sink = attn_sink.astype(mx.float32).reshape(1, h, 1)
 
     outs = []
@@ -242,11 +249,11 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
                 fn = _body(_tile_step, False, qc, kvc, wdtype)
                 m_run, l_run, acc = fn(qc, icb, kvc, m_run, l_run, acc,
                                        softmax_scale)
-            if _FENCE == "ktile":
+            if _FENCE == "ktile" and fence_ok:
                 mx.eval(m_run, l_run, acc)
         assert acc is not None and l_run is not None
         out = (acc / l_run).astype(q.dtype)
-        if _FENCE in ("qtile", "ktile"):
+        if _FENCE in ("qtile", "ktile") and fence_ok:
             # Evaluates this query tile's state and output before the next tile
             # is built, so only one tile's intermediates are ever live.
             mx.eval(out)

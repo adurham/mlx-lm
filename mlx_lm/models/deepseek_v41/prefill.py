@@ -109,7 +109,9 @@ def _as_batch(ids) -> mx.array:
 def prefill(model, ids, cache, *, chunk: int | None = None,
             long_chunk: int | None = None, long_threshold: int | None = None,
             fence_every: int | None = None, async_depth: int | None = None,
-            clear_cache_every: int | None = None, last_logit_only: bool = True,
+            clear_cache_every: int | None = None, final_clear: bool = True,
+            prime_decode: bool | None = None,
+            last_logit_only: bool = True,
             argmax: bool = False, return_taps: bool = False, taps_out=None,
             progress=None):
     """Append ``ids`` to ``cache`` in fenced, size-adaptive chunks.
@@ -195,11 +197,133 @@ def prefill(model, ids, cache, *, chunk: int | None = None,
         # materialised (the caller may read any of them on the host).
         while pending:
             mx.eval(*pending.popleft())
+    if final_clear and nchunks:
+        # Hand the decoder a clean pool. The first decode step allocates its own
+        # (context-sized) transients; leaving the pool full of prefill-shaped
+        # tiles makes that step pay fresh device allocations for nothing
+        # (measured: 130-270 misses, pW9/pW18). Cheap (~10 ms) and it keeps the
+        # boundary reproducible.
+        mx.clear_cache()
+    if prime_decode is None:
+        prime_decode = os.environ.get("DSV41_DECODE_PRIME", "1") == "1"
+    if prime_decode:
+        # Move the one-time post-prefill first-decode-step cost into the
+        # boundary (measured 10.7x -> 1.01x of steady state at 30 layers/16K,
+        # pW26). Semantically a no-op: the probe forward's cache writes are
+        # rolled back exactly and its outputs discarded.
+        decode_prime(model, cache, enabled=True)
     if taps is not None:
         mx.eval(out, *taps.values())
         return out, taps
     mx.eval(out)
     return out
+
+
+def decode_prime(model, cache, *, enabled: bool = True) -> float:
+    """Absorb the post-prefill first-decode-step cost at the prefill boundary.
+
+    Returns seconds spent (the absorbed cost).
+
+    Measured root cause (pW18-pW25, 2026-09-29, single-node layer subsets):
+
+    * After a long prefill the FIRST 1-row decode step costs 10-40x steady
+      state *on the host*, while GPU time and eval are flat (eval ~3 ms,
+      ``mx.metal.gpu_time_ns()`` 0) and every ``mx.compile`` key is already warm
+      from ``warmup()``. cProfile at 30 layers / 16K: 530 of 549 ms sits in
+      ``sparse_attention.sparse_attn`` -- its per-layer ``mx.eval(out)`` fence,
+      i.e. the first full-depth decode flush after the prefill, not per-shape
+      work (same call count as steady state).
+    * It is a ONE-TIME host event per prefill, not a per-step cost: repeating
+      the identical step immediately after a cache rollback costs steady-state
+      time, and a throwaway decode step at the boundary moves the whole premium
+      into the boundary call (pW24 arm D: boundary 573 ms, then step 0 = 50 ms,
+      ratio 1.01x).
+    * It scales with the built model's live footprint: ~15 ms at 8 layers/23 GB,
+      ~45 at 20/55 GB, ~570 at 30/80 GB (so ~24x steady state, in the same
+      direction as the 1.3-1.9 s two-node observation at 105 GB).
+    * Ruled out by measurement: compile/JIT (all keys warm; re-tracing is ~2 ms),
+      allocator pool misses (195 misses price out at 0.032 ms each = ~6 ms;
+      priming exact sizes, generic sizes, with/without a pool clear, all
+      neutral-to-worse), Python GC (0 collections inside the slow step;
+      ``gc.disable()`` no help), page faults/compression (all counters +0).
+
+    This function moves that cost into the prefill boundary where it belongs, by
+    running one throwaway decode step and rolling the cache back exactly. After
+    it, the first real decode step is steady state (measured 1.01x, pW24 arm D).
+
+    Bit-exactness: the probe step writes only position-addressed cache state
+    (window ring slot ``offset % window``, compressed-KV slot, index-key slot)
+    and the compressor open-group carry for one position; the rollback used
+    here (``spec.snap``/``stashes``/``rollback``) is the same machinery the
+    speculative decoder uses to reject drafts, restores the exact pre-step
+    carry, and does not touch the ring (position-addressed: position ``offset``
+    is rewritten by the next real write before it can be read). The probe's own
+    logits are discarded. ``cache.offset`` is unchanged.
+
+    ``enabled=False`` (or an unbuilt/None layer set) returns 0.0 without
+    running the probe. Set ``DSV41_DECODE_PRIME=0`` to disable globally.
+    """
+    if not enabled or not os.environ.get("DSV41_DECODE_PRIME", "1") == "1":
+        return 0.0
+    import time as _t
+    t0 = _t.perf_counter()
+    pos = int(cache.offset)
+    live = [lc for lc in cache.layers if lc.comp_state is not None]
+    if pos <= 0 or not live:
+        return 0.0
+    # Exact pre-probe snapshot of every mutable carry the probe can touch.
+    # (spec.snap only saves the rows needed by a draft rollback; here we want
+    # the full buffer back, so the restore cannot depend on overwrite order.)
+    saved = []
+    for lc in live:
+        cs = lc.comp_state
+        saved.append((cs,
+                      mx.array(cs.kv_state), mx.array(cs.score_state),
+                      cs.chunk_kv, cs.chunk_score, cs.chunk_start))
+    # The probe also writes position ``pos`` into position-addressed buffers:
+    # the window ring slot ``pos % window`` (which aliases live position
+    # ``pos - window``) and, when a group closes, one compressed-KV / index-key
+    # row. The next real step rewrites those slots before reading them, so
+    # decode is unaffected, but a session checkpoint taken at this boundary
+    # would capture the probe's rows. Save and restore them so the boundary
+    # state is bitwise the un-primed state.
+    slots = []
+    for lc in cache.layers:
+        w = int(lc.window)
+        ring = (w, mx.array(lc.win_kv[:, pos % w])) if w > 0 else None
+        rows = []
+        for name in ("comp_kv", "index_k"):
+            buf = getattr(lc, name, None)
+            r = int(lc.ratio or 0)
+            if buf is not None and r > 0:
+                j = pos // r
+                if j < buf.shape[1]:
+                    rows.append((name, j, mx.array(buf[:, j])))
+        slots.append((lc, ring, rows))
+    mx.eval([t[1][1] for t in slots if t[1] is not None]
+            + [r[2] for t in slots for r in t[2]])
+    probe = mx.zeros((1, 1), dtype=mx.int32)     # any id; output is discarded
+    out = model(probe, cache, last_logit_only=True, argmax=True)
+    mx.eval(out)
+    for cs, kv, sc, ck, csc, cst in saved:
+        cs.kv_state[:] = kv
+        cs.score_state[:] = sc
+        cs.chunk_kv, cs.chunk_score, cs.chunk_start = ck, csc, cst
+    for lc, ring, rows in slots:
+        if ring is not None:
+            lc.win_kv[:, pos % ring[0]] = ring[1]
+        for name, j, row in rows:
+            getattr(lc, name)[:, j] = row
+    cache.offset = pos
+    # materialise the restored carry so the next forward cannot see a pending
+    # write from the probe
+    mx.eval([c[0].kv_state for c in saved] + [c[0].score_state for c in saved]
+            + [lc.win_kv for lc, _, _ in slots]
+            + [getattr(lc, n) for lc, _, rows in slots for n, _, _ in rows])
+    if int(cache.offset) != pos:
+        raise RuntimeError(
+            f"decode_prime: cache offset moved {pos} -> {cache.offset}")
+    return _t.perf_counter() - t0
 
 
 def warmup(model, *, chunk: int | None = None, long_chunk: int | None = None,

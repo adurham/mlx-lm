@@ -141,8 +141,9 @@ def plan_step(pos: int, remaining: int, *, chunk: int, long_chunk: int,
 
 def chunked_prefill(model, ids, cache, *, chunk=None, long_chunk=None,
                     long_threshold=None, last_logit_only=True, argmax=False,
-                    return_taps=False, progress=None, fence_every=None,
-                    async_depth=None, clear_cache_every=CLEAR_EVERY, **rest):
+                    return_taps=False, taps_out=None, progress=None,
+                    fence_every=None, async_depth=None,
+                    clear_cache_every=CLEAR_EVERY, **rest):
     """Plain chunked ``model(...)`` loop.
 
     Drop-in for ``prefill.prefill`` (stream C): same keyword names, same
@@ -151,6 +152,11 @@ def chunked_prefill(model, ids, cache, *, chunk=None, long_chunk=None,
     ``async_depth`` are accepted and ignored -- the fenced driver in
     ``prefill.py`` is the real implementation of those; unknown keywords are
     ignored so a newer driver signature cannot break the session path.
+
+    ``taps_out``: pass a list to collect the per-chunk DSpark tap dicts in
+    position order (the whole-prompt tap stream for the draft head's context
+    feed); ``return_taps`` only covers the final chunk. Same contract as
+    ``prefill.prefill``.
     """
     step_base = BASE_CHUNK if chunk is None else int(chunk)
     step_long = LONG_CHUNK if long_chunk is None else int(long_chunk)
@@ -160,6 +166,7 @@ def chunked_prefill(model, ids, cache, *, chunk=None, long_chunk=None,
     if n == 0:
         raise ValueError("chunked_prefill: empty ids")
 
+    want_taps = return_taps or taps_out is not None
     done, chunks, out, taps = 0, 0, None, None
     t0 = time.perf_counter()
     while done < n:
@@ -169,23 +176,27 @@ def chunked_prefill(model, ids, cache, *, chunk=None, long_chunk=None,
         last = done + step == n
         if last:
             res = model(piece, cache, last_logit_only=last_logit_only,
-                        return_taps=return_taps, argmax=argmax)
-            if isinstance(res, tuple):
-                out, taps = res
-            else:
-                out = res
+                        return_taps=want_taps, argmax=argmax)
         else:
             # intermediate chunks only need to be committed; one argmax row
             # through the head is the cheapest way to hand the queue a handle
-            res = model(piece, cache, last_logit_only=True, argmax=True)
-        mx.eval(*([out, *taps.values()] if taps is not None else [out]))
+            res = model(piece, cache, last_logit_only=True,
+                        return_taps=want_taps, argmax=True)
+        handle, chunk_taps = res if isinstance(res, tuple) else (res, None)
+        if taps_out is not None and chunk_taps is not None:
+            taps_out.append(chunk_taps)
+        mx.eval(handle, *(chunk_taps.values() if chunk_taps else []))
+        if last:
+            out, taps = handle, chunk_taps
         done += step
         chunks += 1
         if progress is not None:
             progress(chunks, done, time.perf_counter() - t0)
         if clear_cache_every and done < n and chunks % clear_cache_every == 0:
             mx.clear_cache()
-    return (out, taps) if taps is not None else out
+    if return_taps:
+        return (out, taps) if taps is not None else (out, {})
+    return out
 
 
 def resolve_prefill_fn(fn=None):
@@ -302,14 +313,21 @@ class SessionCache:
                   "long_threshold": long_threshold,
                   "clear_cache_every": clear_cache_every, "progress": progress}
         try:
-            accepted = set(inspect.signature(self._prefill).parameters)
+            params = inspect.signature(self._prefill).parameters
+            accepted = set(params)
             if any(p.kind is inspect.Parameter.VAR_KEYWORD
-                   for p in inspect.signature(self._prefill).parameters.values()):
+                   for p in params.values()):
                 accepted |= wanted.keys()
         except (TypeError, ValueError):
             accepted = set(wanted)
         self.prefill_kwargs = {k: v for k, v in wanted.items()
                                if v is not None and k in accepted}
+        # capabilities of the installed driver (used by the planned-feed path)
+        self._chunk_supported = ("chunk" in accepted
+                                 and "long_chunk" in accepted
+                                 and "long_threshold" in accepted)
+        self._taps_supported = "taps_out" in accepted
+        self._prime_supported = "prime_decode" in accepted
         self.snapshot()                                  # the pos-0 boundary
 
     # ---- introspection ----
@@ -451,11 +469,56 @@ class SessionCache:
 
     # ---- feeding ----
 
-    def _prefill_call(self, ids, *, argmax, return_taps):
+    def _prefill_call(self, ids, *, argmax, return_taps, taps_out=None, extra=None):
         kw = dict(self.prefill_kwargs)
         kw["argmax"] = argmax
         kw["return_taps"] = return_taps
+        if taps_out is not None and self._taps_supported:
+            kw["taps_out"] = taps_out
+        if extra:
+            kw.update(extra)
         return self._prefill(self.model, ids, self.cache, **kw)
+
+    def _prefill_planned(self, ids, *, argmax, taps_out=None, plan=None):
+        """Feed ``ids`` in the explicit piece sizes ``plan`` (driver-agnostic).
+
+        Each piece is one driver call whose chunking is forced to the piece size
+        (``chunk=long_chunk=size``, threshold disabled), so the body sees exactly
+        the chunk boundaries in ``plan`` whichever driver is installed. That is
+        what lets a cold run reproduce a reused-prefix run's op sequence and
+        compare bitwise. Pieces shorter than the plan's remaining budget are fed
+        with the driver's own policy.
+        """
+        done, out = 0, None
+        n = int(len(ids))
+        for size in plan:
+            size = int(size)
+            if size <= 0:
+                continue
+            stop = min(done + size, n)
+            piece = ids[done:stop]
+            last = stop == n
+            ex = None
+            if self._chunk_supported:
+                ex = {"chunk": int(piece.shape[0]), "long_chunk": int(piece.shape[0]),
+                      "long_threshold": 10 ** 9}
+                # Only the turn's final piece is followed by decode; priming the
+                # first decode step (prefill.decode_prime) after an intermediate
+                # piece is wasted work and inserts a probe forward between pieces.
+                if self._prime_supported:
+                    ex["prime_decode"] = bool(last)
+            r = self._prefill_call(piece, argmax=argmax if last else True,
+                                   return_taps=False, taps_out=taps_out, extra=ex)
+            if last:
+                out = r
+            done = stop
+            if done >= n:
+                break
+        if done < n:                       # plan ran out: let the driver finish
+            rest = ids[done:]
+            out = self._prefill_call(rest, argmax=argmax, return_taps=False,
+                                     taps_out=taps_out)
+        return out
 
     def append_tokens(self, ids, *, argmax: bool = False, return_taps: bool = False):
         """Feed tokens continuing the cached sequence. No boundary bookkeeping.
@@ -472,8 +535,26 @@ class SessionCache:
         self.last_output = out
         return out
 
+    def mark_seen(self, ids) -> int:
+        """Book-keeping-only append: the rows were already fed to the cache.
+
+        Lets a caller (``serve.Session``, a draft-head context feed) keep the
+        session's token history in step with a forward it drove itself, without
+        running another prefill. Returns the new offset.
+        """
+        ids = _as_ids(ids)
+        if ids.shape[0] == 0:
+            return self.offset
+        self._ids = np.concatenate([self._ids, ids])
+        if self._ids.shape[0] != self.offset:
+            raise ValueError(
+                f"mark_seen would desync history ({self._ids.shape[0]}) from the "
+                f"cache offset ({self.offset}); the rows were not actually fed")
+        return self.offset
+
     def append_turn(self, ids, *, argmax: bool = False, return_taps: bool = False,
-                    checkpoint: bool = True) -> TurnResult:
+                    checkpoint: bool = True, taps_out=None,
+                    chunk_plan=None) -> TurnResult:
         """Feed a whole turn's token list, prefilling only what is new.
 
         ``ids`` is the conversation's token list for this turn; the cached
@@ -481,6 +562,13 @@ class SessionCache:
         prefix and only ``ids[boundary:]`` is prefilled. The turn end is
         checkpointed (``checkpoint=False`` for streaming partial turns, where
         the next call continues the same turn).
+
+        ``taps_out`` -- optional list; the delta's per-chunk DSpark tap dicts
+        are appended in position order (a driver that supports it; the plain
+        driver in this module does too). ``chunk_plan`` -- optional sequence of
+        piece sizes; the delta is fed in exactly those pieces (see
+        :meth:`_prefill_planned`), which is what makes a reused-prefix run
+        bitwise comparable to a cold run replaying the same boundaries.
         """
         ids = _as_ids(ids)
         if ids.shape[0] == 0:
@@ -497,8 +585,16 @@ class SessionCache:
         if delta.shape[0]:
             self._check_capacity(int(delta.shape[0]))
             try:
-                out = self._prefill_call(delta, argmax=argmax,
-                                         return_taps=return_taps)
+                if chunk_plan is not None:
+                    out = self._prefill_planned(delta, argmax=argmax,
+                                                taps_out=taps_out,
+                                                plan=chunk_plan)
+                    if return_taps:
+                        out = (out, {})
+                else:
+                    out = self._prefill_call(delta, argmax=argmax,
+                                             return_taps=return_taps,
+                                             taps_out=taps_out)
             except Exception:
                 # leave a cancelable cache behind: the tokens actually fed
                 self._ids = np.concatenate([self._ids, delta[:self.cache.offset - boundary]])

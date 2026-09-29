@@ -154,6 +154,21 @@ class Model(nn.Module):
     def __call__(self, input_ids: mx.array, cache: ModelCache,
                  last_logit_only: bool = False, return_taps: bool = False,
                  argmax: bool = False):
+        # First calls per input shape host-sync every collective, so a rank
+        # still JIT-building kernels for the shape cannot leave its peer's
+        # GPU waiting inside a command buffer past the Metal watchdog
+        # (collective.py). Keyed on (rows, flags); decode/verify shapes warm
+        # after 2 calls each.
+        from . import collective as _coll
+        key = ("body", int(input_ids.shape[1]), bool(last_logit_only),
+               bool(return_taps), bool(argmax))
+        with _coll.warm_guard(key):
+            return self._forward(input_ids, cache, last_logit_only=last_logit_only,
+                                 return_taps=return_taps, argmax=argmax)
+
+    def _forward(self, input_ids: mx.array, cache: ModelCache,
+                 last_logit_only: bool = False, return_taps: bool = False,
+                 argmax: bool = False):
         """input_ids [b, n] continue the sequence at cache.offset. Advances the cache.
 
         ``return_taps`` additionally returns ``{layer_id: hc_mean_hidden}`` for

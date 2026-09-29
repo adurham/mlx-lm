@@ -62,6 +62,12 @@ def rollback(cache, sn, target: int, st) -> None:
     for lc, sv, stash in zip(cache.layers, saved, st):
         if lc.comp_state is None:
             continue
+        # A layer whose compressor did not run for this chunk has no stashed
+        # rows, so its carry is untouched and there is nothing to rebuild. This
+        # only happens on a PARTIAL build (out-of-subset kv source never
+        # stashes); on the full model every source runs every forward. (ws2/U)
+        if stash[0] is None:
+            continue
         _rebuild(lc.comp_state, lc.ratio, chunk_start, target, sv, stash)
 
 
@@ -120,7 +126,8 @@ class GammaPolicy:
 def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
              adaptive: bool = True, eos_id: int = 1, policy=None,
              temperature: float = 0.0, top_p: float = 1.0, top_k: int = 0,
-             seed: int | None = None, sampler=None, sp=None):
+             seed: int | None = None, sampler=None, sp=None, cache=None,
+             cache_state=None, cache_update=None, anchor=None):
     """Speculative decode with one host sync per round.
 
     The draft is NOT evaluated on its own: its tokens feed the verify forward
@@ -137,6 +144,28 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
     path needs the full-vocab rows the sharded head does not otherwise produce,
     so it gathers them (see the sampling module) and returns the same keys plus
     ``rejects`` / ``drafted`` / ``accept_rate``.
+
+    CONTINUING AN EXISTING SESSION (``cache=``)
+    -------------------------------------------
+    Pass the live ``ModelCache`` that already holds the prompt prefix
+    (``session_cache.SessionCache.cache``; see ``serve.Session``) together with:
+
+    * ``anchor`` -- the token id to continue from. It must be the argmax the
+      caller's own prefill returned for the last row it fed, i.e. the token
+      that sits at ``cache.offset``'s *previous* position; this call feeds the
+      anchor row itself as the first verify row (exactly as the fresh path
+      feeds the prompt's last-row prediction).
+    * ``cache_state`` -- the draft head's window caches (``head.make_cache(1)``)
+      already fed the context taps, i.e. with ``n_ctx == cache.offset``.
+    * ``cache_update`` -- any object with ``append_tokens(ids)`` /
+      ``mark_seen(ids)``; every row fed to the cache is reported there, so a
+      ``SessionCache``'s token history tracks the cache exactly across a
+      cancelled or completed turn.
+
+    Contract: ``prompt_ids`` rows are prefilled first (empty when the caller
+    has already fed them), the prefix is never re-fed, the cache is left at the
+    last committed token's position, and no rewind happens on exit. Stats gain
+    ``anchor``/``cache_offset`` keys on this path.
     """
     import numpy as np
     import time
@@ -144,6 +173,12 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
     if temperature and temperature > 0.0:
         from . import sampling as _sampling
 
+        if cache is not None:
+            raise NotImplementedError(
+                "session reuse (cache=) is implemented for the greedy path; the "
+                "sampling loop (sampling.spec_generate) does not take a live "
+                "cache yet -- use serve.Session(..., greedy) or the sampling "
+                "thread's follow-up")
         return _sampling.spec_generate(
             model, head, prompt_ids, max_new, gamma=gamma, adaptive=adaptive,
             eos_id=eos_id, temperature=temperature, top_p=top_p, top_k=top_k,
@@ -155,20 +190,39 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
     def tapcat(t):
         return mx.concatenate([t[L] for L in taps_ids], axis=-1)
 
-    cache = model.make_cache(1, max_seq_len=len(prompt_ids) + max_new + 16)
-    am, taps = model(mx.array([prompt_ids]), cache, last_logit_only=True,
-                     return_taps=True, argmax=True)
-    dsc = head.make_cache(1)
-    head.append_ctx(tapcat(taps), dsc)
-    nxt = am[:, -1].astype(mx.int32)
-    mx.eval(nxt)
-    out = [int(nxt.item())]
-    pos = cache.offset
+    cont = cache is not None
+    if not cont:
+        if cache_state is not None or cache_update is not None or anchor is not None:
+            raise ValueError("spec.generate: anchor/cache_state/cache_update need cache=")
+        cache = model.make_cache(1, max_seq_len=len(prompt_ids) + max_new + 16)
+
+    prompt_ids = [] if prompt_ids is None else prompt_ids
     pol = policy or GammaPolicy(start=gamma)
     hist, gams = [], []
+    if cont:
+        dsc = head.make_cache(1) if cache_state is None else cache_state
+        if len(prompt_ids):
+            am, taps = model(mx.array([list(prompt_ids)]), cache,
+                             last_logit_only=True, return_taps=True, argmax=True)
+            if cache_update is not None:
+                cache_update.mark_seen(prompt_ids)   # the forward already fed them
+            head.append_ctx(tapcat(taps), dsc)
+            anchor = int(np.asarray(am).reshape(-1)[0])
+        if anchor is None:
+            raise ValueError("spec.generate: continuing a session needs anchor= (the "
+                             "prefill's argmax for the last row fed) or prompt_ids")
+    else:
+        am, taps = model(mx.array([list(prompt_ids)]), cache, last_logit_only=True,
+                         return_taps=True, argmax=True)
+        dsc = head.make_cache(1)
+        head.append_ctx(tapcat(taps), dsc)
+        anchor = int(np.asarray(am).reshape(-1)[0])
+    out = [int(anchor)]
+    pos = cache.offset
     t0 = time.perf_counter()
     while len(out) < max_new + 1 and out[-1] != eos_id:
         g = pol.next() if adaptive else gamma
+        nxt = mx.array([out[-1]], dtype=mx.int32)
         d, _ = head.draft(nxt, model.embed, model.head, dsc, width=g)
         d = d.astype(mx.int32)
         vin = mx.concatenate([nxt.reshape(1, 1), d], axis=1)
@@ -187,13 +241,21 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
         rollback(cache, sn, target, stashes(cache))
         head.append_ctx(tapcat(taps)[:, :n + 1], dsc)
         pos = target
-        nxt = mx.array([new[-1]], dtype=mx.int32)
+        if cache_update is not None:
+            # rows that survive AND were fed: the anchor + the accepted drafts.
+            # the round's bonus token is the next anchor -- it is fed by the
+            # next round (or by the caller's next turn) and must not be marked
+            # yet, or the history would run ahead of the cache.
+            cache_update.mark_seen([int(out[-1])] + [int(v) for v in dd[:n]])
         for t in new:
             out.append(t)
             if t == eos_id:
                 break
     dt = time.perf_counter() - t0
-    return out, {"tok_s": (len(out) - 1) / dt, "rounds": len(hist),
-                 "mean_acc": float(np.mean(hist)) if hist else 0.0,
-                 "ms_round": dt * 1e3 / max(len(hist), 1),
-                 "gammas": gams}
+    stats = {"tok_s": (len(out) - 1) / dt, "rounds": len(hist),
+             "mean_acc": float(np.mean(hist)) if hist else 0.0,
+             "ms_round": dt * 1e3 / max(len(hist), 1), "gammas": gams}
+    if cont:
+        stats["anchor"] = int(anchor)
+        stats["cache_offset"] = int(cache.offset)
+    return out, stats

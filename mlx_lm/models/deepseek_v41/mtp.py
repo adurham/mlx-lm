@@ -34,6 +34,8 @@ and appended to every stage's rotating window as KV.
 from __future__ import annotations
 
 import mlx.core as mx
+
+from . import collective as _coll
 import mlx.nn as nn
 
 from .config import ModelArgs
@@ -193,7 +195,7 @@ class DraftMoE(nn.Module):
         y = self.experts(xf, indices)
         y = mx.sum(y.astype(mx.float32) * weights[..., None], axis=-2)
         if self.group is not None:          # experts hold one rank's width slice
-            y = mx.distributed.all_sum(y, group=self.group)
+            y = _coll.all_sum(y, group=self.group)
         y = y + self.shared_experts(xf).astype(mx.float32)
         return y.reshape(shape).astype(x.dtype)
 
@@ -290,6 +292,11 @@ class DSparkHead(nn.Module):
             stage.attn.append_ctx(main_x, c)
 
     def draft(self, anchor_tokens: mx.array, embed, head, caches, width=None):
+        from . import collective as _coll
+        with _coll.warm_guard(("draft", int(width or self.block_size))):
+            return self._draft(anchor_tokens, embed, head, caches, width=width)
+
+    def _draft(self, anchor_tokens: mx.array, embed, head, caches, width=None):
         """One parallel draft round -> (draft_tokens, confidence).
 
         ``anchor_tokens`` [b]. Position 0 of the block IS the anchor, so the

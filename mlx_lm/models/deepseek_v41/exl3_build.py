@@ -18,6 +18,8 @@ from typing import Iterable
 
 import numpy as np
 import mlx.core as mx
+
+from . import collective as _coll
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
@@ -310,7 +312,7 @@ class ShardedHead(nn.Module):
         pair = mx.stack([mx.max(flat, axis=-1),
                          mx.argmax(flat, axis=-1).astype(mx.float32) + self._lo], axis=-1)
         buf = mx.pad(pair[None], [(self._rank, self._world - self._rank - 1), (0, 0), (0, 0)])
-        allp = mx.distributed.all_sum(buf, group=self._group)          # [world, rows, 2]
+        allp = _coll.all_sum(buf, group=self._group)          # [world, rows, 2]
         best = mx.argmax(allp[..., 0], axis=0)                          # first max = lowest idx
         idx = mx.take_along_axis(allp[..., 1], best[None], axis=0)[0]
         return idx.astype(mx.int32).reshape(shp)
@@ -322,7 +324,7 @@ class ShardedHead(nn.Module):
         y = self._p(h).astype(mx.float32)
         w = y.shape[-1]
         pad = [(0, 0)] * (y.ndim - 1) + [(self._lo, self._vocab - self._lo - w)]
-        return mx.distributed.all_sum(mx.pad(y, pad), group=self._group)
+        return _coll.all_sum(mx.pad(y, pad), group=self._group)
 
 
 _SHARD_SHARED = os.environ.get("DSV41_TP_SHARED", "1") == "1"

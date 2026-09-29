@@ -23,29 +23,35 @@ reference reads keys through a process-global pointer that the *last* owner set.
 During decode, a ratio-2 owner whose group is incomplete therefore scores
 against layer 20's keys. This port always reads the owner's own cache.
 
-Long-context tiling (local change, exo phase 19 prefill fix)
-------------------------------------------------------------
+Long-context tiling (local change, exo phase 19 prefill fix; reworked round 2)
+-----------------------------------------------------------------------------
 The pre-head-sum score tensor is ``[b, n, index_n_heads, nb]`` fp32: at an n=512
 chunk and nb=16384 that is 1.07 GB for one index layer, and four index layers sit
 in one lazy prefill graph — the allocation that drives the Metal GPU watchdog.
 At ``nb >= DSV41_INDEXER_TILE_MIN_NB`` (default 8192) the columns are scored in
 ``DSV41_INDEXER_TILE``-wide chunks, so only one ``[b, n, heads, tile]`` transient
 exists at a time (33 MB at tile=512, n=512), and the tile shrinks further to
-honour ``DSV41_INDEXER_TILE_MB`` (default 128 MB). The top-k is an exact running
-merge (``merge_topk``): each tile is unioned with the running best-k and
-re-partitioned, and the layer-20 candidate block selection is merged the same
-way — tiles are block-aligned so blocks never straddle a tile.
+honour ``DSV41_INDEXER_TILE_MB`` (default 128 MB).
 
-Exactness. Score elements come from the same expressions on the same data, so
-they are bitwise equal to the untiled path (measured — ``pB_indexer_test.py
-parity``). The running merge returns exactly the k largest values of the
-row-union, so the selected *value* multiset equals the untiled top-k; selected
-*indices* can differ only where equal scores straddle the k-th boundary. One
-deliberate difference: the tiled path never reports a ``-inf`` column (it filters
-on the merged values being finite), while the untiled path can return one before
-its ``idx < lens`` test drops it. Both agree on the number of valid indices, and
-that case needs fewer than ``index_topk`` finite columns — i.e. nb below
-``index_topk + n_chunk/ratio``, never reachable in the tiled regime (nb >= 8192).
+Each tile's collapse is fenced (``mx.eval``) and kept as a 1 MB ``[b, n, t]``
+row; the layer's top-k is then ONE exact ``argpartition`` over the whole row
+(:func:`_tiled_scores_buffer`) — at nb=16384, n=512 that is ~2 ms where the
+previous per-tile running merge spent ~7 ms re-partitioning 512-row windows, and
+the candidate block selection (layer 20) is one global pass over per-tile block
+maxima instead of a per-tile merge (measured 41.8 -> ~18 ms for the whole layer
+call at nb=16384). ``DSV41_INDEXER_TILED_IMPL=merge`` restores the previous
+per-tile running merge (:func:`_tiled_scores_merge`), kept for A/B and rollback.
+
+Exactness. Score elements come from the same expressions on the same data, and
+the per-tile score is bitwise equal to the untiled path at every production
+width (``pB_indexer_test.py parity``), including under the per-shape compiled
+score body (``DSV41_INDEXER_COMPILE``, default on, per-shape key so a width
+change cannot silently mismatch). With one global exact top-k over those values,
+the selected *value* multiset equals the untiled top-k; selected *indices* can
+differ only where equal scores straddle the k-th boundary (argpartition's tie
+pick is implementation-defined, the same class round 1 documented). Measured 0
+differing rows on synthetic tensors (nb 4096..20000, tiles 256..1024) and on
+real activations (49152 rows, ``wsB-ab``).
 
 ``DSV41_INDEXER_TILE=0`` restores the untiled path for any nb;
 ``DSV41_INDEXER_TILE_MIN_NB=0`` runs tiled at any nb (used by parity tests).
@@ -72,6 +78,16 @@ _TILE_BUDGET = int(float(os.environ.get("DSV41_INDEXER_TILE_MB", "128")) * (1 <<
 # Test hook: run the tiled path for every nb that exceeds one tile, ignoring the
 # size gate entirely (parity / NLL gates force the new path at short context).
 _TILE_FORCE = os.environ.get("DSV41_INDEXER_TILE_FORCE", "0") == "1"
+# Selection structure: "buffer" (default) = one global exact top-k over the
+# per-tile score row; "merge" = the previous per-tile running merge (A/B only).
+_TILED_IMPL = os.environ.get("DSV41_INDEXER_TILED_IMPL", "buffer")
+# Score body under mx.compile, keyed per (b, s, h, d, tile-width) so a width
+# change can never silently reuse a mismatched pipeline. The body is a single
+# einsum + relu*scale + head-sum; compiled it is ~15% faster per tile and
+# bitwise equal to the eager expression (verified at every width the parity
+# harness exercises). DSV41_INDEXER_COMPILE=0 falls back to the eager expression.
+_INDEXER_COMPILE = os.environ.get("DSV41_INDEXER_COMPILE", "1") == "1"
+_COMPILED_BODIES: dict = {}
 
 
 def tile_width(bsz: int, n: int, n_heads: int, nb: int, align: int) -> int:
@@ -115,11 +131,117 @@ def merge_topk(best_v: mx.array, best_i: mx.array, tile_v: mx.array,
     returned are exactly the k largest of everything merged so far, and the
     indices are the distinct columns they came from (``-inf``-valued slots carry
     an unusable padding index; callers filter on the value).
+
+    Kept for the ``DSV41_INDEXER_TILED_IMPL=merge`` rollback path and the parity
+    harness; the default buffer path does not use it.
     """
     v = mx.concatenate([best_v, tile_v], axis=-1)
     i = mx.concatenate([best_i, tile_i], axis=-1)
     part = mx.argpartition(-v, k - 1, axis=-1)[..., :k]
     return mx.take_along_axis(v, part, axis=-1), mx.take_along_axis(i, part, axis=-1)
+
+
+def topk_from_row(s: mx.array, k: int) -> tuple[mx.array, mx.array]:
+    """Exact top-k of a full ``[..., nb]`` score row, in position order.
+
+    Returns ``(values [..., k], indices [..., k] int32)``; slots beyond the
+    finite columns hold ``-inf`` and a caller-checkable index.
+    """
+    i = mx.argpartition(-s, k - 1, axis=-1)[..., :k].astype(mx.int32)
+    i = mx.sort(i, axis=-1)                                  # position order
+    v = mx.take_along_axis(s, i, axis=-1)
+    return v, i
+
+
+def _score_body(bsz: int, n: int, n_heads: int, head_dim: int, tile: int):
+    """The per-tile score body: einsum(q, k) -> relu * w -> head sum.
+
+    One entry per (b, s, h, d, tile-width) in a process-local cache, wrapping
+    ``mx.compile`` of the eager expression. Compiled per tile width on purpose:
+    a **shapeless** ``mx.compile`` of this einsum mis-tracks the output's final
+    axis as soon as a second tile width arrives (``[reshape] Cannot reshape
+    array of size ...`` — measured on this MLX build, widths 512/1024/128/2048),
+    so the default path must not use it; a non-shapeless compile handles a new
+    width by recompiling internally (MLX keys its own cache per input shape, so
+    the ragged final tile costs one extra pipeline per width, bounded).
+    ``DSV41_INDEXER_COMPILE=0`` returns the eager expression, bitwise identical.
+    """
+    if not _INDEXER_COMPILE:
+        return _score_body_eager
+    key = (bsz, n, n_heads, head_dim, tile)
+    fn = _COMPILED_BODIES.get(key)
+    if fn is None:
+        fn = mx.compile(_score_body_eager)
+        _COMPILED_BODIES[key] = fn
+    return fn
+
+
+def _score_body_eager(q32: mx.array, kt: mx.array, w32: mx.array) -> mx.array:
+    """Score one tile: ``[b, n, h, t] -> relu -> * w -> head-sum -> [b, n, t]``.
+
+    Elementwise-identical to the untiled path's expression (same ops, same order,
+    same fp32 operands), so per-tile scores stay bitwise equal to the untiled
+    score matrix (checked by the parity harness at every width).
+    """
+    s = mx.einsum("bshd,btd->bsht", q32, kt)
+    s = mx.maximum(s, 0.0) * w32[..., None]
+    return mx.sum(s, axis=2)
+
+
+def _tiled_scores_buffer(q32: mx.array, index_k: mx.array, w32: mx.array,
+                         lens: mx.array, nb: int, k: int, tile: int, *,
+                         cand_mask=None, cand_src=None):
+    """One pass over the nb columns, buffering the per-tile score row.
+
+    ``q32`` [b, n, h, d] fp32, ``index_k`` [b, nb, d], ``w32`` [b, n, h] fp32,
+    ``lens`` [n, 1]. ``cand_mask`` [b, n, nb] bool restricts columns (consumer
+    layers 24..36); ``cand_src=(topk_blocks, block_size)`` makes this layer the
+    candidate source (layer 20).
+
+    Per tile: score ([b, n, h, tile] transient, fenced), mask visibility, append
+    the ``[b, n, tile]`` collapse to a ``[b, n, nb]`` row (the untiled
+    ``[b, n, h, nb]`` 1.07 GB transient becomes a 335 MB fp32 row at nb=16384,
+    n=512, of which only the masked 1.07 GB-worth of head reductions are ever
+    live one tile at a time). The top-k and the candidate block selection are
+    then each ONE exact global pass over that row / over the per-tile block
+    maxima.
+
+    Returns ``(top_v [b,n,k], top_i [b,n,k], block_mask [b,n,nb] bool or None)``.
+    ``top_i`` slots whose ``top_v`` is ``-inf`` are padding: drop them.
+    """
+    bsz, n = q32.shape[0], q32.shape[1]
+    cand = cand_src is not None
+    topk_blocks, block_size = cand_src if cand else (0, 1)
+    body = _score_body(bsz, n, q32.shape[2], q32.shape[3], tile)
+
+    # The whole buffer is written by the loop before anything reads it, so an
+    # uninitialized allocation is safe here and skips a full zero-fill of
+    # ``b*n*nb`` fp32 (335 MB at nb=16384, n=512 — measured ~0.8 ms).
+    row = mx.empty((bsz, n, nb), dtype=mx.float32)
+    for c0 in range(0, nb, tile):
+        c1 = min(c0 + tile, nb)
+        s = body(q32, index_k[:, c0:c1].astype(mx.float32), w32)
+        cols = mx.arange(c0, c1, dtype=mx.int32)
+        s = mx.where(cols[None, :] < lens, s, NEG_INF)
+        # Materialize this tile's collapse BEFORE building the next one: MLX's
+        # lazy evaluation would otherwise keep every tile's [b,n,heads,t]
+        # pre-collapse transient alive until the end of the call, so the peak
+        # would equal the untiled path and the whole exercise be pointless.
+        # (Same finding, same fix as deepseek_v4.py _indexer_score_tiled.)
+        mx.eval(s)
+        row[:, :, c0:c1] = s
+    # The candidate selection is ONE exact global pass over the completed row —
+    # the same two-level block max / top-k the untiled path runs, just fed from
+    # the buffered row instead of the full [b, n, heads, nb] tensor. This is
+    # what took layer 20's call from ~42 ms (per-tile block merge) to ~20 ms.
+    if cand:
+        mask = select_candidate_blocks(row, lens, topk_blocks, block_size)
+    else:
+        mask = None
+    if cand_mask is not None:
+        row = mx.where(cand_mask, row, NEG_INF)
+    v, i = topk_from_row(row, k)
+    return v, i, mask
 
 
 def select_candidate_blocks(scores: mx.array, lens: mx.array, topk_blocks: int,
@@ -151,10 +273,12 @@ def select_candidate_blocks(scores: mx.array, lens: mx.array, topk_blocks: int,
     return mx.repeat(keep, block_size, axis=-1)[..., :width]
 
 
-def _tiled_scores(q32: mx.array, index_k: mx.array, w32: mx.array, lens: mx.array,
-                  nb: int, k: int, tile: int, *, cand_mask=None, cand_src=None):
-    """One pass over the nb columns in ``tile``-wide chunks.
+def _tiled_scores_merge(q32: mx.array, index_k: mx.array, w32: mx.array,
+                        lens: mx.array, nb: int, k: int, tile: int, *,
+                        cand_mask=None, cand_src=None):
+    """Round-1 structure: per-tile running merge for both top-k and blocks.
 
+    Kept verbatim for ``DSV41_INDEXER_TILED_IMPL=merge`` (A/B and rollback).
     ``q32`` [b, n, h, d] fp32, ``index_k`` [b, nb, d], ``w32`` [b, n, h] fp32,
     ``lens`` [n, 1]. ``cand_mask`` [b, n, nb] bool restricts columns (consumer
     layers 24..36); ``cand_src=(topk_blocks, block_size)`` makes this layer the
@@ -298,16 +422,19 @@ class Indexer(nn.Module):
             k = min(self.index_topk, nb)
             mask = shared.candidates if (self.uses_candidates
                                          and shared.candidates is not None) else None
-            v, i, blk = _tiled_scores(
+            impl = _tiled_scores_merge if _TILED_IMPL == "merge" else _tiled_scores_buffer
+            v, i, blk = impl(
                 q.astype(mx.float32), index_k, w.astype(mx.float32), lens, nb, k, tile,
                 cand_mask=mask,
                 cand_src=((self.candidate_topk_blocks, self.candidate_block_size)
                           if self.is_candidate_source else None))
             if self.is_candidate_source:
                 shared.candidates = blk
-            order = mx.argsort(i, axis=-1)                           # position order
-            i = mx.take_along_axis(i, order, axis=-1)
-            v = mx.take_along_axis(v, order, axis=-1)
+            if _TILED_IMPL == "merge":
+                # round-1 result order: value-descending with finite slots first
+                order = mx.argsort(i, axis=-1)
+                i = mx.take_along_axis(i, order, axis=-1)
+                v = mx.take_along_axis(v, order, axis=-1)
             valid = mx.isfinite(v) & (i < lens.astype(mx.int32)[None])
             return mx.where(valid, i + offset, mx.array(-1, mx.int32))
 

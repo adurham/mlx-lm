@@ -57,7 +57,14 @@ HUGE_WEIGHT_BYTES = 64 * 1024 * 1024
 # v20 devx kernel already covers rows <= 16, so 16 is the whole small-batch
 # band. (The old 64 was measured on M5 Max 27B shapes whose layers are far
 # wider per row; DSv4.1's 5120x512 wkv tiles amortize much sooner.)
-FUSED_GEMM_ROW_LIMIT = int(os.environ.get("EXL3_FUSED_ROW_LIMIT", "16"))
+# REVERTED to 64 (2026-09-29): with 16, the full 40-layer TP=2 model hangs the
+# GPU (hundreds of "Caused GPU Timeout Error", run never produces a token) on
+# the first short-prompt prefill; 64 runs clean on the identical tree (bisected
+# on both Macs: e052a58 clean, +exl3 changes -> timeouts, +EXL3_FUSED_ROW_LIMIT=64
+# -> clean). The single-node layer-20 crossover above is real but the
+# decode-once path it routes 17..64-row calls to is not safe at full depth.
+# Re-lowering this needs a full-model two-node run, not a layer benchmark.
+FUSED_GEMM_ROW_LIMIT = int(os.environ.get("EXL3_FUSED_ROW_LIMIT", "64"))
 # Don't materialize transient fp16 W beyond this (lm_head-scale layers keep
 # the striped path).
 DECODE_FULL_MAX_BYTES = 1536 * 1024 * 1024

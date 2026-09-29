@@ -29,6 +29,8 @@ are the same code path.
 from __future__ import annotations
 
 import mlx.core as mx
+
+from . import collective as _coll
 import mlx.nn as nn
 
 from .compressor import Compressor
@@ -186,5 +188,5 @@ class Attention(nn.Module):
             o = self.wo_a(o)                                     # grouped module -> [b, s, g, r]
         out = self.wo_b(o.reshape(bsz, n, -1).astype(x.dtype))
         if self.group is not None:                   # heads sharded: sum partials
-            out = mx.distributed.all_sum(out, group=self.group)
+            out = _coll.all_sum(out, group=self.group)
         return out

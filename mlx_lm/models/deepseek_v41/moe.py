@@ -23,6 +23,8 @@ replace the reference's per-expert Python loop.
 from __future__ import annotations
 
 import mlx.core as mx
+
+from . import collective as _coll
 import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
@@ -126,9 +128,9 @@ class MoE(nn.Module):
         y = mx.sum(y.astype(mx.float32) * weights[..., None], axis=-2)
         if self.group is not None and self.shared_sharded:
             y = y + self.shared_experts(xf).astype(mx.float32)
-            y = mx.distributed.all_sum(y, group=self.group)
+            y = _coll.all_sum(y, group=self.group)
         elif self.group is not None:
-            y = mx.distributed.all_sum(y, group=self.group)
+            y = _coll.all_sum(y, group=self.group)
             y = y + self.shared_experts(xf).astype(mx.float32)
         else:
             y = y + self.shared_experts(xf).astype(mx.float32)
