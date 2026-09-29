@@ -80,7 +80,7 @@ import numpy as np
 # Defaults; every one is overridable per call. Env vars only seed the defaults.
 BASE_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", "512"))
 LONG_CHUNK = int(os.environ.get("DSV41_PREFILL_LONG_CHUNK", "128"))
-LONG_THRESHOLD = int(os.environ.get("DSV41_PREFILL_LONG_THRESHOLD", "8192"))
+LONG_THRESHOLD = int(os.environ.get("DSV41_PREFILL_LONG_THRESHOLD", "1000000000"))
 FENCE_EVERY = int(os.environ.get("DSV41_FENCE_EVERY", "2"))
 ASYNC_DEPTH = int(os.environ.get("DSV41_PREFILL_DEPTH", "2"))
 CLEAR_EVERY = int(os.environ.get("DSV41_PREFILL_CLEAR", "4"))
