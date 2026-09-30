@@ -205,7 +205,7 @@ def prefill(model, ids, cache, *, chunk: int | None = None,
         # boundary reproducible.
         mx.clear_cache()
     if prime_decode is None:
-        prime_decode = os.environ.get("DSV41_DECODE_PRIME", "1") == "1"
+        prime_decode = os.environ.get("DSV41_DECODE_PRIME", "0") == "1"
     if prime_decode:
         # Move the one-time post-prefill first-decode-step cost into the
         # boundary (measured 10.7x -> 1.01x of steady state at 30 layers/16K,
@@ -263,7 +263,7 @@ def decode_prime(model, cache, *, enabled: bool = True) -> float:
     ``enabled=False`` (or an unbuilt/None layer set) returns 0.0 without
     running the probe. Set ``DSV41_DECODE_PRIME=0`` to disable globally.
     """
-    if not enabled or not os.environ.get("DSV41_DECODE_PRIME", "1") == "1":
+    if not enabled or not os.environ.get("DSV41_DECODE_PRIME", "0") == "1":
         return 0.0
     import time as _t
     t0 = _t.perf_counter()

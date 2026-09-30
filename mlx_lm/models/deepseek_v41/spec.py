@@ -12,6 +12,8 @@ rows the compressor stashed for this chunk).
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 
@@ -123,6 +125,27 @@ class GammaPolicy:
         return best
 
 
+
+# Prompts longer than this go through prefill.prefill (fenced 512-row chunks)
+# instead of one forward. A single multi-thousand-row forward is one huge
+# command-buffer chain per rank; measured 2026-09-29 on the full two-node
+# model, a 1.9K-token prompt in one forward tripped the Metal GPU watchdog
+# (31 "GPU Timeout" on rank 0) while every <100-token prompt ran clean.
+_ONESHOT_MAX = int(os.environ.get("DSV41_SPEC_ONESHOT_MAX", "512"))
+
+
+def _prefill_with_taps(model, prompt_ids, cache):
+    """(argmax ids of the last row, {layer: taps for ALL prompt rows})."""
+    ids = mx.array([list(prompt_ids)])
+    if len(prompt_ids) <= _ONESHOT_MAX:
+        return model(ids, cache, last_logit_only=True, return_taps=True, argmax=True)
+    from . import prefill as _PF
+    chunks = []
+    am = _PF.prefill(model, ids[0], cache, last_logit_only=True, argmax=True,
+                     taps_out=chunks)
+    taps = {L: mx.concatenate([c[L] for c in chunks], axis=1) for L in chunks[0]}
+    return am, taps
+
 def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
              adaptive: bool = True, eos_id: int = 1, policy=None,
              temperature: float = 0.0, top_p: float = 1.0, top_k: int = 0,
@@ -202,8 +225,7 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
     if cont:
         dsc = head.make_cache(1) if cache_state is None else cache_state
         if len(prompt_ids):
-            am, taps = model(mx.array([list(prompt_ids)]), cache,
-                             last_logit_only=True, return_taps=True, argmax=True)
+            am, taps = _prefill_with_taps(model, prompt_ids, cache)
             if cache_update is not None:
                 cache_update.mark_seen(prompt_ids)   # the forward already fed them
             head.append_ctx(tapcat(taps), dsc)
@@ -212,8 +234,7 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
             raise ValueError("spec.generate: continuing a session needs anchor= (the "
                              "prefill's argmax for the last row fed) or prompt_ids")
     else:
-        am, taps = model(mx.array([list(prompt_ids)]), cache, last_logit_only=True,
-                         return_taps=True, argmax=True)
+        am, taps = _prefill_with_taps(model, prompt_ids, cache)
         dsc = head.make_cache(1)
         head.append_ctx(tapcat(taps), dsc)
         anchor = int(np.asarray(am).reshape(-1)[0])

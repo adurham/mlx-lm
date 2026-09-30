@@ -162,7 +162,16 @@ class Model(nn.Module):
         from . import collective as _coll
         key = ("body", int(input_ids.shape[1]), bool(last_logit_only),
                bool(return_taps), bool(argmax))
-        with _coll.warm_guard(key):
+        # Multi-row forwards (prefill chunks) always host-sync their
+        # collectives: each chunk runs ~0.1 s/layer, so a rank that falls a few
+        # layers behind leaves its peer's command buffer waiting past the Metal
+        # watchdog (measured: 1.9K-token prompt, 512-row pieces, rank 0 timed
+        # out on the third 512-row piece once warm_guard had stopped syncing).
+        # Cost is negligible at this granularity; decode/verify (<=16 rows)
+        # keep the fast in-graph path after warmup.
+        guard = (_coll.sync_collectives() if int(input_ids.shape[1]) > 16
+                 else _coll.warm_guard(key))
+        with guard:
             return self._forward(input_ids, cache, last_logit_only=last_logit_only,
                                  return_taps=return_taps, argmax=argmax)
 
