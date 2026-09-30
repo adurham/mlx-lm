@@ -326,6 +326,48 @@ def decode_prime(model, cache, *, enabled: bool = True) -> float:
     return _t.perf_counter() - t0
 
 
+def load_warmup(model, head=None, *, chunk: int | None = None,
+                long_chunk: int | None = None, decode: bool = True,
+                fence_every: int | None = None, clear: bool = True,
+                spec_rows: int = 4) -> dict:
+    """Compile every kernel shape the serving workload uses, at load time.
+
+    MUST be called before the first real forward on a rank. Measured
+    2026-09-30 (p114/p115): without it, the first forward compiles ~17 custom
+    Metal kernels per new shape; on the full two-node model layers 17-26 of
+    that first forward take 4-7 s EACH (47 s of compile total) and the rank
+    skew trips the Metal watchdog -- hundreds of "Caused GPU Timeout Error"
+    then a process abort, on roughly half of cold starts. With it (p115):
+    0 timeouts on the exact repro that failed twice in a row, and later
+    forwards build in 30-90 ms per layer.
+
+    Runs inside ``collective.sync_collectives()`` so every collective is
+    host-synchronised: a rank still compiling cannot leave its peer's command
+    buffer waiting past the watchdog. ``head`` (the DSpark draft head, already
+    built) additionally warms the spec-verify shape, which is the shape decode
+    runs. Returns per-stage seconds like :func:`warmup`.
+    """
+    import time as _t
+    from . import collective as _coll
+    with _coll.sync_collectives():
+        t0 = _t.perf_counter()
+        times = warmup(model, chunk=chunk, long_chunk=long_chunk, decode=decode,
+                       fence_every=fence_every, clear=False)
+        if head is not None and spec_rows:
+            scratch = model.make_cache(1, max_seq_len=2 * (chunk or BASE_CHUNK) + 64)
+            try:
+                for _ in range(2):
+                    r = model(mx.full((1, int(spec_rows)), 100, dtype=mx.int32),
+                              scratch, return_taps=True, argmax=True)
+                    mx.eval(r[0], *r[1].values())
+            finally:
+                del scratch
+        times["total"] = _t.perf_counter() - t0
+        if clear:
+            mx.clear_cache()
+    return times
+
+
 def warmup(model, *, chunk: int | None = None, long_chunk: int | None = None,
            decode: bool = True, fence_every: int | None = None,
            clear: bool = True) -> dict:

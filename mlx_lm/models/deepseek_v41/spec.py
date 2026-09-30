@@ -189,6 +189,39 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
     has already fed them), the prefix is never re-fed, the cache is left at the
     last committed token's position, and no rewind happens on exit. Stats gain
     ``anchor``/``cache_offset`` keys on this path.
+
+    WARM-UP (greedy path)
+    ---------------------
+    Two distinct problems were measured on this stack (2026-09-30, p97-p116):
+
+    * **Load-time kernel compilation storm.** The first forward after load
+      compiles ~17 custom Metal kernels per new shape; on the full model
+      layers 17-26 of the first forward take 4-7 s EACH (47 s of compile) and
+      the rank skew trips the Metal watchdog ("Caused GPU Timeout Error",
+      hundreds of them; first failure site sparse_attn's fence eval). Fixed by
+      ``prefill.warmup(model)`` before any real workload (p115: 0 timeouts on
+      the exact repro that failed twice in a row; layers compile in 30-90 ms
+      afterwards). Callers that can wait ~2 min at load should call it.
+    * **Slow spec rounds after a long prompt.** After a prompt of >= ~430
+      rows, verify rounds run ~2 s instead of ~110 ms for a while (sometimes
+      all run, sometimes a few). Measured with per-module exclusive timing
+      (p106): the time sits in the EXL3 expert kernels *in-model* (~35 ms/call
+      vs 0.5-2.3 ms in isolation on the captured inputs) and in the peer waits;
+      it is NOT the weights being evicted (p108: 0 decompressions in the slow
+      rounds; locking 112 GiB changes nothing) and NOT the data (p107: real vs
+      random inputs identical in isolation). Root cause still open; candidate
+      is macOS GPU memory-pressure behaviour (p109/p112: "Pages wired down"
+      swings 20-70 GiB within single slow rounds while MLX active memory is
+      flat at ~100 GB).
+    * ``DSV41_SPEC_PRIME_STEPS`` (default 8) runs plain greedy steps after the
+      prefill (>= ``DSV41_SPEC_PRIME_MIN_ROWS``, default 64, rows) and
+      ``DSV41_SPEC_REPRIME_STEPS`` (default 8) falls back to a burst whenever a
+      verify round exceeds ``DSV41_SPEC_SLOW_MS`` (default 400 ms). Priming
+      cures short/mid-context slowdowns (p98/p99: 110 ms rounds, acceptance
+      ~2.8) but does NOT fully cure >=2.4K context (p116 with warm-up: still
+      ~2 s rounds) and a primed run at 2456 rows produced degenerate comma
+      text (p99/p100/p116). Both knobs default 0: OFF until the slow state is
+      root-caused. Enable only for experiments.
     """
     import numpy as np
     import time
@@ -222,9 +255,12 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
     prompt_ids = [] if prompt_ids is None else prompt_ids
     pol = policy or GammaPolicy(start=gamma)
     hist, gams = [], []
+    reprises = []
     if cont:
+        n_prefilled = 0
         dsc = head.make_cache(1) if cache_state is None else cache_state
         if len(prompt_ids):
+            n_prefilled = len(prompt_ids)
             am, taps = _prefill_with_taps(model, prompt_ids, cache)
             if cache_update is not None:
                 cache_update.mark_seen(prompt_ids)   # the forward already fed them
@@ -234,13 +270,42 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
             raise ValueError("spec.generate: continuing a session needs anchor= (the "
                              "prefill's argmax for the last row fed) or prompt_ids")
     else:
+        n_prefilled = len(prompt_ids)
         am, taps = _prefill_with_taps(model, prompt_ids, cache)
         dsc = head.make_cache(1)
         head.append_ctx(tapcat(taps), dsc)
         anchor = int(np.asarray(am).reshape(-1)[0])
     out = [int(anchor)]
-    pos = cache.offset
     t0 = time.perf_counter()
+    # WARM-UP: plain greedy steps cure the slow-round state (see the docstring
+    # "WARM-UP" note). K is a MINIMUM run at the start; if the state appears
+    # again later (it can: p103 showed it spreading to short prompts right
+    # after a long one, and to the first rounds of any prefill), the spec loop
+    # detects slow rounds and falls back into plain steps until rounds are
+    # fast again. The plain steps are real greedy tokens, so nothing is wasted.
+    prime_steps = int(os.environ.get("DSV41_SPEC_PRIME_STEPS", "0"))
+    prime_min_rows = int(os.environ.get("DSV41_SPEC_PRIME_MIN_ROWS", "64"))
+    slow_ms = float(os.environ.get("DSV41_SPEC_SLOW_MS", "400"))
+    reprime = int(os.environ.get("DSV41_SPEC_REPRIME_STEPS", "0"))
+
+    def plain_step():
+        nxt = mx.array([out[-1]], dtype=mx.int32)
+        a1, t1 = model(nxt[None], cache, last_logit_only=True,
+                       return_taps=True, argmax=True)
+        head.append_ctx(tapcat(t1), dsc)
+        nxt = a1[:, -1].astype(mx.int32)
+        mx.eval(nxt)
+        if cache_update is not None:
+            cache_update.mark_seen([int(out[-1])])
+        out.append(int(nxt))
+
+    if prime_steps > 0 and n_prefilled >= prime_min_rows:
+        for _ in range(prime_steps):
+            if len(out) >= max_new + 1 or out[-1] == eos_id:
+                break
+            plain_step()
+    pos = cache.offset
+    tloop = time.perf_counter()
     while len(out) < max_new + 1 and out[-1] != eos_id:
         g = pol.next() if adaptive else gamma
         nxt = mx.array([out[-1]], dtype=mx.int32)
@@ -248,8 +313,21 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
         d = d.astype(mx.int32)
         vin = mx.concatenate([nxt.reshape(1, 1), d], axis=1)
         sn = snap(cache, pos)
+        tr0 = time.perf_counter()
         am, taps = model(vin, cache, return_taps=True, argmax=True)
         mx.eval(am, d)                                   # the one sync per round
+        round_ms = (time.perf_counter() - tr0) * 1e3
+        if round_ms > slow_ms and reprime > 0:
+            # Slow-round state detected: discard this round's verify (its rows
+            # are rolled back below) and run plain steps instead.
+            rollback(cache, sn, pos, stashes(cache))     # undo the verify rows
+            for _ in range(reprime):
+                if len(out) >= max_new + 1 or out[-1] == eos_id:
+                    break
+                plain_step()
+                pos += 1
+            reprises.append(round_ms)
+            continue
         tg, dd = np.array(am[0]), np.array(d[0])
         n = 0
         while n < g and tg[n] == dd[n]:
@@ -273,9 +351,12 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
             if t == eos_id:
                 break
     dt = time.perf_counter() - t0
+    dt_loop = time.perf_counter() - tloop
     stats = {"tok_s": (len(out) - 1) / dt, "rounds": len(hist),
              "mean_acc": float(np.mean(hist)) if hist else 0.0,
-             "ms_round": dt * 1e3 / max(len(hist), 1), "gammas": gams}
+             "ms_round": dt_loop * 1e3 / max(len(hist), 1), "gammas": gams,
+             "prime_steps": max(0, len(out) - 1 - sum(1 + int(v) for v in hist)),
+             "reprises": len(reprises), "slow_ms": slow_ms}
     if cont:
         stats["anchor"] = int(anchor)
         stats["cache_offset"] = int(cache.offset)
