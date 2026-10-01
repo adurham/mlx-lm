@@ -19,6 +19,7 @@ for warmup / the first forward; steady-state decode leaves it off.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 
 import mlx.core as mx
@@ -61,8 +62,16 @@ def warm_guard(key):
     return sync_collectives()
 
 
+def _raw(fn):
+    """The unwrapped MLX collective. Another model in this process (exo's
+    deepseek_v4) wraps mx.distributed.* to downcast fp32 payloads to bf16;
+    this model sends exact fp32 values (token ids in combine_argmax), so a
+    wrapper silently corrupts them."""
+    return inspect.unwrap(fn)
+
+
 def all_sum(x, group=None):
-    y = mx.distributed.all_sum(x, group=group)
+    y = _raw(mx.distributed.all_sum)(x, group=group)
     if active():
         mx.eval(y)
     return y

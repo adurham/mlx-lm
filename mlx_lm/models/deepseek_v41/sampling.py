@@ -338,7 +338,9 @@ class DraftProbe:
         if w * self.world != self.vocab:
             raise ValueError(f"local head width {w} x world {self.world} != vocab {self.vocab}")
         pad = [(0, 0)] * (y.ndim - 1) + [(self.lo, self.vocab - self.lo - w)]
-        return mx.distributed.all_sum(mx.pad(y, pad), group=self.group)
+        from . import collective as _coll
+
+        return _coll.all_sum(mx.pad(y, pad), group=self.group)
 
 
 def draft_geometry(model, head):

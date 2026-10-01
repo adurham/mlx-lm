@@ -607,6 +607,7 @@ def _collective_fp32_safe(fn, _name="?"):
                 _s.stderr.flush()
             return fn(x.astype(mx.bfloat16), *args, **kwargs).astype(mx.float32)
         return fn(x, *args, **kwargs)
+    wrapped.__wrapped__ = fn  # lets other models reach the raw collective
     return wrapped
 
 
@@ -618,6 +619,7 @@ if not getattr(mx.distributed.all_sum, "_all_sum_nop_wrapped", False):
             return x  # NOP: pass through, skip cross-rank reduce
         return _all_sum_fp32(x, *args, **kwargs)
     _all_sum_nop_aware._all_sum_nop_wrapped = True
+    _all_sum_nop_aware.__wrapped__ = _all_sum_fp32
     mx.distributed.all_sum = _all_sum_nop_aware
 
 # Wrap ALL collectives that can carry fp32 activations (all_gather, and
