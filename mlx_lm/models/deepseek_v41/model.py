@@ -153,7 +153,7 @@ class Model(nn.Module):
 
     def __call__(self, input_ids: mx.array, cache: ModelCache,
                  last_logit_only: bool = False, return_taps: bool = False,
-                 argmax: bool = False):
+                 argmax: bool = False, logprobs: int = 0):
         # First calls per input shape host-sync every collective, so a rank
         # still JIT-building kernels for the shape cannot leave its peer's
         # GPU waiting inside a command buffer past the Metal watchdog
@@ -161,7 +161,7 @@ class Model(nn.Module):
         # after 2 calls each.
         from . import collective as _coll
         key = ("body", int(input_ids.shape[1]), bool(last_logit_only),
-               bool(return_taps), bool(argmax))
+               bool(return_taps), bool(argmax), int(logprobs))
         # Multi-row forwards (prefill chunks) always host-sync their
         # collectives: each chunk runs ~0.1 s/layer, so a rank that falls a few
         # layers behind leaves its peer's command buffer waiting past the Metal
@@ -173,11 +173,12 @@ class Model(nn.Module):
                  else _coll.warm_guard(key))
         with guard:
             return self._forward(input_ids, cache, last_logit_only=last_logit_only,
-                                 return_taps=return_taps, argmax=argmax)
+                                 return_taps=return_taps, argmax=argmax,
+                                 logprobs=logprobs)
 
     def _forward(self, input_ids: mx.array, cache: ModelCache,
                  last_logit_only: bool = False, return_taps: bool = False,
-                 argmax: bool = False):
+                 argmax: bool = False, logprobs: int = 0):
         """input_ids [b, n] continue the sequence at cache.offset. Advances the cache.
 
         ``return_taps`` additionally returns ``{layer_id: hc_mean_hidden}`` for
@@ -244,13 +245,31 @@ class Model(nn.Module):
         h = self.norm(h)
         if last_logit_only:
             h = h[:, -1:]
-        if argmax and hasattr(self.head, "argmax"):
+        lp = None
+        if argmax and logprobs:
+            # ``logprobs`` = top-k count: also return exact log-probs (selected
+            # token + top-k) next to the greedy ids, as an extra return value.
+            hh = h.astype(mx.float32)
+            if hasattr(self.head, "topk_logprobs"):
+                logits, lp = self.head.topk_logprobs(hh, int(logprobs))
+            else:
+                from . import logprobs as _lp
+                y = self.head(hh)
+                ids, sel, tid, tlp = _lp.from_logits(y, int(logprobs))
+                shp = y.shape[:-1]
+                logits = ids.reshape(shp)
+                lp = {"selected": sel.reshape(shp),
+                      "top_ids": tid.reshape(*shp, tid.shape[-1]),
+                      "top_logprobs": tlp.reshape(*shp, tlp.shape[-1])}
+        elif argmax and hasattr(self.head, "argmax"):
             logits = self.head.argmax(h.astype(mx.float32))   # token ids [b, n]
         elif argmax:
             logits = mx.argmax(self.head(h.astype(mx.float32)), axis=-1).astype(mx.int32)
         else:
             logits = self.head(h.astype(mx.float32))   # fp32 logits, as the reference
         cache.offset = start_pos + n
+        if lp is not None:
+            return (logits, taps, lp) if return_taps else (logits, lp)
         if return_taps:
             return logits, taps
         return logits

@@ -320,6 +320,19 @@ class ShardedHead(nn.Module):
     def argmax(self, h: mx.array) -> mx.array:
         return self.combine_argmax(self.local(h))
 
+    def topk_logprobs(self, h: mx.array, k: int):
+        """Exact greedy ids + log-probs (selected and top-k), one small all_sum."""
+        from . import logprobs as _lp
+        y = self.local(h)
+        shp = y.shape[:-1]
+        buf = _lp.local_buffer(y.reshape(-1, y.shape[-1]), k, self._lo)
+        buf = mx.pad(buf[None], [(self._rank, self._world - self._rank - 1), (0, 0), (0, 0)])
+        ids, sel, top_ids, top_lp = _lp.combine(_coll.all_sum(buf, group=self._group), k)
+        kk = top_ids.shape[-1]
+        return ids.reshape(shp), {"selected": sel.reshape(shp),
+                                  "top_ids": top_ids.reshape(*shp, kk),
+                                  "top_logprobs": top_lp.reshape(*shp, kk)}
+
     def __call__(self, h: mx.array) -> mx.array:
         y = self._p(h).astype(mx.float32)
         w = y.shape[-1]
