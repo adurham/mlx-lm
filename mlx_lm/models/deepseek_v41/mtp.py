@@ -257,7 +257,30 @@ class DraftStage(nn.Module):
 
 
 class DSparkHead(nn.Module):
-    """The 3-stage draft head: anchor + noise block -> logits + confidence."""
+    """The 3-stage draft head: anchor + noise block -> logits + confidence.
+
+    ``DSV41_RD_MARKOV_REP=1`` (default OFF, LOCAL ADDITION for the D2 decode
+    sync-reduction work) replicates the markov head's vocab projection on
+    every rank instead of slicing it: at build time
+    (``exl3_build.build_mtp``) the flag keeps ``markov_head`` full-width and
+    leaves ``vocab_sharded`` unset, so ``_draft`` below takes the LOCAL
+    ``mx.argmax`` per markov step instead of ``head.combine_argmax``.
+
+    The TRADE, stated honestly: the unflagged path's per-step
+    ``combine_argmax`` collectives are TINY (a [world, rows, 2] pair buffer,
+    ~16 B) but SERIAL (the markov chain needs step k's token to build step
+    k+1), i.e. gamma serial collective waits per draft. The flagged path
+    needs the FULL-vocab base row on every rank, which on a TP build comes
+    from ``ShardedHead.__call__`` -- ONE padded [b, bs, vocab] fp32 all_sum
+    (~1.5 MB at b=1, bs=3) per draft. So the flag collapses gamma serial
+    waits into one large collective: count 88 -> 86/round, wire bytes UP,
+    direction unknown until the Mac A/B. It stays bit-exact either way:
+    each logit element is an independent dot product, the padded all_sum
+    adds exact zeros, and ``combine_argmax`` returns exactly the global
+    first-occurrence argmax that the full-row ``mx.argmax`` computes (ties ->
+    lowest vocab id). The draft's OTHER sharded parts (routed expert all_sum)
+    are untouched by the flag.
+    """
 
     def __init__(self, args: ModelArgs):
         super().__init__()
