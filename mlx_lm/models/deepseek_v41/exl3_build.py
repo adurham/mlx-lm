@@ -118,14 +118,15 @@ class _Grouped(nn.Module):
 
 _ENGRAM_POOL = None
 
-# Read shape for the engram tables (module read at import; the A/B flips the
-# env at relaunch). "legacy" keeps the original per-row fan-out: one pool task
+# Read shape for the engram tables (module read at import). DEFAULT "coarse"
+# since 2026-10-02 (measured -10.3% 16K prefill, max|dlogit|=0; set
+# DSV41_ENGRAM_READ=legacy to restore the old shape). "legacy" keeps the original per-row fan-out: one pool task
 # per unique row for the weights and one for the scales -- 2*U tiny
 # submit/result round trips per lookup (80 816 tasks for a 2048-row chunk at
 # U = 40 408). "coarse" groups the rows into contiguous index slices and reads
 # each slice with ONE task that loops its rows: 2*min(_ENGRAM_SLICES, U) tasks,
 # same preads, same bytes. Root cause is the per-row granularity, not the I/O.
-_ENGRAM_READ = os.environ.get("DSV41_ENGRAM_READ", "legacy")
+_ENGRAM_READ = os.environ.get("DSV41_ENGRAM_READ", "coarse")
 _ENGRAM_SLICES = int(os.environ.get("DSV41_ENGRAM_SLICES", "64"))
 
 

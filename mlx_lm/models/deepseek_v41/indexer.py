@@ -72,8 +72,10 @@ NEG_INF = float("-inf")
 POS_INF = float("inf")
 
 # --- tiled score path settings ----------------------------------------------
+# DSV41_INDEXER_TILE_MIN_NB default 0 since 2026-10-02: always take the tiled
+# path (bit-exact, max|dlogit|=0; -1.7 GB prefill peak). Set 8192 for the old gate.
 _TILE = int(os.environ.get("DSV41_INDEXER_TILE", "512"))
-_TILE_MIN_NB = int(os.environ.get("DSV41_INDEXER_TILE_MIN_NB", "8192"))
+_TILE_MIN_NB = int(os.environ.get("DSV41_INDEXER_TILE_MIN_NB", "0"))
 _TILE_BUDGET = int(float(os.environ.get("DSV41_INDEXER_TILE_MB", "128")) * (1 << 20))
 # Test hook: run the tiled path for every nb that exceeds one tile, ignoring the
 # size gate entirely (parity / NLL gates force the new path at short context).

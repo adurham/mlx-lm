@@ -134,7 +134,7 @@ class EngramReadTest(unittest.TestCase):
 
     def test_module_flag_contract(self):
         self.assertEqual(eb._ENGRAM_READ,
-                         os.environ.get("DSV41_ENGRAM_READ", "legacy"))
+                         os.environ.get("DSV41_ENGRAM_READ", "coarse"))
         self.assertIn(eb._ENGRAM_READ, ("legacy", "coarse"))
 
     def test_byte_identity_empty_and_single(self):
