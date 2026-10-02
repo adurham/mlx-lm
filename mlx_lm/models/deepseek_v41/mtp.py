@@ -51,6 +51,118 @@ from .hc_fused import hc_expand, mixes_and_collapse
 
 _HC_FUSED = os.environ.get("DSV41_HC_FUSED", "1") == "1"
 
+# DSV41_DRAFT_COMPILE=1: run the draft attention block's pure tensor math
+# under ``mx.compile`` (same convention as ``layers.py:110``), so the ~130
+# elementwise/reshape dispatches of one draft-stage attention collapse into a
+# handful of fused kernels. Default OFF.
+#
+# Scope, exactly: only the region between the projections and the output
+# projection is compiled -- rope, the fp8 fake-quant of the block KV, the
+# softmax-with-sink and both einsums. The pieces deliberately left OUT, with
+# reasons:
+#
+# * the q/k/v/wo projections (``wq_a`` ... ``wo_b``): they are EXL3Linear /
+#   Exl3Proj modules whose weights are closure-baked at trace time (a compiled
+#   function cannot take an nn.Module argument: "Function arguments must be
+#   trees of arrays or constants"). Compiling them again per shape would be
+#   redundant -- ``exl3_build.py:44`` already compiles every EXL3 projection's
+#   own ``__call__`` -- and would bake the module into a second cache keyed
+#   only by shape, which is unsafe for any other module instance with the same
+#   shapes. See REPORT §"scope" for the probe.
+# * ``DraftWindow.chrono`` / the ring write in ``append``: this is cache state
+#   mutation (``self.win_kv[:, slots] = ...``) driven by ``n_ctx``, which is a
+#   host-side Python int, not an array. It stays eager; the compiled region
+#   receives the already-materialised ``ctx`` array.
+# * the markov sampling loop (``DSparkHead._draft``): it cannot be compiled as
+#   a whole because the SHARDED path calls ``head.combine_argmax`` inside the
+#   loop (mtp.py:321-336), a collective whose watchdog sync does
+#   ``mx.eval`` -- and ``mx.eval`` inside a compiled trace raises
+#   ``ValueError: [eval] Attempting to eval an array during function
+#   transformations like compile or vmap is not allowed`` (probed, 2026-10-02).
+#   The one-step body (markov_embed -> matmul -> add -> argmax) is pure and is
+#   compiled separately in ``DSparkHead._draft`` below; the collectives stay
+#   between the compiled steps, exactly as they are eager today.
+_DRAFT_COMPILE = os.environ.get("DSV41_DRAFT_COMPILE", "0") == "1"
+
+# Per-shape compiled bodies (see ``_COMPILED_DRAFT_ATTN``; MLX keys its own
+# cache per input shape, and this explicit registry mirrors the convention in
+# ``indexer.py:_COMPILED_BODIES`` / ``sparse_attention.py:_COMPILED``).
+_COMPILED_DRAFT_ATTN: dict = {}
+_COMPILED_MARKOV_STEP: dict = {}
+
+
+def _markov_step(prev, base_row, embed_w, head_w):
+    """One Markov sampling step's pure math: embed -> logits row.
+
+    ``prev`` [b] int ids, ``base_row`` [b, V] fp32, ``embed_w`` [V, r] and
+    ``head_w`` [V_head, r] are the markov embed / head weights passed as
+    arrays (never closure-baked, so a weight reload can never go stale). The
+    selection (``combine_argmax`` collective or ``argmax``) stays outside: the
+    collective syncs with the host and cannot live in a trace.
+    """
+    m_emb = embed_w[prev]
+    return m_emb, base_row + m_emb @ head_w.T
+
+
+def _markov_step_c(prev, base_row, embed_w, head_w):
+    """Dispatch the markov step: eager (default) or compiled."""
+    if not _DRAFT_COMPILE:
+        return _markov_step(prev, base_row, embed_w, head_w)
+    key = (tuple(prev.shape), tuple(base_row.shape), str(prev.dtype))
+    fn = _COMPILED_MARKOV_STEP.get(key)
+    if fn is None:
+        fn = _COMPILED_MARKOV_STEP[key] = mx.compile(_markov_step)
+    return fn(prev, base_row, embed_w, head_w)
+
+
+def _draft_attn_math(q_pre, kv_pre, ctx, c, s, sink, rd, scale):
+    """The draft block's pure tensor math: rope -> fp8 KV -> softmax w/ sink.
+
+    All inputs are arrays (no module state, so one compiled body serves all
+    three stages); ``rd`` is a Python constant. Op-for-op the body of the
+    eager ``DraftAttention.draft_block`` region between the projections and
+    the output projection, so eager and compiled are bit-identical.
+
+    ``scale`` MUST be an ``mx.array``, not a Python float: MLX folds a traced
+    float constant into a matmul epilogue with a different rounding than the
+    eager ``array * python_float`` promotion (~1 ulp, measured on the CPU
+    wheel 0.31.2), which breaks bit-exactness. As a runtime array operand the
+    multiply keeps the eager order.
+    """
+    q = rope_tail(q_pre, rd, c, s)
+    kv_blk = fake_quant_fp8_ue8m0(rope_tail(kv_pre, rd, c, s), 32)
+    kv = mx.concatenate([ctx.astype(kv_blk.dtype), kv_blk], axis=1)
+
+    # dense bidirectional attention with a learned sink per head
+    qf = q.astype(mx.float32)
+    kf = kv.astype(mx.float32)
+    logits = mx.einsum("blhd,bkd->blhk", qf, kf) * scale
+    sinkf = sink.astype(mx.float32).reshape(1, 1, sink.shape[0], 1)
+    mmax = mx.maximum(mx.max(logits, axis=-1, keepdims=True), sinkf)
+    w = mx.exp(logits - mmax)
+    denom = mx.sum(w, axis=-1, keepdims=True) + mx.exp(sinkf - mmax)
+    o = mx.einsum("blhk,bkd->blhd", w, kf) / denom
+    return rope_tail(o, rd, c, s, inverse=True)
+
+
+def _draft_attn_math_c(q_pre, kv_pre, ctx, c, s, sink, rd, scale):
+    """Dispatch the draft attention math: eager (default) or compiled.
+
+    The eager path takes the same ``mx.array`` scale as the compiled one; both
+    are bitwise equal to the pre-refactor ``array * float`` expression (pinned
+    by ``test_eager_refactor_unchanged_baseline``).
+    """
+    scale = mx.array(float(scale), mx.float32)
+    if not _DRAFT_COMPILE:
+        return _draft_attn_math(q_pre, kv_pre, ctx, c, s, sink, rd, scale)
+    key = (tuple(q_pre.shape), tuple(kv_pre.shape), tuple(ctx.shape),
+           tuple(c.shape), tuple(s.shape), tuple(sink.shape),
+           str(q_pre.dtype), str(ctx.dtype), int(rd), float(scale))
+    fn = _COMPILED_DRAFT_ATTN.get(key)
+    if fn is None:
+        fn = _COMPILED_DRAFT_ATTN[key] = mx.compile(_draft_attn_math)
+    return fn(q_pre, kv_pre, ctx, c, s, sink, rd, scale)
+
 
 class DraftWindow:
     """Rotating window KV for one draft stage, plus the draft block's own KV.
@@ -140,31 +252,28 @@ class DraftAttention(nn.Module):
         cache.append(kv)
 
     def draft_block(self, x: mx.array, cache: DraftWindow) -> mx.array:
-        """Bidirectional attention of the draft block over [ctx window; block]."""
+        """Bidirectional attention of the draft block over [ctx window; block].
+
+        The rope + fp8-KV + softmax + einsum region runs through
+        ``_draft_attn_math_c`` (eager by default, compiled behind
+        ``DSV41_DRAFT_COMPILE=1``); the projections and the output projection
+        stay on their own (already compiled) modules, and the cache
+        materialisation stays eager. See ``_DRAFT_COMPILE`` for the scope.
+        """
         b, l, _ = x.shape
         rd = self.rope_head_dim
         start = cache.n_ctx
 
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).reshape(b, l, self.n_heads, self.head_dim)
+        q_pre = self.wq_b(self.q_norm(self.wq_a(x))).reshape(
+            b, l, self.n_heads, self.head_dim)
+        kv_pre = self.kv_norm(self.wkv(x))
         cos, sin = self._freqs(start + l)
-        q = rope_tail(q, rd, cos[start:start + l], sin[start:start + l])
-        kv_blk = self._kv(x, start)
-
+        c, s = cos[start:start + l], sin[start:start + l]
         ctx = cache.chrono()
-        kv = mx.concatenate([ctx.astype(kv_blk.dtype), kv_blk], axis=1)
 
-        # dense bidirectional attention with a learned sink per head
-        qf = q.astype(mx.float32)
-        kf = kv.astype(mx.float32)
-        logits = mx.einsum("blhd,bkd->blhk", qf, kf) * self.softmax_scale
-        sink = self.attn_sink.astype(mx.float32).reshape(1, 1, self.n_heads, 1)
-        mmax = mx.maximum(mx.max(logits, axis=-1, keepdims=True), sink)
-        w = mx.exp(logits - mmax)
-        denom = mx.sum(w, axis=-1, keepdims=True) + mx.exp(sink - mmax)
-        o = mx.einsum("blhk,bkd->blhd", w, kf) / denom
+        o = _draft_attn_math_c(q_pre, kv_pre, ctx, c, s, self.attn_sink, rd,
+                               self.softmax_scale)
 
-        o = rope_tail(o, rd, cos[start:start + l], sin[start:start + l], inverse=True)
         o = o.reshape(b, l, self.n_groups, -1)
         if isinstance(self.wo_a, nn.Linear):
             wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
@@ -347,9 +456,11 @@ class DSparkHead(nn.Module):
         # sequential first-order Markov sampling left -> right
         prev = anchor_tokens
         toks, m_embeds = [], []
+        embed_w = self.markov_embed.weight
+        head_w = self.markov_head.weight
         for k in range(bs):
-            m_emb = self.markov_embed(prev)
-            step_logits = base_logits[:, k, :] + self.markov_head(m_emb)
+            m_emb, step_logits = _markov_step_c(
+                prev, base_logits[:, k, :], embed_w, head_w)
             if sharded:
                 nxt = head.combine_argmax(step_logits.astype(mx.float32))
             else:
