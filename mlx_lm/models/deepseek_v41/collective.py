@@ -70,8 +70,40 @@ def _raw(fn):
     return inspect.unwrap(fn)
 
 
+# DSV41_MOE_ALLSUM_BF16=1: shrink the MoE routed-sum collective's payload from
+# fp32 to bf16 (half the wire bytes; on the 2x M4 Max JACCL link the fp32 MoE
+# all_sum costs 141 us/call against 41 us for the same-size bf16 attention
+# all_sum -- D1, scratch/d1/REPORT.md). NOT BIT-EXACT by construction: one
+# rank's partial is rounded to bf16 before the reduction and the reduced result
+# is widened back to fp32 after, so each element carries up to the bf16
+# round-to-nearest relative error (2^-8) plus the reduction's own rounding. Do
+# not use it for token ids or anything that must round-trip exactly; the MoE
+# routed sum is a float sum where that error is acceptable (and the same
+# downcast is what deepseek_v4's process-wide wrapper has always done to fp32
+# collectives). Default OFF: flag off calls the exact fp32 collective.
+_ALLSUM_BF16 = os.environ.get("DSV41_MOE_ALLSUM_BF16", "0") == "1"
+
+
 def all_sum(x, group=None):
     y = _raw(mx.distributed.all_sum)(x, group=group)
     if active():
         mx.eval(y)
     return y
+
+
+def all_sum_lowp(x, group=None):
+    """``all_sum`` for fp32 float payloads that tolerate bf16 rounding.
+
+    Flag OFF (default): exactly ``all_sum(x, group=group)`` -- same op, same
+    payload, byte-identical result.
+    Flag ON: cast the fp32 payload to bf16 for the transfer, widen the reduced
+    result back to the input dtype. The host-sync contract (``active()``) is
+    the one ``all_sum`` implements: the synchronised array is the collective's
+    own output, before the widening cast.
+
+    Only fp32 payloads are touched, so a non-fp32 input (and every caller that
+    does not opt in) is unaffected.
+    """
+    if not _ALLSUM_BF16 or x.dtype != mx.float32:
+        return all_sum(x, group=group)
+    return all_sum(x.astype(mx.bfloat16), group=group).astype(x.dtype)
