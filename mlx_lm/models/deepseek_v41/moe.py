@@ -126,11 +126,14 @@ class MoE(nn.Module):
         weights, indices = self.gate(xf)
         y = self.experts(xf, indices)                            # [tokens, topk, dim]
         y = mx.sum(y.astype(mx.float32) * weights[..., None], axis=-2)
+        # DSV41_MOE_ALLSUM_BF16=1 halves this collective's payload (bf16, not
+        # bit-exact -- see collective.all_sum_lowp). One code path serves both
+        # decode and prefill, so the flag covers both.
         if self.group is not None and self.shared_sharded:
             y = y + self.shared_experts(xf).astype(mx.float32)
-            y = _coll.all_sum(y, group=self.group)
+            y = _coll.all_sum_lowp(y, group=self.group)
         elif self.group is not None:
-            y = _coll.all_sum(y, group=self.group)
+            y = _coll.all_sum_lowp(y, group=self.group)
             y = y + self.shared_experts(xf).astype(mx.float32)
         else:
             y = y + self.shared_experts(xf).astype(mx.float32)
