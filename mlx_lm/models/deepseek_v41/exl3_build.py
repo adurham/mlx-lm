@@ -468,6 +468,33 @@ def _dense(ck: Exl3Checkpoint, name: str):
     return Exl3Proj(load_dense_linear(ck, name))
 
 
+_BIAS_VL_CACHE: dict = {}
+
+
+def bias_vl_sidecar_path(model_dir: str) -> str:
+    """Where the image-routing biases live when the checkpoint dropped them.
+
+    ``gate.bias_vl`` (one fp32 [n_experts] vector per MoE layer) selects the
+    experts for image-span rows. The release ships it; an EXL3 re-quant can
+    drop it (the served dealignai 2.9bpw index has 0 of the release's 43).
+    ``DSV41_BIAS_VL`` overrides; default
+    ``~/.exo/dsv41/gate_bias_vl_<checkpoint dir name>.npz`` (keys = the release
+    tensor names, e.g. ``layers.3.ffn.gate.bias_vl``).
+    """
+    override = os.environ.get("DSV41_BIAS_VL")
+    if override:
+        return os.path.expanduser(override)
+    name = os.path.basename(os.path.normpath(os.path.expanduser(model_dir)))
+    return os.path.expanduser(f"~/.exo/dsv41/gate_bias_vl_{name}.npz")
+
+
+def _bias_vl_sidecar(ck: Exl3Checkpoint):
+    path = bias_vl_sidecar_path(ck.model_dir)
+    if path not in _BIAS_VL_CACHE:
+        _BIAS_VL_CACHE[path] = dict(np.load(path)) if os.path.exists(path) else None
+    return _BIAS_VL_CACHE[path]
+
+
 def build_block(ck: Exl3Checkpoint, args: ModelArgs, layer_id: int, *,
                 native: Exl3Checkpoint | None = None, rank: int = 0,
                 world: int = 1, group=None) -> tuple[Block, dict]:
@@ -554,10 +581,20 @@ def build_block(ck: Exl3Checkpoint, args: ModelArgs, layer_id: int, *,
         hpr = blk.attn.n_heads
         items = [(t, v[rank * hpr:(rank + 1) * hpr] if t == "attn.attn_sink" else v)
                  for t, v in items]
+    vl_src = None
+    if "ffn.gate.bias_vl" in optional:
+        side = _bias_vl_sidecar(ck)
+        key = f"layers.{layer_id}.ffn.gate.bias_vl"
+        if side is not None and key in side:
+            items.append(("ffn.gate.bias_vl", mx.array(side[key], dtype=mx.float32)))
+            optional.discard("ffn.gate.bias_vl")
+            vl_src = "sidecar"
+    elif "ffn.gate.bias_vl" in have:
+        vl_src = "checkpoint"
     blk.load_weights(items, strict=False)
     mx.eval([v for _, v in items])
     return blk, {"dense_groups": len(dense), "plain": len(items), "fused": fused,
-                 "optional_absent": sorted(optional)}
+                 "optional_absent": sorted(optional), "bias_vl": vl_src}
 
 
 def build_model(model_dir: str, *, native_dir: str | None = None,
@@ -609,7 +646,13 @@ def build_model(model_dir: str, *, native_dir: str | None = None,
     if stray:
         raise ValueError(f"unconsumed top-level tensors: {sorted(stray)}")
     args.n_mtp_layers = n_mtp
-    return model, {"layers": reports, "n_mtp_layers_skipped": n_mtp}
+    srcs = {r.get("bias_vl") for r in reports.values()}
+    # True only when EVERY built MoE layer has its image-routing bias: an image
+    # span routed with the text bias is a different model (it loops).
+    model.vl_bias_loaded = bool(reports) and None not in srcs
+    model.vl_bias_source = sorted(s for s in srcs if s) or None
+    return model, {"layers": reports, "n_mtp_layers_skipped": n_mtp,
+                   "vl_bias_loaded": model.vl_bias_loaded}
 
 
 _MTP_TOP = {

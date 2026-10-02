@@ -9,8 +9,9 @@ non-standard:
 * **the selection bias does not reach the routing weights** — scores are read
   before the bias is added; the bias only reorders the top-k. The checkpoint
   carries a second bias, ``gate.bias_vl``, selected for tokens inside image
-  spans (training's ``noaux_tc_for_vl``). This text-only runtime always uses
-  ``gate.bias`` but keeps ``bias_vl`` loaded so the checkpoint round-trips;
+  spans (training's ``noaux_tc_for_vl``). Rows flagged by ``image_mask``
+  select experts with ``bias_vl``; every other row (all of text, decode and
+  the draft head) uses ``gate.bias``;
 * top-k weights are normalized by ``sum + 1e-20`` (not ``norm_eps``) and scaled
   by ``routed_scaling_factor`` 1.5;
 * clamped SwiGLU (limit 10): ``up`` clamped two-sided, ``gate`` upper-only.
@@ -69,7 +70,9 @@ class Gate(nn.Module):
         self.bias = mx.zeros((n_experts,), dtype=mx.float32)
         self.bias_vl = mx.zeros((n_experts,), dtype=mx.float32)
 
-    def __call__(self, x: mx.array):
+    def __call__(self, x: mx.array, image_mask: mx.array | None = None):
+        """x [tokens, dim]; image_mask [tokens] bool, True inside image spans
+        (selects ``bias_vl``, reference ``Gate.forward``)."""
         scores = (x.astype(mx.float32) @ self.weight.astype(mx.float32).T) / self.gate_temp
         if self.score_func == "softmax":
             scores = mx.softmax(scores, axis=-1)
@@ -79,7 +82,10 @@ class Gate(nn.Module):
             scores = mx.sqrt(nn.softplus(scores))
 
         # the bias picks experts but does not scale them
-        biased = scores + self.bias
+        bias = self.bias
+        if image_mask is not None:
+            bias = mx.where(image_mask[:, None], self.bias_vl, bias)
+        biased = scores + bias
         indices = mx.argpartition(-biased, self.topk - 1, axis=-1)[..., :self.topk]
         weights = mx.take_along_axis(scores, indices, axis=-1)
         if self.norm_topk_prob and self.topk > 1:
@@ -120,10 +126,11 @@ class MoE(nn.Module):
         self.group = None
         self.shared_sharded = False
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, image_mask: mx.array | None = None) -> mx.array:
         shape = x.shape
         xf = x.reshape(-1, self.dim)
-        weights, indices = self.gate(xf)
+        weights, indices = self.gate(
+            xf, None if image_mask is None else image_mask.reshape(-1))
         y = self.experts(xf, indices)                            # [tokens, topk, dim]
         y = mx.sum(y.astype(mx.float32) * weights[..., None], axis=-2)
         if self.group is not None and self.shared_sharded:

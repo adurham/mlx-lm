@@ -42,6 +42,26 @@ _HC_FUSED = os.environ.get("DSV41_HC_FUSED", "1") == "1"
 _ASYNC_EVAL = os.environ.get("DSV41_ASYNC_EVAL", "1") == "1"
 
 
+def image_rows(vl_mask, start_pos: int, b: int, n: int):
+    """This forward's slice of the turn's image-row mask, or None.
+
+    ``vl_mask`` is (1, S) bool over absolute positions (True = image-span row)
+    or None. Returns a (b, n) bool array when any row of
+    [start_pos, start_pos + n) is an image row, else None -- so a text forward,
+    a later prefill piece past the span, and every decode row take the
+    unmasked path, op for op identical to a model without vision.
+    """
+    if vl_mask is None:
+        return None
+    vl = np.asarray(vl_mask, dtype=bool).reshape(1, -1)
+    if start_pos >= vl.shape[1]:
+        return None
+    seg = np.zeros((b, n), dtype=bool)
+    part = vl[:, start_pos:start_pos + n]
+    seg[:, :part.shape[1]] = part
+    return seg if seg.any() else None
+
+
 class SharedState:
     """What attention layers hand down the stack instead of recomputing.
 
@@ -52,6 +72,7 @@ class SharedState:
         self.index_src_cache = None    # LayerCache of the most recent index-key owner
         self.topk_idxs = None          # [b, n, k] from the most recent index source
         self.candidates = None         # [b, n, nb] bool from the candidate source
+        self.image_mask = None         # [b, n] bool, True on image-span rows (VL routing bias)
 
 
 class Block(nn.Module):
@@ -101,7 +122,7 @@ class Block(nn.Module):
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
             self.hc_mult, self.hc_iters, self.norm_eps, self.hc_eps)
         h = hc_pre(x, attn_pre)
-        h = self.ffn(self.ffn_norm(h))
+        h = self.ffn(self.ffn_norm(h), getattr(shared, "image_mask", None))
         x = hc_post(h, residual, ffn_post, ffn_comb)
         return x, ffn_pre
 
@@ -114,7 +135,7 @@ class Block(nn.Module):
         h, ffn_pre, ffn_post, ffn_comb = mixes_and_collapse(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, attn_pre,
             self.hc_iters, self.norm_eps, self.hc_eps)
-        h = self.ffn(self.ffn_norm(h))
+        h = self.ffn(self.ffn_norm(h), getattr(shared, "image_mask", None))
         x = hc_expand(h, x, ffn_post, ffn_comb)
         return x, ffn_pre
 
@@ -190,10 +211,18 @@ class Model(nn.Module):
         start_pos = cache.offset
         b, n = input_ids.shape
 
+        # Image-span rows of THIS forward (reference Transformer.forward:
+        # image_mask = token_types >= 0). ``vl_mask`` is installed by the caller
+        # for an image-carrying turn (absolute positions, True = image row);
+        # rows past it, every text forward and every decode row get None, so
+        # the text path is unchanged op for op.
+        img = image_rows(getattr(self, "vl_mask", None), start_pos, b, n)
+
         hashes = None
         if self.engram_hasher is not None:
             ids_np = np.array(input_ids, dtype=np.int64)
-            hashes = self.engram_hasher(ids_np, start_pos, cache.engram_ids)
+            hashes = self.engram_hasher(ids_np, start_pos, cache.engram_ids,
+                                        None if img is None else ~img)
             if getattr(self, "_host_engram", False):
                 for layer in self.layers:
                     emb = getattr(layer.engram, "embed", None) if layer.engram is not None else None
@@ -211,6 +240,10 @@ class Model(nn.Module):
 
         pre_mix = make_identity_pre_mix(b, n, self.hc_mult)
         shared = SharedState()
+        engram_mask = None
+        if img is not None:
+            shared.image_mask = mx.array(img)
+            engram_mask = mx.array(~img)
         tap_ids = set(self.args.dspark_target_layer_ids) if return_taps else set()
         taps = {}
         # Prefill fence (prefill.py): during a multi-row forward, commit the
@@ -221,7 +254,8 @@ class Model(nn.Module):
         fence = getattr(self, "_fence_every", 0) if n > 1 else 0
         for layer in self.layers:
             if layer.engram is not None:
-                h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index])
+                h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index],
+                                 engram_mask)
             # the draft head reads the INPUT of its target layers (reference
             # Transformer.forward), not their output
             if layer.layer_id in tap_ids:
@@ -230,6 +264,7 @@ class Model(nn.Module):
                 shared_use = SharedState()           # sever the link: consumers see nothing
                 shared_use.kv_src_cache = shared.kv_src_cache
                 shared_use.index_src_cache = shared.index_src_cache
+                shared_use.image_mask = shared.image_mask
                 zero = mx.full(shared.topk_idxs.shape, -1, dtype=mx.int32) \
                     if shared.topk_idxs is not None else None
                 shared_use.topk_idxs = zero

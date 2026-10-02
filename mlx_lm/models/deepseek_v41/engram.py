@@ -12,8 +12,11 @@ token map (case/accent/whitespace-normalized), so " The"/"the"/"THE" collapse.
 The hash: per layer, one odd int64 multiplier per lookback position (seeded
 ``default_rng(10007 * layer_id)``); the running XOR of ``token * multiplier``
 after i steps is the (i+1)-gram hash, taken mod each head's prime. Lookback
-stops at the sequence start (and at image spans, which this text-only runtime
-never produces); blocked slots read the compressed pad token.
+stops at the sequence start and at image spans (``token_mask`` False: the
+position is cached as ``DEAD`` so no n-gram ever spans one, across chunks and
+into decode); blocked slots read the compressed pad token. Image positions also
+get no engram write (the gate is shut there), exactly as the reference's
+``Transformer.forward`` passes ``engram_mask = ~image_mask``.
 
 Decode needs the previous 3 compressed ids, so :class:`EngramHasher` keeps a
 per-sequence id cache — the model's cache object owns one.
@@ -153,16 +156,24 @@ class EngramHasher:
             raise ValueError(f"prime sums {sums} != engram_num_embeddings "
                              f"{args.engram_num_embeddings}")
 
+    #: compressed-id sentinel for positions that take no part in any n-gram
+    #: (image spans); the reference's ``NgramHashState.DEAD``.
+    DEAD = -1
+
     def __call__(self, input_ids: np.ndarray, start_pos: int,
-                 ids_cache: np.ndarray) -> np.ndarray:
+                 ids_cache: np.ndarray, token_mask: np.ndarray | None = None) -> np.ndarray:
         """input_ids [B, L] -> hash ids [B, L, n_engram_layers, (G-1)*H].
 
         ``ids_cache`` [B, max_seq] carries compressed ids across chunks; this
-        call writes positions [start_pos, start_pos+L) into it.
+        call writes positions [start_pos, start_pos+L) into it. ``token_mask``
+        [B, L] bool is False for image-span positions: they are cached as
+        ``DEAD`` and every look-back that reaches one is blocked (pad).
         """
         input_ids = np.asarray(input_ids)
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
+        if token_mask is not None:
+            compressed = np.where(np.asarray(token_mask, dtype=bool), compressed, self.DEAD)
         ids_cache[:batch, start_pos:start_pos + seqlen] = compressed
 
         positions = np.broadcast_to(np.arange(start_pos, start_pos + seqlen), (batch, seqlen))
@@ -170,7 +181,7 @@ class EngramHasher:
         for shift in range(self.max_ngram):
             src_pos = np.clip(positions - shift, 0, None)
             source = np.take_along_axis(ids_cache[:batch], src_pos, axis=1)
-            blocked = blocked | (positions < shift)
+            blocked = blocked | (positions < shift) | (source == self.DEAD)
             tokens.append(np.where(blocked, self.pad_id, source))
         tokens = np.stack(tokens, axis=-1)                       # [B, L, G]
 
@@ -244,8 +255,11 @@ class Engram(nn.Module):
         self.q_weight = mx.ones((args.hc_mult, args.dim), dtype=mx.float32)
         self.k_weight = mx.ones((args.hc_mult, args.dim), dtype=mx.float32)
 
-    def __call__(self, x: mx.array, hash_ids: mx.array) -> mx.array:
-        """x [B, L, hc, dim]; hash_ids [B, L, n_hash_cols]."""
+    def __call__(self, x: mx.array, hash_ids: mx.array,
+                 token_mask: mx.array | None = None) -> mx.array:
+        """x [B, L, hc, dim]; hash_ids [B, L, n_hash_cols]; token_mask [B, L]
+        bool, False shuts the gate so those positions (image spans) pass
+        through untouched (reference ``Engram.forward``)."""
         rows = self.embed(hash_ids)                              # [B, L, cols, hd] fp32
         rows = rows.reshape(*rows.shape[:-2], -1).astype(x.dtype)
         kv = self.wkv(rows)                                      # [B, L, (hc+1)*dim]
@@ -262,5 +276,7 @@ class Engram(nn.Module):
         # signed sqrt before the sigmoid, matching the training kernel
         mag = mx.sqrt(mx.maximum(mx.abs(dot), self.clamp_value))
         gate = mx.sigmoid(mx.where(dot < 0, -mag, mag))
+        if token_mask is not None:
+            gate = mx.where(token_mask[..., None], gate, 0.0)
         out = h + gate[..., None] * value[..., None, :]
         return out.astype(x.dtype)
