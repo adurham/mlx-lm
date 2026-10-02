@@ -118,6 +118,16 @@ class _Grouped(nn.Module):
 
 _ENGRAM_POOL = None
 
+# Read shape for the engram tables (module read at import; the A/B flips the
+# env at relaunch). "legacy" keeps the original per-row fan-out: one pool task
+# per unique row for the weights and one for the scales -- 2*U tiny
+# submit/result round trips per lookup (80 816 tasks for a 2048-row chunk at
+# U = 40 408). "coarse" groups the rows into contiguous index slices and reads
+# each slice with ONE task that loops its rows: 2*min(_ENGRAM_SLICES, U) tasks,
+# same preads, same bytes. Root cause is the per-row granularity, not the I/O.
+_ENGRAM_READ = os.environ.get("DSV41_ENGRAM_READ", "legacy")
+_ENGRAM_SLICES = int(os.environ.get("DSV41_ENGRAM_SLICES", "64"))
+
 
 def _engram_pool():
     global _ENGRAM_POOL
@@ -371,10 +381,41 @@ class LazyEngramTable(nn.Module):
         fw, bw, ww = self._loc(self._w)
         fs, bs, ws = self._loc(self._s)
         pool = _engram_pool()
-        fut_w = [pool.submit(os.pread, fw, ww, bw + int(r) * ww) for r in uniq]
-        fut_s = [pool.submit(os.pread, fs, ws, bs + int(r) * ws) for r in uniq]
-        w = np.frombuffer(b"".join(f.result() for f in fut_w), np.uint8).reshape(len(uniq), ww)
-        sc = np.frombuffer(b"".join(f.result() for f in fut_s), np.uint8).reshape(len(uniq), ws)
+        n = len(uniq)
+        if _ENGRAM_READ != "coarse":
+            # legacy shape: one pool task PER ROW per tensor (2*n tasks), each
+            # result joined one by one -- the per-task Python overhead this
+            # branch exists to avoid.
+            fut_w = [pool.submit(os.pread, fw, ww, bw + int(r) * ww) for r in uniq]
+            fut_s = [pool.submit(os.pread, fs, ws, bs + int(r) * ws) for r in uniq]
+            w = np.frombuffer(b"".join(f.result() for f in fut_w), np.uint8).reshape(n, ww)
+            sc = np.frombuffer(b"".join(f.result() for f in fut_s), np.uint8).reshape(n, ws)
+            return w, sc
+        # coarse shape: the rows are split into min(_ENGRAM_SLICES, n) contiguous
+        # index slices; each slice is read by ONE task looping its rows into a
+        # preallocated bytearray. Same preads, same offsets, same bytes.
+        wb = bytearray(n * ww)
+        sb = bytearray(n * ws)
+        if n:
+            k = max(1, min(_ENGRAM_SLICES, n))
+            step = -(-n // k)
+
+            def slurp(lo: int, hi: int, fd: int, base: int, width: int, mv) -> None:
+                for i in range(lo, hi):
+                    mv[i * width:(i + 1) * width] = os.pread(
+                        fd, width, base + int(uniq[i]) * width)
+
+            futs = [pool.submit(slurp, i * step, min((i + 1) * step, n),
+                                fw, bw, ww, memoryview(wb))
+                    for i in range(k)]
+            futs += [pool.submit(slurp, i * step, min((i + 1) * step, n),
+                                 fs, bs, ws, memoryview(sb))
+                     for i in range(k)]
+            for f in futs:
+                f.result()
+        # bytes() keeps the read-only flag the legacy join produced
+        w = np.frombuffer(bytes(wb), np.uint8).reshape(n, ww)
+        sc = np.frombuffer(bytes(sb), np.uint8).reshape(n, ws)
         return w, sc
 
     def prefetch(self, indices) -> None:
