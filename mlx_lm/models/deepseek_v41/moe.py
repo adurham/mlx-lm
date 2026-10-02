@@ -22,6 +22,8 @@ replace the reference's per-expert Python loop.
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 from . import collective as _coll
@@ -29,6 +31,32 @@ import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from .config import ModelArgs
+
+# Compile the gate body (same ops, fewer launches; bit-exact). Default off; the
+# A/B flips DSV41_GATE_COMPILE=1 at relaunch.
+_GATE_COMPILE = os.environ.get("DSV41_GATE_COMPILE", "0") == "1"
+
+
+def _gate_math(x, weight, bias, topk, gate_temp, score_func, norm_topk_prob, route_scale):
+    scores = (x.astype(mx.float32) @ weight.astype(mx.float32).T) / gate_temp
+    if score_func == "softmax":
+        scores = mx.softmax(scores, axis=-1)
+    elif score_func == "sigmoid":
+        scores = mx.sigmoid(scores)
+    else:  # sqrtsoftplus
+        scores = mx.sqrt(nn.softplus(scores))
+
+    # the bias picks experts but does not scale them
+    biased = scores + bias
+    indices = mx.argpartition(-biased, topk - 1, axis=-1)[..., :topk]
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    if norm_topk_prob and topk > 1:
+        weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
+    weights = weights * route_scale
+    return weights, indices
+
+
+_gate_math_c = mx.compile(_gate_math)
 
 
 class ClampedSwiGLU(nn.Module):
@@ -70,22 +98,11 @@ class Gate(nn.Module):
         self.bias_vl = mx.zeros((n_experts,), dtype=mx.float32)
 
     def __call__(self, x: mx.array):
-        scores = (x.astype(mx.float32) @ self.weight.astype(mx.float32).T) / self.gate_temp
-        if self.score_func == "softmax":
-            scores = mx.softmax(scores, axis=-1)
-        elif self.score_func == "sigmoid":
-            scores = mx.sigmoid(scores)
-        else:  # sqrtsoftplus
-            scores = mx.sqrt(nn.softplus(scores))
-
-        # the bias picks experts but does not scale them
-        biased = scores + self.bias
-        indices = mx.argpartition(-biased, self.topk - 1, axis=-1)[..., :self.topk]
-        weights = mx.take_along_axis(scores, indices, axis=-1)
-        if self.norm_topk_prob and self.topk > 1:
-            weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
-        weights = weights * self.route_scale
-        return weights, indices
+        if _GATE_COMPILE:
+            return _gate_math_c(x, self.weight, self.bias, self.topk, self.gate_temp,
+                                self.score_func, self.norm_topk_prob, self.route_scale)
+        return _gate_math(x, self.weight, self.bias, self.topk, self.gate_temp,
+                          self.score_func, self.norm_topk_prob, self.route_scale)
 
 
 class SharedExpert(nn.Module):
