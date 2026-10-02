@@ -128,6 +128,53 @@ _ENGRAM_POOL = None
 # same preads, same bytes. Root cause is the per-row granularity, not the I/O.
 _ENGRAM_READ = os.environ.get("DSV41_ENGRAM_READ", "coarse")
 _ENGRAM_SLICES = int(os.environ.get("DSV41_ENGRAM_SLICES", "64"))
+# W5b exposure levers (default OFF; same preads, same offsets, same bytes):
+# * DSV41_ENGRAM_SERIAL=1 -- the forward prefetches BOTH engram tables at chunk
+#   top (model.py), and both reads share the 32-worker pool, so layer 14's
+#   ~U preads compete with layer 1's (the one with ~0.5 s of lead). Serial
+#   starts each table's read only after the previously issued one finished.
+# * DSV41_ENGRAM_NOCACHE=1 -- each read pulls >= one 16 KB page per 256-byte
+#   row into the unified buffer cache (~U x 16 KB per table per chunk, ~1.4 GB
+#   at 4096 rows) on a box with ~0.1 GB free. Ask the kernel not to keep them:
+#   macOS F_NOCACHE + F_RDAHEAD=0 on the table's fd; elsewhere
+#   POSIX_FADV_RANDOM. Advisory only -- the kernel returns the same bytes.
+_ENGRAM_SERIAL = os.environ.get("DSV41_ENGRAM_SERIAL", "0") == "1"
+_ENGRAM_NOCACHE = os.environ.get("DSV41_ENGRAM_NOCACHE", "0") == "1"
+_ENGRAM_LAST: list = [None]     # last issued table-read future (serial mode)
+_NOCACHE_DONE: set = set()
+
+
+def _engram_nocache(fd: int) -> str:
+    """Advise the kernel not to cache/read-ahead ``fd``. Returns what was applied."""
+    if fd in _NOCACHE_DONE:
+        return "done"
+    import fcntl
+    import sys
+    applied = []
+    if sys.platform == "darwin":
+        # <sys/fcntl.h>: F_RDAHEAD 45, F_NOCACHE 48 (Python exposes F_NOCACHE
+        # on macOS; F_RDAHEAD only on newer builds)
+        fcntl.fcntl(fd, int(getattr(fcntl, "F_NOCACHE", 48)), 1)
+        fcntl.fcntl(fd, int(getattr(fcntl, "F_RDAHEAD", 45)), 0)
+        applied = ["F_NOCACHE", "F_RDAHEAD=0"]
+    elif hasattr(os, "posix_fadvise"):
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+        applied = ["POSIX_FADV_RANDOM"]
+    _NOCACHE_DONE.add(fd)
+    return "+".join(applied) or "none"
+
+
+_ENGRAM_CHAIN = None
+
+
+def _engram_chain():
+    """One-worker executor that orders table reads (DSV41_ENGRAM_SERIAL).
+    The reads themselves still fan out on ``_engram_pool``."""
+    global _ENGRAM_CHAIN
+    if _ENGRAM_CHAIN is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _ENGRAM_CHAIN = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram-chain")
+    return _ENGRAM_CHAIN
 
 
 def _engram_pool():
@@ -381,6 +428,9 @@ class LazyEngramTable(nn.Module):
     def _read(self, uniq: np.ndarray):
         fw, bw, ww = self._loc(self._w)
         fs, bs, ws = self._loc(self._s)
+        if _ENGRAM_NOCACHE:
+            _engram_nocache(fw)
+            _engram_nocache(fs)
         pool = _engram_pool()
         n = len(uniq)
         if _ENGRAM_READ != "coarse":
@@ -422,7 +472,25 @@ class LazyEngramTable(nn.Module):
     def prefetch(self, indices) -> None:
         idx = np.asarray(indices, dtype=np.int64)
         uniq = np.unique(idx.reshape(-1))
-        self._pending = (idx.tobytes(), uniq, _engram_pool().submit(self._read, uniq))
+        if _ENGRAM_SERIAL:
+            # chain behind the previously issued table read: the first
+            # engram layer's rows get the whole pool. A dedicated 1-worker
+            # executor runs the waits so no pool worker blocks on another.
+            prev = _ENGRAM_LAST[0]
+
+            def chained(u=uniq, p=prev):
+                if p is not None:
+                    try:
+                        p.result()
+                    except Exception:   # the owner re-raises at __call__
+                        pass
+                return self._read(u)
+
+            fut = _engram_chain().submit(chained)
+            _ENGRAM_LAST[0] = fut
+        else:
+            fut = _engram_pool().submit(self._read, uniq)
+        self._pending = (idx.tobytes(), uniq, fut)
 
     def __call__(self, indices) -> mx.array:
         idx = np.asarray(indices, dtype=np.int64)
