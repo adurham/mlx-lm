@@ -344,6 +344,19 @@ _SHARD_SHARED = os.environ.get("DSV41_TP_SHARED", "1") == "1"
 _SHARD_ATTN = os.environ.get("DSV41_TP_ATTN", "1") == "1"
 _DRAFT_SHARD = os.environ.get("DSV41_DRAFT_SHARD", "1") == "1"
 _SHARD_HEAD = os.environ.get("DSV41_TP_HEAD", "1") == "1"
+_MARKOV_REP = os.environ.get("DSV41_RD_MARKOV_REP", "0") == "1"
+
+
+def _shard_markov(world: int, group) -> bool:
+    """Should build_mtp slice the markov head's vocab projection?
+
+    Every default here matches the pre-flag behaviour exactly; the only
+    change is the trailing ``not _MARKOV_REP`` -- the D2 flag that keeps the
+    markov head replicated (see build_mtp). Split out as a function so the
+    gate itself is unit-pinnable without a checkpoint.
+    """
+    return bool(world > 1 and _SHARD_HEAD and group is not None and _DRAFT_SHARD
+                and not _MARKOV_REP)
 
 
 class LazyEngramTable(nn.Module):
@@ -625,7 +638,20 @@ def build_mtp(ck: Exl3Checkpoint, args: ModelArgs, *, rank: int = 0, world: int 
     items = [(t, _plain(ck, n, mx.float32 if any(f in t for f in fp32) else None))
              for t, n in have.items()]
     head.load_weights(items, strict=False)
-    if world > 1 and _SHARD_HEAD and group is not None and _DRAFT_SHARD:
+    # DSV41_RD_MARKOV_REP=1 (default OFF, D2 round-sync work): keep the markov
+    # head's vocab projection REPLICATED (full width on every rank) instead of
+    # slicing it, so the markov sampling loop in DSparkHead._draft takes the
+    # local argmax per step rather than head.combine_argmax -- gamma SERIAL
+    # collective waits per draft collapse into ONE padded [b, bs, vocab] fp32
+    # all_sum for the full base row (ShardedHead.__call__). Bit-exact vs the
+    # sliced head: each logit element is an independent dot product, and
+    # combine_argmax's padded all_sum + first-max-over-ranks picks exactly the
+    # full row's first-occurrence argmax (ties -> lowest vocab id), which the
+    # local argmax also returns. Trade: fewer, but LARGER, collectives; wire
+    # bytes go UP (~16 B x gamma -> ~1.5 MB), count goes DOWN by gamma-1.
+    # Cost: the replicated markov_head is vocab*markov_rank fp16 extra per
+    # rank (128800*256*2 ~= 63 MB at this checkpoint).
+    if _shard_markov(world, group):
         v = args.vocab_size // world
         w = head.markov_head.weight[rank * v:(rank + 1) * v]
         head.markov_head = nn.Linear(w.shape[1], w.shape[0], bias=False)
