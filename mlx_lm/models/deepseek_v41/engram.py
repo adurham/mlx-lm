@@ -26,6 +26,8 @@ the value into the stream by a normalized stream-key dot product pushed through
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
@@ -225,6 +227,42 @@ class QuantizedEngramEmbedding(nn.Module):
         return out.astype(mx.float32)
 
 
+#: Prefill transient bound (W5b, default OFF). A multi-row Engram step builds
+#: ~8 full-size fp32 copies of the hc stream ([B, L, hc, dim] -- 336 MB each at
+#: L=4096) plus the projection's decoded weight; evaluated as one lazy graph
+#: they are live together. With DSV41_ENGRAM_TILE_ROWS=T > 0, a forward with
+#: L > T rows evaluates the gate chain in row tiles of ~T rows, one mx.eval
+#: fence per tile, so only one tile's fp32 chain is live at a time. Every op in
+#: the chain is elementwise or a reduction over the last (dim) axis, so each
+#: row's bytes are the untiled bytes. The table is still read ONCE per call
+#: (same ids => the prefetch still hits). DSV41_ENGRAM_TILE_PROJ=1 additionally
+#: row-tiles the wkv projection; every tile keeps > _TILE_MIN_ROWS rows so it
+#: takes the same multi-row projection path as the untiled call.
+_TILE_ROWS = int(os.environ.get("DSV41_ENGRAM_TILE_ROWS", "0"))
+_TILE_PROJ = os.environ.get("DSV41_ENGRAM_TILE_PROJ", "0") == "1"
+# EXL3Proj switches kernels at <=16 and <=EXL3_FUSED_ROW_LIMIT (64) rows;
+# reductions switch at < 32 rows. A tile never goes below this.
+_TILE_MIN_ROWS = max(128, int(os.environ.get("EXL3_FUSED_ROW_LIMIT", "64")) + 1)
+
+
+def row_tiles(n: int, tile: int) -> list:
+    """Half-open row ranges covering [0, n) in steps of ``tile``.
+
+    ``[(0, n)]`` (no tiling) when ``tile <= 0`` or ``n <= tile``. ``tile`` is
+    raised to ``_TILE_MIN_ROWS``; a tail shorter than that is merged into the
+    previous tile, so every tile has >= _TILE_MIN_ROWS rows."""
+    if tile <= 0 or n <= tile:
+        return [(0, n)]
+    tile = max(int(tile), _TILE_MIN_ROWS)
+    if n <= tile:
+        return [(0, n)]
+    out = [(s, min(s + tile, n)) for s in range(0, n, tile)]
+    if out[-1][1] - out[-1][0] < _TILE_MIN_ROWS:
+        tail = out.pop()
+        out[-1] = (out[-1][0], tail[1])
+    return out
+
+
 class Engram(nn.Module):
     """Gated write of the n-gram lookup into the hc-expanded residual stream."""
 
@@ -246,9 +284,26 @@ class Engram(nn.Module):
 
     def __call__(self, x: mx.array, hash_ids: mx.array) -> mx.array:
         """x [B, L, hc, dim]; hash_ids [B, L, n_hash_cols]."""
+        tiles = row_tiles(int(x.shape[1]), _TILE_ROWS)
         rows = self.embed(hash_ids)                              # [B, L, cols, hd] fp32
-        rows = rows.reshape(*rows.shape[:-2], -1).astype(x.dtype)
-        kv = self.wkv(rows)                                      # [B, L, (hc+1)*dim]
+        if len(tiles) == 1:
+            return self._gate(x, self._project(rows, x.dtype))
+        # Tiled (DSV41_ENGRAM_TILE_ROWS): one table lookup for the whole call,
+        # then the per-row work tile by tile, each tile fenced.
+        kv = None if _TILE_PROJ else self._project(rows, x.dtype)
+        outs = []
+        for s, e in tiles:
+            kv_t = self._project(rows[:, s:e], x.dtype) if kv is None else kv[:, s:e]
+            o = self._gate(x[:, s:e], kv_t)
+            mx.eval(o)
+            outs.append(o)
+        return mx.concatenate(outs, axis=1)
+
+    def _project(self, rows: mx.array, dtype) -> mx.array:
+        rows = rows.reshape(*rows.shape[:-2], -1).astype(dtype)
+        return self.wkv(rows)                                    # [B, L, (hc+1)*dim]
+
+    def _gate(self, x: mx.array, kv: mx.array) -> mx.array:
         key = kv[..., :self.hc_mult * self.dim].astype(mx.float32)
         value = kv[..., self.hc_mult * self.dim:].astype(mx.float32)
         key = key.reshape(*key.shape[:-1], self.hc_mult, self.dim)
