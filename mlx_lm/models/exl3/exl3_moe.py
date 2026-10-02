@@ -52,6 +52,30 @@ _MOE_V2 = os.environ.get("EXL3_MOE_V2", "1") == "1"
 # v19 segmented simdgroup GEMM for prefill (EXL3_MOE_MM=0 falls back to
 # decode-all + sorted gather_mm)
 _MOE_MM = os.environ.get("EXL3_MOE_MM", "1") == "1"
+
+# --- expert-grouped multi-row decode (W4) ---------------------------------
+# DSV41_MOE_GROUPED=1 makes the R<=8 spec-verify decode path decode each
+# DISTINCT expert's trellis tiles once and apply them to every (row, expert)
+# slot routed there, instead of once per slot. The fused2 kernels above charge
+# the full per-slot trellis-decode cost for every slot even when rows share
+# experts (w3gpu A: 0.87 ms/layer at R=4 real routing vs a 0.23 ms bandwidth
+# floor; 16.9 distinct experts of 24 slots) because each threadgroup owns ONE
+# slot and decodes its expert itself (exl3_moe.py A2 `slot = blkg / groups`).
+# The grouped A2G kernel keeps the per-slot decode ORDER and arithmetic
+# EXACTLY the fused2 order -- each slot's gate/up columns are still written by
+# ONE threadgroup running the identical tile loop on identical inputs; the
+# only change is WHICH threadgroup does it -- so ygu is bit-identical by
+# construction, and the B2 down kernel is reused VERBATIM on it (bit-exact
+# end to end; the downstream fp32 weighted-sum accumulation order is the
+# caller's and is untouched). The per-expert (expert, start, count, slot-list)
+# tables are built ON DEVICE by an in-graph compiled step (`_grouped_tables_fn`)
+# from a stable slot sort: fixed shapes for a given (E, slots, SLOTS_MAX), no
+# host sync, no data-dependent grid. Padding slots (expert id E) exit before
+# the trellis. Default 0 (OFF): fused2 runs op-for-op unchanged.
+_MOE_GROUPED = os.environ.get("DSV41_MOE_GROUPED", "0") == "1"
+# Padded slot-list width per expert. The real per-expert maximum is R (all rows
+# route the same expert); >= R only costs table bytes, not kernel work.
+_SLOTS_MAX = int(os.environ.get("DSV41_MOE_SLOTS_MAX", "8") or 8)
 _MOE_KERNELS: dict[tuple[int, int] | tuple[int, int, str], tuple[Any, Any]] = {}
 _SEG_BM = 64
 # Hybrid crossover: above this many sorted (token, slot) rows the steel
@@ -144,6 +168,78 @@ def _seg_table_fn(E: int, nb_max: int, bm: int) -> Callable[[mx.array], tuple[mx
 
     return _fn
 
+
+# --- W4: on-device per-expert slot tables (expert-grouped decode) ------------
+# Build order contract (must mirror EXL3SwitchGLU._decode_fused2 exactly):
+#   sel = indices.reshape(-1)                       # ORIGINAL slot order
+#   suh_sel = gu_suh[sel].reshape(E_sel*2, D)
+#   x_rep = broadcast x over (E_sel*2, D)
+#   xh = rows_prep(x_rep, suh_sel)                  # row (slot*2 + is_up)
+# The grouped path only ever PERMUTES which threadgroup computes each row of
+# that xh -> ygu mapping; the mapping itself is unchanged.
+
+
+def _grouped_tables_fn(
+    E: int, n_slots: int, sm: int
+) -> Callable[[mx.array, mx.array], tuple[mx.array, mx.array]]:
+    """Compiled slot -> (expert tables, slot list) for the grouped kernels.
+
+    Input: ``srt`` = expert id per sorted position and ``slots`` = ORIGINAL
+    slot id per sorted position (the pair ``_decode_grouped`` builds from the
+    unique sort keys ``expert*n_pad + slot``: grouped by expert, each
+    expert's slots in ascending original slot order; padding positions carry
+    expert id E and slot id 0, and sort last). Output, all uint32, fixed
+    shapes for a given (E, n_slots, sm), built entirely on device:
+
+    - ``tabs`` (2, E): [expert id, number of real slots routed to it].
+    - ``slist`` (E, sm): for each expert, the ORIGINAL slot ids routed to it
+      in ascending order, padded with 0.
+    """
+    key = (E, n_slots, sm)
+
+    @mx.compile
+    def _fn(srt: mx.array, slots: mx.array):
+        # real positions come first (padding expert id E sorts last)
+        real = srt < E
+        # run boundaries in the expert-sorted slot vector: first position of
+        # each run (cummax of positions at changes = last run start <= p)
+        pos = mx.arange(n_slots, dtype=mx.uint32)
+        changed = mx.concatenate(
+            [mx.ones((1,), dtype=mx.bool_), srt[1:] != srt[:-1]]
+        )
+        first_pos = mx.cummax(pos * changed)
+        seq = pos - first_pos  # 0-based slot rank within its expert's run
+        # scatter each real slot into its expert's padded slot list; unrouted
+        # experts stay all-zero and are never read (cnt == 0). The seq < sm
+        # guard keeps the flat scatter in bounds even if a caller ever routes
+        # more than sm slots to one expert (real routing cannot: a row's
+        # top-k experts are distinct, so a per-expert count is <= R <= sm)
+        # -- extra slots are dropped, matching the clipped count below.
+        keep = real & (seq < sm)
+        sl_idx = mx.where(keep, srt * sm + seq, E * sm)
+        slist = mx.full((E * sm + 1,), 0, dtype=mx.uint32).at[sl_idx].add(
+            mx.where(keep, slots, 0)
+        )
+        # per-expert real-slot count (padding expert id E is the write guard);
+        # clipped to sm: the caller guarantees count <= sm (top-k experts are
+        # distinct within a row, so a per-expert count is <= R <= sm), the
+        # clip only keeps the kernel in-bounds if that invariant is violated
+        e_idx = mx.where(real, srt, E)
+        counts = mx.minimum(
+            mx.zeros((E + 1,), dtype=mx.uint32).at[e_idx].add(1)[:E], sm
+        )
+        tabs = mx.stack([mx.arange(E, dtype=mx.uint32), counts]).astype(
+            mx.uint32
+        )
+        return tabs, slist[: E * sm].reshape(E, sm)
+
+    _grouped_tables_cache[key] = _fn
+    return _fn
+
+
+_grouped_tables_cache: dict[
+    tuple[int, int, int], Callable[[mx.array, mx.array], tuple[mx.array, mx.array]]
+] = {}
 _compiled_rows_prep: Callable[[mx.array, mx.array], mx.array] | None = None
 _compiled_rows_finish: Callable[[mx.array, mx.array], mx.array] | None = None
 
@@ -420,6 +516,54 @@ def _moe_gateup2_source(k: int, cb: CodebookMode, tiles: int = 1) -> str:
 """
 
 
+def _moe_gateup2_grouped_source(
+    k: int, cb: CodebookMode, tiles: int = 1, sm: int = 8
+) -> str:
+    """Kernel A2G: A2's tile loop with the slot list walked INSIDE the group.
+
+    Same grid shape as A2 (one (expert-sorted-slot, tile-run) pair per
+    threadgroup), same per-slot trellis-decode order and arithmetic, one
+    change only: the slot indirection. ``gslot`` indexes the EXPERT-SORTED
+    slot vector (slots grouped by expert, ascending); ``slist[e]`` maps each
+    grouped position to its ORIGINAL slot id, and ``xh``/``out`` rows are
+    read/written through those original ids. Distinct experts therefore
+    decode their trellis tiles exactly once and apply them to every slot
+    routed there; each slot's 16-column output is still produced by ONE
+    threadgroup running the identical tile loop on identical inputs, so the
+    output buffer is byte-identical to A2's and the downstream B2 kernel is
+    reused verbatim. Unrouted experts (count 0, incl. the padding id E) exit
+    before touching the trellis.
+    """
+    decode = __import__(f"{__package__}.gemv_metal", fromlist=["_decode_expr"])._decode_expr(cb, cw_in="cw")
+    return f"""
+#define PACKED_U32 {k * 256 // 32}
+#define K_BITS {k}
+#define SM {sm}u
+    uint in_tiles = dims[0];
+    uint gu_tiles = dims[1];          // tiles per gate (== per up)
+    uint src_tiles = dims[2];         // stride of the stacked trellis
+    uint in_features = in_tiles * 16u;
+    uint E_total = dims[3];           // real experts; padding id == E_total
+    uint groups = 2u * (gu_tiles / {tiles}u);
+    uint blkg = threadgroup_position_in_grid.x;
+    uint gslot = blkg / groups;       // expert-sorted slot id
+    uint t = (blkg % groups) * {tiles}u;
+    uint is_up = (t >= gu_tiles) ? 1u : 0u;
+    uint tile0 = t - is_up * gu_tiles;
+    uint e = srt[gslot];
+    if (e >= E_total) return;         // padding slot / unrouted expert
+    uint cnt = tabs[1u * E_total + e]; // real slots routed to this expert
+    if (cnt == 0u) return;
+    uint tnsrc0 = (is_up ? (E_total + e) : e) * gu_tiles + tile0;
+    for (uint j = 0u; j < cnt; j++) {{
+        uint slot = slist[e * SM + j];
+        uint xoff = (slot * 2u + is_up) * in_features;
+        uint obase = slot * (2u * gu_tiles * 16u) + t * 16u;
+{_tile_loop(decode, "tnsrc0 + ot", "float(xh[xoff + tk * 16u + (lane & 15u)])", "(out + obase)", tiles=tiles)}
+    }}
+"""
+
+
 def _moe_down2_source(k: int, cb: CodebookMode, act: str = "silu",
                       hidden: int = 0) -> str:
     """Kernel B2: down projection whose prologue FINISHES gate+up (dual
@@ -551,7 +695,8 @@ if _XDIRECT:
             return _xdirect_src(_fn(*a, **kw))
         return _wrapped
     for _n in ("_moe_gateup_source", "_moe_down_source",
-               "_moe_gateup2_source", "_moe_down2_source"):
+               "_moe_gateup2_source", "_moe_down2_source",
+               "_moe_gateup2_grouped_source"):
         globals()[_n] = _mk_xdirect(globals()[_n])
 
 
@@ -731,9 +876,66 @@ class EXL3SwitchGLU(nn.Module):
             pair = _MOE_KERNELS[key] = (kA, kB)
         return pair
 
+    def _kernels2_grouped(self, sm: int):
+        """A2G (grouped A2) + the VERBATIM B2 down kernel."""
+        if self._gu_tiles % _A2_TILES:
+            raise ValueError(
+                f"EXL3_MOE_A2_TILES={_A2_TILES} must divide gu_tiles="
+                f"{self._gu_tiles} (hidden/16)"
+            )
+        key = (self._k, int(self._cb), self._activation, "g1",
+               int(self.hidden_dims), _A2_TILES, sm)
+        pair = _MOE_KERNELS.get(key)
+        if pair is None:
+            act = self._activation
+            kA = mx.fast.metal_kernel(
+                name=(
+                    f"exl3_moe_gateup2g_k{self._k}_cb{int(self._cb)}_{act}"
+                    f"_v1_h{int(self.hidden_dims)}_t{_A2_TILES}_sm{sm}"
+                ),
+                input_names=[
+                    "xh", "trellis", "perm", "srt", "tabs", "slist", "dims",
+                ],
+                output_names=["out"],
+                source=_moe_gateup2_grouped_source(
+                    self._k, self._cb, tiles=_A2_TILES, sm=sm
+                ),
+            )
+            kB = mx.fast.metal_kernel(
+                name=f"exl3_moe_down2_k{self._k}_cb{int(self._cb)}_{act}_v3_h{int(self.hidden_dims)}",
+                input_names=[
+                    "ygu", "trellis", "perm", "sel",
+                    "gu_svh", "dn_suh", "dn_svh", "dims",
+                ],
+                output_names=["out"],
+                source=_moe_down2_source(self._k, self._cb, act,
+                                          hidden=int(self.hidden_dims)),
+            )
+            pair = _MOE_KERNELS[key] = (kA, kB)
+        return pair
+
+    def _grouped_srt(self, sel_u: mx.array) -> tuple[mx.array, mx.array]:
+        """Expert-sorted (expert ids, original slot ids), padded to 2n.
+
+        The sort key is ``expert_id * (2n) + original_slot_id`` so the
+        ordering is fully deterministic (unique keys) regardless of the
+        backend sort's tie behavior: real slots land grouped by expert in
+        ascending ORIGINAL slot order (the order _decode_fused2 assigned and
+        A2G walks them in), and the padding entries sort last at expert id E
+        with slot id 0. Built on device; fixed shapes per (R, kk).
+        """
+        E = self.num_experts
+        n = sel_u.shape[0]
+        stride = mx.array(2 * n, dtype=mx.uint32)
+        key = sel_u * stride + mx.arange(n, dtype=mx.uint32)
+        pad = mx.full((n,), E * 2 * n, dtype=mx.uint32)
+        sorted_key = mx.sort(mx.concatenate([key, pad]))
+        return (sorted_key // stride).astype(mx.uint32), (
+            sorted_key % stride
+        ).astype(mx.uint32)
+
     def _decode_fused2(self, x2d: mx.array, indices: mx.array) -> mx.array:
         """A2 (one tile/threadgroup, raw output) + B2 (finish in prologue):
-        same 3 dispatches as v1, ~16x the gate+up grid parallelism.
 
         Shape-generic over rows: ``x2d`` is (R, D), ``indices`` (R, kk) —
         slots are (row, expert) pairs, so an 8-row spec verify is 72 slots
@@ -770,6 +972,90 @@ class EXL3SwitchGLU(nn.Module):
         )[0]
         dims_b = mx.array(
             [H // 16, self._dn_tiles, int(self._dn_trellis.shape[1]), self.num_experts],
+            dtype=mx.uint32,
+        )
+        y = kB(
+            inputs=[
+                ygu,
+                self._dn_trellis.reshape(-1).view(mx.uint32),
+                _fwd_perm_u32(),
+                sel_u,
+                self._gu_svh.reshape(-1),
+                self._dn_suh.reshape(-1),
+                self._dn_svh.reshape(-1),
+                dims_b,
+            ],
+            template=[("T", mx.float16)],
+            grid=(E_sel * (self._dn_tiles // 8) * _GEM_THREADS, 1, 1),
+            threadgroup=(_GEM_THREADS, 1, 1),
+            output_shapes=[(E_sel * D,)],
+            output_dtypes=[mx.float16],
+        )[0]
+        return y.reshape(R, kk, D)
+
+    def _decode_grouped(self, x2d: mx.array, indices: mx.array) -> mx.array:
+        """Expert-grouped multi-row decode (DSV41_MOE_GROUPED=1).
+
+        Same slot geometry, same xh build (rows_prep on the ORIGINAL slot
+        order), same B2 down kernel — only A2 becomes A2G: each threadgroup
+        takes one expert-sorted slot and walks every ORIGINAL slot routed to
+        that expert, so a trellis tile is decoded once per (distinct expert,
+        tile-run) instead of once per slot. Output bit-identical to
+        _decode_fused2: each slot's columns are still written by exactly one
+        threadgroup running the same tile loop on the same inputs.
+
+        Shape contract (no host sync, fixed shapes per (R, kk)): the A2G grid
+        is n_pad = 2*E_sel groups wide, where n_pad >= the number of sorted
+        positions; sorted real slots come first and padding slots (id E)
+        exit at the kernel head, so the grid covers every real group.
+        """
+        R, kk = int(indices.shape[0]), int(indices.shape[1])
+        E_sel = R * kk
+        E = self.num_experts
+        D, H = self.input_dims, self.hidden_dims
+        sm = max(_SLOTS_MAX, R)
+        if sm < R:
+            raise ValueError(
+                f"DSV41_MOE_SLOTS_MAX={sm} < rows R={R}"
+            )
+        kA, kB = self._kernels2_grouped(sm)
+        sel = indices.reshape(-1)
+        sel_u = sel.astype(mx.uint32)
+        # same xh as _decode_fused2: rows (slot*2 + is_up) in ORIGINAL order
+        suh_sel = self._gu_suh[sel].reshape(E_sel * 2, D)
+        x_rep = mx.broadcast_to(
+            x2d[:, None, :], (R, kk * 2, D)
+        ).reshape(E_sel * 2, D)
+        xh = _rows_prep()(x_rep, suh_sel)
+        # expert-sorted slot vector padded to a fixed 2x width: the sort is
+        # stable, real slots land before the padding id E, and the grid covers
+        # every sorted position regardless of how many slots share experts
+        srt, srt_slots = self._grouped_srt(sel_u)
+        n_pad = int(srt.shape[0])
+        tabs, slist = _grouped_tables_fn(E, n_pad, sm)(srt, srt_slots)
+        dims = mx.array(
+            [D // 16, self._gu_tiles, int(self._gu_trellis.shape[1]), E],
+            dtype=mx.uint32,
+        )
+        ygu = kA(
+            inputs=[
+                xh.reshape(-1),
+                self._gu_trellis.reshape(-1).view(mx.uint32),
+                _fwd_perm_u32(),
+                srt,
+                tabs.reshape(-1),
+                slist.reshape(-1),
+                dims,
+            ],
+            template=[("T", mx.float16)],
+            grid=(n_pad * (2 * self._gu_tiles // _A2_TILES) * _GEM_THREADS, 1, 1),
+            threadgroup=(_GEM_THREADS, 1, 1),
+            output_shapes=[(E_sel * 2 * H,)],
+            output_dtypes=[mx.float16],
+        )[0]
+        # down: the VERBATIM B2 kernel on the identical ygu, original slots
+        dims_b = mx.array(
+            [H // 16, self._dn_tiles, int(self._dn_trellis.shape[1]), E],
             dtype=mx.uint32,
         )
         y = kB(
@@ -960,7 +1246,8 @@ class EXL3SwitchGLU(nn.Module):
         if R <= 8 and not _MOE_UNFUSED and self._v2_ok():
             # spec verify / small-batch serving: decode-class A2/B2 over
             # R*kk slots instead of the _prefill sort/table machinery
-            y = self._decode_fused2(
+            fn = self._decode_grouped if _MOE_GROUPED else self._decode_fused2
+            y = fn(
                 x.reshape(R, self.input_dims),
                 indices.reshape(R, kk).astype(mx.int32),
             )
