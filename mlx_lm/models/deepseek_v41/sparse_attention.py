@@ -51,6 +51,14 @@ Knobs (all env-gated for A/B and rollback): ``DSV41_SPARSE_IMPL``
 (``tiled``|``ref``), ``DSV41_SPARSE_QTILE``, ``DSV41_SPARSE_KTILE``,
 ``DSV41_SPARSE_WDTYPE`` (``auto``|``bf16``|``fp16``|``fp32``),
 ``DSV41_SPARSE_COMPILE``, ``DSV41_SPARSE_BUDGET_MB``.
+
+Two-source gather (gather-direct comp_kv). ``sparse_attn`` also accepts
+``kv2``/``split``: index rows ``< split`` gather from ``kv``, rows
+``>= split`` from ``kv2`` at ``row - split`` — i.e. the indices address
+``concat(kv, kv2)`` but no such concatenation is ever built. ``attention.py``
+uses this to read the shared ``comp_kv`` cache directly by top-k index instead
+of materializing it per compressing layer per forward. ``kv2=None`` is byte-for-
+byte the previous single-source behaviour.
 """
 
 from __future__ import annotations
@@ -158,6 +166,28 @@ def _gather_kv(kv: mx.array, idx: mx.array) -> mx.array:
     return flat[(safe + base).reshape(-1)].reshape(*idx.shape, d)
 
 
+def _gather_split(kv: mx.array, kv2: mx.array, idx: mx.array, split: int) -> mx.array:
+    """Two-source gather: idx row ``i`` -> ``kv`` for ``i < split``, else ``kv2[i-split]``.
+
+    Indices are in the *concatenated* space ``concat(kv, kv2)``; ``split`` is the
+    number of ``kv`` rows. Each row is gathered DIRECTLY from its source buffer --
+    no ``concat(kv, kv2)`` is ever materialized -- which is the whole point: the
+    compressed-KV source is a bf16 buffer whose dense concatenation was
+    ~31 GiB/step at 1M context, while the top-k touches <=640 rows per query.
+
+    ``-1`` (masked) resolves to row 0 of whichever source the boundary puts it
+    on; a ``-1`` is always ``< split`` so it lands on ``kv``, and row 0's value is
+    replaced by a ``-inf`` logit downstream and cannot contribute. A single
+    out-of-range index is therefore impossible for either source.
+    """
+    take_b = idx >= split                                  # [b, m, k] bool
+    idx_a = mx.minimum(mx.maximum(idx, 0), split - 1)      # in-range row of kv
+    idx_b = mx.maximum(idx - split, 0)                     # in-range row of kv2
+    gathered_a = _gather_kv(kv, idx_a)
+    gathered_b = _gather_kv(kv2, idx_b)
+    return mx.where(take_b[..., None], gathered_b, gathered_a)
+
+
 # --------------------------------------------------------------------------
 # per-(query, key)-tile body: the online-softmax step
 #
@@ -204,14 +234,22 @@ def _body(fn, first: bool, qc, kvc, wdtype):
 
 
 def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.array,
-                softmax_scale: float, chunk: int = 64) -> mx.array:
+                softmax_scale: float, chunk: int = 64, kv2: mx.array | None = None,
+                split: int | None = None) -> mx.array:
     """q [b,m,h,d], kv [b,n,d], attn_sink [h], topk_idxs [b,m,k] (-1 = masked).
 
     ``chunk`` caps the query rows per tile; the tiling plan shrinks it (and the
     key tile) further whenever one tile would exceed ``DSV41_SPARSE_BUDGET_MB``.
+
+    ``kv2``/``split`` add a second K/V source: ``topk_idxs`` rows ``>= split``
+    index ``kv2`` (at ``row - split``) and rows ``< split`` index ``kv``, i.e.
+    the indices address ``concat(kv, kv2)``. Both sources are gathered directly,
+    with ``kv2`` never concatenated into a dense buffer (see ``_gather_split``).
+    ``kv2=None`` is the exact single-source path.
     """
     if _IMPL == "ref":
-        return sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale)
+        return sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale,
+                                     chunk, kv2=kv2, split=split)
 
     b, m, h, d = q.shape
     kdim = topk_idxs.shape[-1]
@@ -223,6 +261,16 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
         q = q.astype(wdtype)
     if kv.dtype != wdtype:
         kv = kv.astype(wdtype)
+    split_i: int = 0
+    if kv2 is not None:
+        # The two-source path only pays off when both sources share the gather
+        # dtype; production stores comp_kv (and the window+chunk buffer) in bf16,
+        # so this cast is a no-op there. A differing dtype is a real
+        # materialization, so it is cast here once, explicitly.
+        if kv2.dtype != wdtype:
+            kv2 = kv2.astype(wdtype)
+        assert split is not None and 0 <= split <= kv.shape[1], (split, kv.shape)
+        split_i = int(split)
     qt, kt = plan_tiles(h, d, kdim, chunk, wdtype)
     # The fence bounds prefill memory (many query tiles live at once). A decode
     # or verify call (m <= _FENCE_MIN_ROWS, one small tile) has nothing to bound,
@@ -241,7 +289,11 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
         for ti, ks in enumerate(range(0, kdim, kt)):
             ke = min(ks + kt, kdim)
             icb = ic[:, :, ks:ke]                         # [b, Tq, Tk]
-            kvc = _gather_kv(kv, icb)                     # [b, Tq, Tk, d]
+            if kv2 is None:
+                kvc = _gather_kv(kv, icb)                 # [b, Tq, Tk, d]
+            else:
+                # Two sources: gather each row directly from its own buffer.
+                kvc = _gather_split(kv, kv2, icb, split_i)
             if ti == 0:
                 fn = _body(_tile_init, True, qc, kvc, wdtype)
                 m_run, l_run, acc = fn(qc, icb, kvc, sink, softmax_scale)
@@ -268,17 +320,31 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
 # --------------------------------------------------------------------------
 def sparse_attn_reference(q: mx.array, kv: mx.array, attn_sink: mx.array,
                           topk_idxs: mx.array, softmax_scale: float,
-                          chunk: int = 256) -> mx.array:
-    """q [b,m,h,d], kv [b,n,d], attn_sink [h], topk_idxs [b,m,k] (-1 = masked)."""
+                          chunk: int = 256, kv2: mx.array | None = None,
+                          split: int | None = None) -> mx.array:
+    """q [b,m,h,d], kv [b,n,d], attn_sink [h], topk_idxs [b,m,k] (-1 = masked).
+
+    ``kv2``/``split`` add the second K/V source (see :func:`sparse_attn`); the
+    two-source gather is :func:`_gather_split`, shared with the tiled path so the
+    parity harness compares the same index semantics.
+    """
     b, m, h, d = q.shape
     sink = attn_sink.astype(mx.float32).reshape(1, 1, h, 1)
+    split_i = -1
+    if kv2 is not None:
+        if split is None:
+            raise ValueError("kv2 requires split")
+        split_i = int(split)
 
     outs = []
     for start in range(0, m, chunk):
         stop = min(start + chunk, m)
         qc = q[:, start:stop].astype(mx.float32)
         ic = topk_idxs[:, start:stop]
-        kvc = _gather_kv(kv, ic).astype(mx.float32)          # [b, c, k, d]
+        if kv2 is None:
+            kvc = _gather_kv(kv, ic).astype(mx.float32)      # [b, c, k, d]
+        else:
+            kvc = _gather_split(kv, kv2, ic, split_i).astype(mx.float32)
 
         logits = mx.einsum("bchd,bckd->bchk", qc, kvc) * softmax_scale
         valid = (ic >= 0)[:, :, None, :]

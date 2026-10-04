@@ -136,6 +136,7 @@ class Attention(nn.Module):
         lc.write_window(start_pos, kv)
         offset = wp + n                                          # compressed entries follow
 
+        kv2 = None                                               # second K/V source
         if self.ratio:
             src = shared.kv_src_cache                            # the source layer's LayerCache
             compress_len = end_pos // self.ratio
@@ -173,12 +174,16 @@ class Attention(nn.Module):
                 lc.comp_kv[:bsz, g0:g0 + g] = latents.astype(lc.dtype)
 
             if compress_len:
-                comp = src.comp_kv[:bsz, :compress_len].astype(kv.dtype)
-                kv_all = mx.concatenate([kv_all, comp], axis=1)
+                # Gather-direct: hand the shared comp_kv to sparse_attn as a
+                # second source addressed by cidx (which the indexer emitted in
+                # the concat space via `offset`) instead of materializing
+                # `concat(kv_all, comp)` per layer per forward. comp row i is
+                # concat position offset+i, and |kv_all| == offset (split).
                 idxs = mx.concatenate([idxs, cidx], axis=-1)
-
+                kv2 = src.comp_kv[:bsz, :compress_len]
         sink = mx.zeros_like(self.attn_sink) if self._break_sink else self.attn_sink
-        o = sparse_attn(q, kv_all, sink, idxs, self.softmax_scale)
+        o = sparse_attn(q, kv_all, sink, idxs, self.softmax_scale,
+                        kv2=kv2, split=offset)
 
         # --- inverse rope, grouped block-diagonal output LoRA ---
         if not self._break_rope_inverse:
