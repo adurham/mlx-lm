@@ -15,6 +15,22 @@ Per layer:
   quantized index-key cache, read by every index source below them.
 
 Model-level: the engram compressed-token-id history, and the global offset.
+
+Storage dtype (local change). The three *quantized-grid* buffers — ``win_kv``,
+``comp_kv`` and ``index_k`` — are stored in **bf16**, always, regardless of the
+``dtype`` a caller passes (kept accepted for compatibility; ``engram_ids`` is
+int64 and ``CompressorState`` stays fp32). This is EXACT, not lossy: every
+stored value is pre-quantized onto a coarse grid (win_kv: fp8 e4m3 <=4
+significant bits; comp_kv: fp4 e2m1 latents <=2 bits x e4m3 scales; index_k:
+fp4 e2m1 x ue8m0 power-of-two scales; MTP draft KV: fp8). Such products carry
+<=6 significant bits, exactly representable in bf16's 8 mantissa bits, so
+``bf16 -> fp32`` widening reproduces the identical fp32 value every reader saw
+when the buffers were fp32. bf16 halves the buffer bytes (a 1M session's
+compressed/index caches are ~3.2 GiB in bf16, ~6.4 GiB fp32).
+
+Capacity (local change). ``comp_kv`` / ``index_k`` / ``engram_ids`` start at a
+small ``capacity`` and grow on demand (``ensure_capacity``) instead of being
+preallocated to the cap, so an idle session does not cost the full cap up front.
 """
 
 from __future__ import annotations
@@ -27,27 +43,78 @@ from .config import ModelArgs
 
 NEG_INF = float("-inf")
 
+#: Rows a fresh ``ModelCache`` allocates before it has to grow. Small enough that
+#: an idle session costs little, large enough that ordinary turns never grow.
+DEFAULT_INITIAL_CAPACITY = 65536
+
+
+class CapacityError(RuntimeError):
+    """A requested token position does not fit the cache's ``max_seq_len``.
+
+    Raised by :meth:`ModelCache.ensure_capacity` when growth would exceed the
+    logical maximum, or when the reallocation itself fails (OOM). The exo
+    engine maps this to its own ``Dsv41UnsupportedFeature`` refusal (see
+    ``dsv41/session.py``), so the request is failed cleanly instead of crashing
+    the runner.
+    """
+
+
+def _latent_rows(tokens: int, ratio: int) -> int:
+    """Complete group rows needed to cover ``tokens`` open-group positions."""
+    return -(-int(tokens) // max(int(ratio), 1))
+
 
 class LayerCache:
-    def __init__(self, bsz: int, args: ModelArgs, layer_id: int, max_seq_len: int,
+    def __init__(self, bsz: int, args: ModelArgs, layer_id: int, capacity: int,
                  dtype=mx.float32):
         self.window = args.window_size
         self.ratio = args.compress_ratio(layer_id)
         self.is_kv_source = layer_id in args.kv_source_layers
-        self.dtype = dtype
+        # bf16 ALWAYS for the quantized-grid buffers (see module docstring): a
+        # caller's ``dtype`` is accepted but never widens these, because bf16 is
+        # lossless for their values. ``self.dtype`` is what writers cast to.
+        self.dtype = mx.bfloat16
+        self.bsz = int(bsz)
+        del dtype  # accepted for compatibility; quantized-grid storage is bf16
 
-        self.win_kv = mx.zeros((bsz, self.window, args.head_dim), dtype=dtype)
+        self.win_kv = mx.zeros((bsz, self.window, args.head_dim), dtype=self.dtype)
 
         self.comp_kv = None
         self.comp_state = None
         self.index_k = None
         if self.is_kv_source:
-            n_comp = max_seq_len // self.ratio
-            self.comp_kv = mx.zeros((bsz, n_comp, args.head_dim), dtype=dtype)
+            n_comp = _latent_rows(capacity, self.ratio)
+            self.comp_kv = mx.zeros((bsz, n_comp, args.head_dim), dtype=self.dtype)
             if self.ratio > 1:
                 self.comp_state = CompressorState(bsz, self.ratio, args.head_dim)
             if layer_id in args.index_source_layers:
-                self.index_k = mx.zeros((bsz, n_comp, args.index_head_dim), dtype=dtype)
+                self.index_k = mx.zeros((bsz, n_comp, args.index_head_dim),
+                                        dtype=self.dtype)
+
+    def grow_latent(self, new_rows: int, used_rows: int) -> None:
+        """Reallocate comp_kv/index_k to ``new_rows`` group rows, copying used rows.
+
+        Copies ONLY the rows a live read can reach (``ceil(offset / ratio)``,
+        clamped to the old width) and zero-fills the rest. Called from
+        ``ModelCache.ensure_capacity`` so growth happens at an eval-clean
+        boundary, before the chunk's forward graph is built.
+        """
+        if self.comp_kv is None:
+            return
+        old = self.comp_kv
+        if new_rows <= old.shape[1]:
+            return
+        used = max(0, min(int(used_rows), old.shape[1]))
+        self.comp_kv = mx.zeros((old.shape[0], new_rows, old.shape[2]),
+                                dtype=old.dtype)
+        if used > 0:
+            self.comp_kv[:, :used] = old[:, :used]
+        idx = self.index_k
+        if idx is not None:
+            self.index_k = mx.zeros((idx.shape[0], new_rows, idx.shape[2]),
+                                    dtype=idx.dtype)
+            if used > 0:
+                self.index_k[:, :used] = idx[:, :used]
 
     # ---- window ring ----
 
@@ -78,8 +145,8 @@ class LayerCache:
         The ring is the one position-addressed buffer a rollback cannot
         reconstruct on its own: slots alias every ``window`` positions, so a
         discarded write at ``q`` silently corrupts a live read of ``q -
-        window``. A session checkpoint therefore keeps a copy (~256 KB at
-        window 128 / head_dim 512 fp32)."""
+        window``. A session checkpoint therefore keeps a copy (~64 KB at
+        window 128 / head_dim 512 bf16)."""
         return mx.array(self.win_kv)
 
     def ring_restore(self, snap) -> None:
@@ -100,11 +167,65 @@ class LayerCache:
 
 
 class ModelCache:
+    """Incremental cache. ``max_seq_len`` is the logical cap; ``capacity`` rows
+    are allocated, grown geometrically by :meth:`ensure_capacity`."""
+
     def __init__(self, args: ModelArgs, bsz: int = 1, max_seq_len: int | None = None,
-                 dtype=mx.float32):
-        self.max_seq_len = max_seq_len or min(args.max_seq_len, 4096)
+                 dtype=mx.float32, initial_capacity: int | None = None):
+        self.args = args
+        self.bsz = int(bsz)
+        self.max_seq_len = int(max_seq_len or min(args.max_seq_len, 4096))
         self.offset = 0
-        self.layers = [LayerCache(bsz, args, i, self.max_seq_len, dtype)
+        cap = DEFAULT_INITIAL_CAPACITY if initial_capacity is None else int(initial_capacity)
+        self.capacity = max(1, min(cap, self.max_seq_len))
+        self.layers = [LayerCache(bsz, args, i, self.capacity, dtype)
                        for i in range(args.n_layers)]
-        self.engram_ids = (np.zeros((bsz, self.max_seq_len), dtype=np.int64)
+        self.engram_ids = (np.zeros((bsz, self.capacity), dtype=np.int64)
                            if args.engram_layer_ids else None)
+
+    # ---- capacity growth ----
+
+    def ensure_capacity(self, required_tokens: int) -> None:
+        """Ensure the cache can hold ``required_tokens`` positions right now.
+
+        INVARIANT: any write at positions ``[p, p + n)`` must be preceded by
+        ``ensure_capacity(p + n)``. Growth reallocates the latent buffers
+        (``comp_kv`` / ``index_k``) and ``engram_ids`` to cover the new
+        positions, copying only the rows a live read can reach and zero-filling
+        the rest, and calls ``mx.clear_cache()`` afterwards. It must run at an
+        EVAL-CLEAN boundary -- before the chunk's forward graph is built, never
+        mid-graph -- so the reallocation happens between committed graphs.
+
+        Raises :class:`CapacityError` when ``required_tokens > max_seq_len`` or
+        when a reallocation fails (OOM), so the engine fails one request instead
+        of crashing the runner.
+        """
+        req = int(required_tokens)
+        if req <= self.capacity:
+            return
+        if req > self.max_seq_len:
+            raise CapacityError(
+                f"cache holds {self.max_seq_len} tokens; a request at "
+                f"{req} exceeds it")
+        new_cap = min(max(req, self.capacity * 2), self.max_seq_len)
+        try:
+            new_engram = None
+            if self.engram_ids is not None:
+                new_engram = np.zeros((self.engram_ids.shape[0], new_cap),
+                                      dtype=np.int64)
+                used = max(0, min(int(self.offset), self.engram_ids.shape[1]))
+                if used:
+                    new_engram[:, :used] = self.engram_ids[:, :used]
+            for lc in self.layers:
+                used = _latent_rows(min(int(self.offset), self.capacity), lc.ratio)
+                lc.grow_latent(_latent_rows(new_cap, lc.ratio), used)
+            if new_engram is not None:
+                self.engram_ids = new_engram
+        except CapacityError:
+            raise
+        except Exception as e:  # OOM or any allocator failure -> clean refusal
+            raise CapacityError(
+                f"cache growth to {new_cap} tokens failed: "
+                f"{type(e).__name__}: {e}") from e
+        self.capacity = new_cap
+        mx.clear_cache()

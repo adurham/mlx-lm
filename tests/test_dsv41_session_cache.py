@@ -18,7 +18,7 @@ import sys
 import numpy as np
 import mlx.core as mx
 
-from mlx_lm.models.deepseek_v41.cache import LayerCache
+from mlx_lm.models.deepseek_v41.cache import ModelCache
 from mlx_lm.models.deepseek_v41.config import ModelArgs
 from mlx_lm.models.deepseek_v41 import session_cache as SC
 
@@ -34,18 +34,27 @@ def check(name, ok, detail=""):
 WINDOW, RATIO, NLAYERS = 8, 2, 4
 
 
-class StubCache:
-    """Duck-typed ``ModelCache`` with the real per-layer classes."""
+def _stub_args(engram=False):
+    """The tiny layer subset the stub model/cache are built from."""
+    return ModelArgs(window_size=WINDOW, compress_ratios=(RATIO,) * NLAYERS,
+                     kv_source_layers=(0,), index_source_layers=(0, 1),
+                     engram_layer_ids=(1,) if engram else ())
 
-    def __init__(self, max_seq_len=256, engram=False):
-        self.max_seq_len = max_seq_len
-        self.offset = 0
-        args = ModelArgs(window_size=WINDOW, compress_ratios=(RATIO,) * NLAYERS,
-                         kv_source_layers=(0,), index_source_layers=(0, 1),
-                         engram_layer_ids=(1,) if engram else ())
-        self.layers = [LayerCache(1, args, i, max_seq_len) for i in range(NLAYERS)]
-        self.engram_ids = (np.zeros((1, max_seq_len), dtype=np.int64) if engram
-                           else None)
+
+class StubCache:
+    """The REAL ``ModelCache`` over a tiny layer subset.
+
+    Position-addressed buffers, ``ensure_capacity`` growth and bf16 storage are
+    all exercised for real, so the replay/growth/poison tests below test the
+    production class, not a double.
+    """
+
+    def __init__(self, max_seq_len=256, engram=False, initial_capacity=None):
+        args = _stub_args(engram)
+        self._mc = ModelCache(args, 1, max_seq_len, initial_capacity=initial_capacity)
+
+    def __getattr__(self, name):
+        return getattr(self._mc, name)
 
 
 class StubModel:
@@ -53,8 +62,9 @@ class StubModel:
         self.args = ModelArgs()
         self.engram = engram
 
-    def make_cache(self, bsz=1, max_seq_len=None, dtype=None):
-        return StubCache(max_seq_len=max_seq_len or 256, engram=self.engram)
+    def make_cache(self, bsz=1, max_seq_len=None, dtype=None, **kw):
+        return StubCache(max_seq_len=max_seq_len or 256, engram=self.engram,
+                         initial_capacity=kw.get("initial_capacity"))
 
 
 def stub_prefill(model, ids, cache, *, argmax=False, return_taps=False, **kw):

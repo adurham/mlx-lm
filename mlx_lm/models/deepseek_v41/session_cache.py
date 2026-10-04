@@ -65,11 +65,13 @@ import hashlib
 import inspect
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import mlx.core as mx
 
 from . import spec as _spec
+from .cache import CapacityError
 
 NEG_INF = float("-inf")
 
@@ -85,8 +87,9 @@ class RollbackError(RuntimeError):
     """No checkpoint at (or below) the requested rewind target."""
 
 
-class CapacityError(RuntimeError):
-    """The turn does not fit in the cache's ``max_seq_len``."""
+# ``CapacityError`` is the cache-growth refusal: raised by
+# ``cache.ModelCache.ensure_capacity`` and re-exported here so sessions and the
+# engine share ONE type (the exo engine maps it to its own refusal).
 
 
 # --------------------------------------------------------------------------
@@ -479,6 +482,19 @@ class SessionCache:
             kw.update(extra)
         return self._prefill(self.model, ids, self.cache, **kw)
 
+    def _ensure_capacity(self, required: int) -> None:
+        """Grow ``self.cache`` for ``required`` positions, at an eval-clean
+        boundary (before the chunk's forward graph is built). A duck-typed cache
+        without growth (a test double) is a no-op; the real ``ModelCache``
+        always has ``ensure_capacity``."""
+        cache: Any = self.cache
+        if cache is None:
+            return
+        try:
+            cache.ensure_capacity(int(required))
+        except AttributeError:            # a duck-typed cache without growth
+            pass
+
     def _prefill_planned(self, ids, *, argmax, taps_out=None, plan=None):
         """Feed ``ids`` in the explicit piece sizes ``plan`` (driver-agnostic).
 
@@ -499,6 +515,8 @@ class SessionCache:
             piece = ids[done:stop]
             last = stop == n
             ex = None
+            # Grow BEFORE the piece's forward graph is built (eval-clean).
+            self._ensure_capacity(self.offset + int(piece.shape[0]))
             if self._chunk_supported:
                 ex = {"chunk": int(piece.shape[0]), "long_chunk": int(piece.shape[0]),
                       "long_threshold": 10 ** 9}
@@ -516,6 +534,7 @@ class SessionCache:
                 break
         if done < n:                       # plan ran out: let the driver finish
             rest = ids[done:]
+            self._ensure_capacity(self.offset + int(rest.shape[0]))
             out = self._prefill_call(rest, argmax=argmax, return_taps=False,
                                      taps_out=taps_out)
         return out
@@ -529,6 +548,8 @@ class SessionCache:
         if ids.shape[0] == 0:
             raise ValueError("append_tokens: empty ids")
         self._check_capacity(int(ids.shape[0]))
+        # Grow BEFORE the driver builds its per-chunk graphs (eval-clean).
+        self._ensure_capacity(self.offset + int(ids.shape[0]))
         out = self._prefill_call(ids, argmax=argmax, return_taps=return_taps)
         self._ids = np.concatenate([self._ids, ids])
         self.stats["prefilled"] += int(ids.shape[0])
@@ -584,6 +605,9 @@ class SessionCache:
         out = None
         if delta.shape[0]:
             self._check_capacity(int(delta.shape[0]))
+            # Grow BEFORE the driver builds each chunk's forward graph (the
+            # eval-clean boundary); the driver re-checks per chunk.
+            self._ensure_capacity(self.offset + int(delta.shape[0]))
             try:
                 if chunk_plan is not None:
                     out = self._prefill_planned(delta, argmax=argmax,
