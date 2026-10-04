@@ -127,16 +127,19 @@ exactness-preserving two-level selection.
 | 524 288 | 4.0 GiB | 2.0 GiB | 512 MiB | 256 MiB | ~128 MiB |
 | 1 048 576 | 8.0 GiB | 4.0 GiB | 1.0 GiB | 512 MiB | ~128 MiB |
 
-\* exact-pass peak = `b·n·c·(4 + 4d)` at `c = 16 blocks × 8 = 128` columns
-(`b·n·c·d·4` key gather dominates the `b·n·c·4` score). **Independent of `nb`** —
-the deep-context scaling term is gone. The maxima buffer scales as `nb/16`
-(bf16) vs `nb` (fp32 row): **16× smaller**; per-row (n=1) the row goes
-`64 KiB → 4 KiB` at nb=16384 and `4 MiB → 256 KiB` at nb=1048576.
+\* exact-pass peak: the transient chain is gather(bf16) -> cast(fp32) -> score/reduce,
+  so the limiter is the **key** gather pair: `b·n·c·(2d + 4d)` = `b·n·c·6d`
+  (2 bytes/elt for the bf16 gather + 4 bytes/elt for the fp32 working copy per
+  d-element, plus the `b·n·c·4` fp32 score — dominated by the keys). Independent of `nb` —
+  the deep-context scaling term is gone. The maxima buffer scales as `nb/16`
+  (bf16) vs `nb` (fp32 row): **16× smaller**; per-row (n=1) the row goes
+  `64 KiB → 4 KiB` at nb=16384 and `4 MiB → 256 KiB` at nb=1048576.
 
 **Exact-pass strip sizing (M2 finding).** The memory limiter in the exact pass is
-the **key** gather `[b, n, c, d]`, not the score `[b, n, c]`. For a budget
-`M`: `c ≤ M / (b·n·(4 + 4d))`. At `n=2048, d=128, b=1, M=128 MiB` that is
-`c ≈ 120` columns ⇒ ~15 blocks per strip (`bp ≈ 15`). Production `strip` must be
+the **key** gather `[b, n, c, d]` in BOTH the gathered dtype (bf16, 2 B/elt) and
+its fp32 working cast (4 B/elt), not the score `[b, n, c]`. For a budget
+`M`: `c ≤ M / (b·n·(6d + 4))`. At `n=2048, d=128, b=1, M=128 MiB` that is
+`c ≈ 87` columns ⇒ ~10-11 blocks per strip (`bp ≈ 10`). Production `strip` must be
 derived from this key budget, not chosen for the coarse score transient (which
 can be far larger). See §8.
 
