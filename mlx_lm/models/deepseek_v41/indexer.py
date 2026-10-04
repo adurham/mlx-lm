@@ -238,10 +238,10 @@ def _tiled_scores_buffer(q32: mx.array, index_k: mx.array, w32: mx.array,
     topk_blocks, block_size = cand_src if cand else (0, 1)
     body = _score_body(bsz, n, q32.shape[2], q32.shape[3], tile)
 
-    # A full zero-fill of ``b*n*nb`` row elements is skipped-worthy (~0.8 ms
-    # fp32 memset at nb=16384, n=512), but ``mx.empty`` is absent from the
-    # pinned MLX build, so allocate ``zeros``; every element is overwritten by
-    # the loop below, so the init value never reaches a consumer. The per-tile
+    # ``zeros`` (not ``empty``): in this MLX build ``mx.empty`` is a pure
+    # alias of ``mx.zeros`` (no uninitialized allocation exists), and older
+    # dev builds lack the alias entirely -- so zeros is the portable spelling
+    # and fills every row element before the loop overwrites it. The per-tile
     # head-sum ``s`` stays fp32 (see module docstring); only the stored row is
     # _ROW_DTYPE, and the fp32->bf16 slice-assign cast is the entire change.
     row = mx.zeros((bsz, n, nb), dtype=_ROW_DTYPE)
