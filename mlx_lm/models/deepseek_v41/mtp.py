@@ -41,7 +41,7 @@ import mlx.nn as nn
 from .config import ModelArgs
 from .hyper_connections import hc_mixes, hc_post, hc_pre, make_identity_pre_mix
 from .fakequant import fake_quant_fp8_ue8m0
-from .layers import RMSNorm, precompute_freqs_cis, rope_tail
+from .layers import RMSNorm, cos_sin_at, rope_freqs, rope_tail
 from .moe import ClampedSwiGLU, Gate, SharedExpert
 from mlx_lm.models.switch_layers import SwitchGLU
 
@@ -116,20 +116,14 @@ class DraftAttention(nn.Module):
         # draft attention never compresses: YaRN off, base theta
         self._rope = (args.rope_head_dim, 0, args.rope_theta, args.rope_factor,
                       args.beta_fast, args.beta_slow)
-        self._cos = None
-        self._sin = None
-
-    def _freqs(self, upto: int):
-        if self._cos is None or self._cos.shape[0] < upto:
-            rd, orig_len, theta, factor, bf, bs = self._rope
-            self._cos, self._sin = precompute_freqs_cis(
-                rd, max(upto * 2, 4096), orig_len, theta, factor, bf, bs)
-        return self._cos, self._sin
+        # ONE frequency vector (was a [2*end_pos, 32] cos/sin table per stage).
+        self._freqvec = rope_freqs(*self._rope)
 
     def _kv(self, x: mx.array, start: int):
         rd = self.rope_head_dim
-        cos, sin = self._freqs(start + x.shape[1])
-        c, s = cos[start:start + x.shape[1]], sin[start:start + x.shape[1]]
+        n = x.shape[1]
+        # Context KV rows: exactly positions [start, start + n).
+        c, s = cos_sin_at(self._freqvec, mx.arange(start, start + n))
         kv = self.kv_norm(self.wkv(x))
         kv = rope_tail(kv, rd, c, s)
         return fake_quant_fp8_ue8m0(kv, 32)      # reference act_quant on draft KV
@@ -147,8 +141,10 @@ class DraftAttention(nn.Module):
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(b, l, self.n_heads, self.head_dim)
-        cos, sin = self._freqs(start + l)
-        q = rope_tail(q, rd, cos[start:start + l], sin[start:start + l])
+        # Block rows are bidirectional at positions [start, start + l); the
+        # same positions the block KV is written at, computed on demand.
+        c_blk, s_blk = cos_sin_at(self._freqvec, mx.arange(start, start + l))
+        q = rope_tail(q, rd, c_blk, s_blk)
         kv_blk = self._kv(x, start)
 
         ctx = cache.chrono()
@@ -164,7 +160,7 @@ class DraftAttention(nn.Module):
         denom = mx.sum(w, axis=-1, keepdims=True) + mx.exp(sink - mmax)
         o = mx.einsum("blhk,bkd->blhd", w, kf) / denom
 
-        o = rope_tail(o, rd, cos[start:start + l], sin[start:start + l], inverse=True)
+        o = rope_tail(o, rd, c_blk, s_blk, inverse=True)
         o = o.reshape(b, l, self.n_groups, -1)
         if isinstance(self.wo_a, nn.Linear):
             wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)

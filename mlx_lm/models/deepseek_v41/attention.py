@@ -37,7 +37,7 @@ from .compressor import Compressor
 from .config import ModelArgs
 from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp8_ue8m0
 from .indexer import Indexer
-from .layers import RMSNorm, precompute_freqs_cis, rope_tail
+from .layers import RMSNorm, cos_sin_at, rope_freqs, rope_tail
 from .sparse_attention import sparse_attn
 
 
@@ -96,27 +96,26 @@ class Attention(nn.Module):
             orig_len, theta = 0, args.rope_theta
         self._rope = (args.rope_head_dim, orig_len, theta, args.rope_factor,
                       args.beta_fast, args.beta_slow)
-        self._cos = None
-        self._sin = None
+        # One [32] fp32 YaRN frequency vector per layer (was a [2*end_pos, 32]
+        # cos/sin table per layer -- ~21 GiB at 1M context). cos/sin are now
+        # computed per call for exactly the positions the call needs.
+        self._freqvec = rope_freqs(*self._rope)
 
         # test hooks (negative controls)
         self._break_rope_inverse = False
         self._break_sink = False
 
-    def _freqs(self, upto: int):
-        if self._cos is None or self._cos.shape[0] < upto:
-            rd, orig_len, theta, factor, bf, bs = self._rope
-            self._cos, self._sin = precompute_freqs_cis(
-                rd, max(upto * 2, 4096), orig_len, theta, factor, bf, bs)
-        return self._cos, self._sin
+    def _cos_sin(self, positions: mx.array):
+        """cos/sin for an arbitrary token-position array (bit-exact vs the table)."""
+        return cos_sin_at(self._freqvec, positions)
 
     def __call__(self, x: mx.array, start_pos: int, cache, shared) -> mx.array:
         """x [b, n, dim] (post attn_norm), absolute positions [start_pos, start_pos+n)."""
         bsz, n, _ = x.shape
         rd = self.rope_head_dim
         end_pos = start_pos + n
-        cos, sin = self._freqs(end_pos)
-        c_q, s_q = cos[start_pos:end_pos], sin[start_pos:end_pos]
+        # Query rows: exactly the n positions this forward's rows occupy.
+        c_q, s_q = self._cos_sin(mx.arange(start_pos, end_pos))
 
         # --- queries ---
         qr = self.q_norm(self.wq_a(x))
@@ -150,13 +149,14 @@ class Attention(nn.Module):
             if self.is_index_source:
                 if self.indexer.owns_k:
                     if latents is not None:
-                        self.indexer.publish_keys(latents, start_pos, cos, sin, lc)
+                        self.indexer.publish_keys(latents, start_pos, self._freqvec, lc)
                     shared.index_src_cache = lc   # an owner always reads its own keys
                 if compress_len == 0:
                     cidx = mx.zeros((bsz, n, 0), dtype=mx.int32)
                 else:
                     index_k = shared.index_src_cache.index_k[:bsz, :compress_len]
-                    cidx = self.indexer(x, qr, start_pos, offset, cos, sin, index_k, shared)
+                    cidx = self.indexer(x, qr, start_pos, offset, self._freqvec,
+                                        index_k, shared)
                 shared.topk_idxs = cidx
             else:
                 cidx = shared.topk_idxs
@@ -165,7 +165,10 @@ class Attention(nn.Module):
                 g0 = start_pos // self.ratio
                 g = latents.shape[1]
                 pos = (g0 + mx.arange(g)) * self.ratio           # group j at position j*ratio
-                latents = rope_tail(latents, rd, cos[pos], sin[pos])
+                # The compressor's NON-contiguous latent positions, computed on
+                # demand (no table row lookup, no max(upto*2,4096) headroom).
+                l_cos, l_sin = self._cos_sin(pos)
+                latents = rope_tail(latents, rd, l_cos, l_sin)
                 latents = fake_quant_fp4_e4m3(latents, 16)
                 lc.comp_kv[:bsz, g0:g0 + g] = latents.astype(lc.dtype)
 

@@ -66,7 +66,7 @@ import mlx.nn as nn
 
 from .config import ModelArgs
 from .fakequant import fake_quant_fp4_ue8m0
-from .layers import RMSNorm, rope_tail
+from .layers import RMSNorm, cos_sin_at, rope_tail
 
 NEG_INF = float("-inf")
 POS_INF = float("inf")
@@ -377,25 +377,27 @@ class Indexer(nn.Module):
             self.wk = nn.Linear(args.head_dim, self.head_dim, bias=False)
             self.k_norm = RMSNorm(self.head_dim, args.norm_eps)
 
-    def publish_keys(self, latents: mx.array, start_pos: int, cos, sin, cache):
+    def publish_keys(self, latents: mx.array, start_pos: int, freqvec: mx.array, cache):
         """Turn this chunk's pre-RoPE latents into index keys and cache them.
 
         Must run before Attention overwrites the latents with their RoPE'd,
         quantized form. ``latents`` [b, g, head_dim] for groups g0.., where
         g0 = start_pos // ratio; a latent's rope position is its group's first
-        token, g*ratio.
+        token, g*ratio. ``freqvec`` is the per-layer YaRN frequency vector:
+        cos/sin are computed for exactly the non-contiguous group positions
+        (no dense cos/sin table is threaded through).
         """
         rd = self.rope_head_dim
         g0 = start_pos // self.ratio
         g = latents.shape[1]
         pos = (g0 + mx.arange(g)) * self.ratio
         k = self.k_norm(self.wk(latents))
-        k = rope_tail(k, rd, cos[pos], sin[pos])
+        k = rope_tail(k, rd, *cos_sin_at(freqvec, pos))
         k = fake_quant_fp4_ue8m0(k, 32)
         cache.index_k[:k.shape[0], g0:g0 + g] = k
 
     def __call__(self, x: mx.array, qr: mx.array, start_pos: int, offset: int,
-                 cos, sin, index_k: mx.array, shared) -> mx.array:
+                 freqvec: mx.array, index_k: mx.array, shared) -> mx.array:
         """Score and pick top-k compressed positions for each query.
 
         x [b, n, dim] (post-attn-norm), qr [b, n, q_lora_rank],
@@ -408,7 +410,8 @@ class Indexer(nn.Module):
         nb = index_k.shape[1]
 
         q = self.wq_b(qr).reshape(bsz, n, self.n_heads, self.head_dim)
-        q = rope_tail(q, rd, cos[start_pos:start_pos + n], sin[start_pos:start_pos + n])
+        # Query rows: exactly this forward's n positions, computed on demand.
+        q = rope_tail(q, rd, *cos_sin_at(freqvec, mx.arange(start_pos, start_pos + n)))
         q = fake_quant_fp4_ue8m0(q, 32)
 
         w = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)

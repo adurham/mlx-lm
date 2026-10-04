@@ -46,12 +46,19 @@ def _rms(x, weight, eps):
     return (weight * xf).astype(dtype)
 
 
-def precompute_freqs_cis(dim: int, seqlen: int, original_seq_len: int, base: float,
-                         factor: float, beta_fast: int, beta_slow: int):
-    """YaRN-scaled rotary frequencies as a (cos, sin) pair of shape [seqlen, dim//2].
+def rope_freqs(dim: int, original_seq_len: int, base: float, factor: float,
+               beta_fast: int, beta_slow: int) -> mx.array:
+    """The YaRN-adjusted ``[dim//2]`` fp32 frequency (angles per token position).
 
-    ``original_seq_len == 0`` disables YaRN entirely — the reference uses that for
-    the pure sliding-window layers (which also drop back to the base theta).
+    Factored out of :func:`precompute_freqs_cis` so per-call RoPE multiplies this
+    ONE vector by an arbitrary position tensor. Layers used to cache a
+    ``[seqlen, dim//2]`` cos/sin table per attention layer (~21 GiB at 1M
+    context); now each layer holds only this 32-element vector (128 B), and
+    cos/sin are computed for just the positions a call actually needs.
+
+    ``original_seq_len == 0`` disables YaRN (pure sliding-window layers use the
+    base theta). Bit-exact: this is the identical expression the table builder
+    used, so a per-position value is unchanged.
     """
     def corrected_dim(rotations):
         return dim * math.log(original_seq_len / (rotations * 2 * math.pi)) / (2 * math.log(base))
@@ -63,7 +70,30 @@ def precompute_freqs_cis(dim: int, seqlen: int, original_seq_len: int, base: flo
         ramp = mx.clip((mx.arange(dim // 2, dtype=mx.float32) - low) / max(high - low, 1e-3), 0, 1)
         smooth = 1 - ramp
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
+    return freqs
 
+
+def cos_sin_at(freqvec: mx.array, positions: mx.array) -> tuple[mx.array, mx.array]:
+    """``cos``/``sin`` of ``positions`` against a ``[dim//2]`` frequency vector.
+
+    ``positions`` may be any int/float token-position array (contiguous for
+    query rows, the compressor's ``(g0 + arange(g)) * ratio`` for latents) ->
+    ``([..., dim//2], [...])`` fp32. Bitwise-equal to the corresponding rows of
+    the old :func:`precompute_freqs_cis` table: both compute ``t * freq`` in
+    fp32 then cos/sin elementwise, so a value depends only on its position.
+    """
+    ang = positions.astype(mx.float32)[:, None] * freqvec[None, :]
+    return mx.cos(ang), mx.sin(ang)
+
+
+def precompute_freqs_cis(dim: int, seqlen: int, original_seq_len: int, base: float,
+                         factor: float, beta_fast: int, beta_slow: int):
+    """YaRN-scaled rotary frequencies as a (cos, sin) pair of shape [seqlen, dim//2].
+
+    Kept for callers/tests that still want a dense table; it is now a thin
+    wrapper over :func:`rope_freqs` with the same bit values.
+    """
+    freqs = rope_freqs(dim, original_seq_len, base, factor, beta_fast, beta_slow)
     t = mx.arange(seqlen, dtype=mx.float32)
     ang = t[:, None] * freqs[None, :]
     return mx.cos(ang), mx.sin(ang)
