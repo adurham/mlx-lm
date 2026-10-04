@@ -61,8 +61,9 @@ def timed_attn(self, x, start_pos, cache, shared):
     bsz, n, _ = x.shape
     rd = self.rope_head_dim
     end_pos = start_pos + n
-    cos, sin = self._freqs(end_pos)
-    c_q, s_q = cos[start_pos:end_pos], sin[start_pos:end_pos]
+    # Per-call RoPE: query rows are exactly this forward's n positions,
+    # computed on demand from the layer's [32] freq vector (no cached table).
+    c_q, s_q = self._cos_sin(mx.arange(start_pos, end_pos))
 
     qr_box = {}
 
@@ -99,13 +100,14 @@ def timed_attn(self, x, start_pos, cache, shared):
         if self.is_index_source:
             if self.indexer.owns_k:
                 if latents is not None:
-                    self.indexer.publish_keys(latents, start_pos, cos, sin, lc)
+                    self.indexer.publish_keys(latents, start_pos, self._freqvec, lc)
                 shared.index_src_cache = lc
             if compress_len == 0:
                 cidx = mx.zeros((bsz, n, 0), dtype=mx.int32)
             else:
                 index_k = shared.index_src_cache.index_k[:bsz, :compress_len]
-                cidx = self.indexer(x, qr, start_pos, offset, cos, sin, index_k, shared)
+                cidx = self.indexer(x, qr, start_pos, offset, self._freqvec,
+                                    index_k, shared)
             shared.topk_idxs = cidx
         else:
             cidx = shared.topk_idxs
@@ -113,7 +115,8 @@ def timed_attn(self, x, start_pos, cache, shared):
             g0 = start_pos // self.ratio
             g = latents.shape[1]
             pos = (g0 + mx.arange(g)) * self.ratio
-            latents = rope_tail(latents, rd, cos[pos], sin[pos])
+            l_cos, l_sin = self._cos_sin(pos)
+            latents = rope_tail(latents, rd, l_cos, l_sin)
             latents = fake_quant_fp4_e4m3(latents, 16)
             lc.comp_kv[:bsz, g0:g0 + g] = latents.astype(lc.dtype)
         if compress_len:
