@@ -34,12 +34,17 @@ from .layers import RMSNorm
 from .moe import MoE
 from .hc_fused import hc_expand, mixes_and_collapse
 
+import logging
 import os
+from collections.abc import Callable
 
 # Fused hyper-connection kernels (hc_fused.py). "0" selects the reference ops.
 _HC_FUSED = os.environ.get("DSV41_HC_FUSED", "1") == "1"
 # Queue each block's GPU work as soon as it is built (same results, earlier start).
 _ASYNC_EVAL = os.environ.get("DSV41_ASYNC_EVAL", "1") == "1"
+
+# Module logger for the once-only fence-hook failure report.
+logger = logging.getLogger(__name__)
 
 
 def image_rows(vl_mask, start_pos: int, b: int, n: int):
@@ -164,6 +169,13 @@ class Model(nn.Module):
         # a multi-row forward by evaluating (h, pre_mix). 0 disables. Set only
         # by prefill.prefill()/warmup(); single-row forwards are never fenced.
         self._fence_every = 0
+        # Liveness hook keyed to the fence (design: Fix A). Optional callable,
+        # invoked after each fence eval of a multi-row forward. Observation-only:
+        # implementors must not take locks, touch model state, or call mx.*.
+        # Resolved once per forward; set/restored by prefill.prefill()/warmup().
+        self._fence_hook: Callable[[], None] | None = None
+        # Latched if the hook ever raises, so a broken hook cannot repeat.
+        self._fence_hook_failed = False
 
     def set_token_map(self, token_map):
         self.engram_hasher = EngramHasher(self.args, token_map)
@@ -252,6 +264,11 @@ class Model(nn.Module):
         # unfenced run; the point is to bound the transient memory a chunk's
         # lazy graph holds (indexer scores / sparse-attn gathers).
         fence = getattr(self, "_fence_every", 0) if n > 1 else 0
+        # Liveness hook, resolved ONCE per forward (design: Fix A). A plain
+        # Python callable invoked after each fence eval; see the contract in
+        # __init__. `fence` is already 0 for single-row forwards, so a decode
+        # never resolves or calls it.
+        hook = getattr(self, "_fence_hook", None) if fence else None
         for layer in self.layers:
             if layer.engram is not None:
                 h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index],
@@ -275,6 +292,19 @@ class Model(nn.Module):
                 mx.async_eval(h, pre_mix)
             if fence and layer.layer_id % fence == fence - 1:
                 mx.eval(h, pre_mix)
+                # Liveness beat, keyed to committed compute. Observation-only:
+                # a hook bug must NEVER propagate into Model.__call__ nor repeat
+                # every fence, so it is logged once and disabled on failure.
+                if hook is not None:
+                    try:
+                        hook()
+                    except Exception:
+                        logger.warning(
+                            "prefill fence liveness hook raised; disabling it "
+                            "for this model", exc_info=True)
+                        self._fence_hook = None
+                        self._fence_hook_failed = True
+                        hook = None
 
         h = hc_pre(h, pre_mix)                       # collapse with the last ffn_pre
         h = self.norm(h)

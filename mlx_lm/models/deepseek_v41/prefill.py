@@ -113,13 +113,21 @@ def prefill(model, ids, cache, *, chunk: int | None = None,
             prime_decode: bool | None = None,
             last_logit_only: bool = True,
             argmax: bool = False, return_taps: bool = False, taps_out=None,
-            progress=None):
+            progress=None, fence_hook=None):
     """Append ``ids`` to ``cache`` in fenced, size-adaptive chunks.
 
     Returns the final chunk's output (see the module docstring). ``fence_every=0``
     disables fences, ``async_depth=0`` disables the queue bound,
     ``clear_cache_every=0`` disables the periodic clear; ``progress`` is an
     optional ``fn(index, rows_done, elapsed_s)`` hook for logging.
+
+    ``fence_hook`` (design: Fix A) is an optional observation-only callable
+    invoked after every ``mx.eval`` fence of a multi-row chunk; it is installed
+    as ``model._fence_hook`` for the duration of the call and restored in the
+    ``finally`` (exactly like ``_fence_every``). Every call is backed by the
+    K layers just committed at that fence. The hook must not take locks, mutate
+    model state, or call ``mx.*``; a raising hook is caught and disabled by
+    ``Model.__call__``, never propagated.
 
     ``taps_out``: pass a list to collect the DSpark tap dict *per chunk*
     (``[{layer_id: [1, chunk_rows, dim]}, ...]`` in position order). The taps
@@ -144,6 +152,8 @@ def prefill(model, ids, cache, *, chunk: int | None = None,
     want_taps = return_taps or taps_out is not None
     fence_prev = getattr(model, "_fence_every", None)
     model._fence_every = fence_every
+    fence_hook_prev = getattr(model, "_fence_hook", None)
+    model._fence_hook = fence_hook
     pending: collections.deque = collections.deque()
     out = None
     taps = None
@@ -191,6 +201,7 @@ def prefill(model, ids, cache, *, chunk: int | None = None,
                 progress(nchunks, done, time.perf_counter() - t0)
     finally:
         model._fence_every = fence_prev if fence_prev is not None else 0
+        model._fence_hook = fence_hook_prev
 
     if pending:
         # Drain everything still in flight so every returned/tapped array is
@@ -370,7 +381,7 @@ def load_warmup(model, head=None, *, chunk: int | None = None,
 
 def warmup(model, *, chunk: int | None = None, long_chunk: int | None = None,
            decode: bool = True, fence_every: int | None = None,
-           clear: bool = True) -> dict:
+           fence_hook=None, clear: bool = True) -> dict:
     """Compile the prefill + decode branch shapes now, at load time.
 
     Runs a scratch cache through 2x``chunk`` rows, 1x``long_chunk`` rows and (by
@@ -379,12 +390,16 @@ def warmup(model, *, chunk: int | None = None, long_chunk: int | None = None,
     are untouched. The model must be fully built (token map set for engram).
 
     ``fence_every`` defaults to the driver default (``FENCE_EVERY``) so the
-    compiled command buffers are the ones a real prefill will use.
+    compiled command buffers are the ones a real prefill will use. ``fence_hook``
+    is accepted for symmetry with :func:`prefill` and installed/restored the
+    same way (default None: no hook).
     """
     chunk = BASE_CHUNK if chunk is None else int(chunk)
     long_chunk = LONG_CHUNK if long_chunk is None else int(long_chunk)
     fence_prev = getattr(model, "_fence_every", None)
     model._fence_every = FENCE_EVERY if fence_every is None else int(fence_every)
+    fence_hook_prev = getattr(model, "_fence_hook", None)
+    model._fence_hook = fence_hook
     scratch = model.make_cache(1, max_seq_len=2 * chunk + long_chunk + 64)
     times: dict = {}
     dummy = mx.zeros((1, chunk), dtype=mx.int32)
@@ -400,6 +415,7 @@ def warmup(model, *, chunk: int | None = None, long_chunk: int | None = None,
             times[name] = time.perf_counter() - t0
     finally:
         model._fence_every = fence_prev if fence_prev is not None else 0
+        model._fence_hook = fence_hook_prev
     del scratch
     if clear:
         mx.clear_cache()
