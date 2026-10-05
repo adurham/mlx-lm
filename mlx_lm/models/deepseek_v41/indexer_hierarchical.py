@@ -139,6 +139,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 NEG_INF = float("-inf")
+POS_INF = float("inf")
 
 # --- prototype knobs (see "M2 knobs" above) ---------------------------------
 HIER_BLOCK = 8            # columns per coarse block (== candidate_block_size)
@@ -154,6 +155,7 @@ __all__ = [
     "coarse_block_scores",
     "top_blocks",
     "exact_rescore_streaming",
+    "candidate_mask_from_block_maxima",
     "hierarchical_topk",
 ]
 
@@ -205,21 +207,23 @@ def _gather_rows(index_k: mx.array, cols: mx.array) -> mx.array:
 def coarse_block_scores(q32: mx.array, index_k: mx.array, w32: mx.array,
                         lens: mx.array, block: int = HIER_BLOCK,
                         strip: int = HIER_STRIP,
-                        dtype=mx.bfloat16) -> mx.array:
+                        dtype=mx.bfloat16, col_mask: mx.array | None = None) -> mx.array:
     """Per-block maximum score, streamed — never materializes ``[b, n, nb]``.
 
     Shapes: ``q32`` [b, n, h, d] fp32, ``index_k`` [b, nb, d] (bf16 cache),
     ``w32`` [b, n, h] fp32, ``lens`` [n, 1] int32 (visible columns per query).
-    Returns ``block_maxima`` [b, n, nb_blocks] fp32, ``nb_blocks =
-    ceil(nb / block)``.
+    ``col_mask`` [b, n, nb] bool, optional: restrict columns to a candidate set
+    (the consumer-layer composition; a masked column is ``-inf`` and can never
+    win a block max). Returns ``block_maxima`` [b, n, nb_blocks] fp32,
+    ``nb_blocks = ceil(nb / block)``.
 
     ``nb`` is consumed in ``strip``-wide strips (round down to a multiple of
     ``block`` so block boundaries align across strips). Per strip: score
-    ``[b, n, strip]`` in ``dtype``, mask invisible columns to ``-inf``, reduce
-    to ``[b, n, strip/block]`` block maxima, write into the buffer, ``mx.eval``
-    the strip (so MLX's lazy graph cannot keep every strip's transient alive).
-    The largest score transient is ``[b, n, strip]``; the resident buffer is
-    ``[b, n, nb/block]`` — the full row is never allocated.
+    ``[b, n, strip]`` in ``dtype``, mask invisible/masked columns to ``-inf``,
+    reduce to ``[b, n, strip/block]`` block maxima, write into the buffer,
+    ``mx.eval`` the strip (so MLX's lazy graph cannot keep every strip's
+    transient alive). The largest score transient is ``[b, n, strip]``; the
+    resident buffer is ``[b, n, nb/block]`` — the full row is never allocated.
 
     ``-inf`` block maxima mean "no visible column in this block" and are
     handled downstream (they rank last and contribute only ``-inf`` scores).
@@ -240,7 +244,10 @@ def coarse_block_scores(q32: mx.array, index_k: mx.array, w32: mx.array,
         keys = index_k[:, c0:c1].astype(dtype)                 # [b, t, d] view
         s = _score_shared_columns(qc, keys, wc)                # [b, n, t]
         cols = mx.arange(c0, c1, dtype=mx.int32)
-        s = mx.where(cols[None, :] < lens, s, mx.array(NEG_INF, dtype=dtype))
+        vis = cols[None, :] < lens
+        if col_mask is not None:
+            vis = vis & col_mask[:, :, c0:c1]
+        s = mx.where(vis, s, mx.array(NEG_INF, dtype=dtype))
         mx.eval(s)                                             # bound the peak
 
         nt = -(-t // block)
@@ -277,24 +284,62 @@ def top_blocks(block_maxima: mx.array, k_blocks: int,
     return mx.sort(idx, axis=-1)
 
 
+def candidate_mask_from_block_maxima(block_maxima: mx.array, lens: mx.array,
+                                     topk_blocks: int,
+                                     block_size: int) -> mx.array:
+    """Layer-20 candidate mask, derived from the SAME coarse maxima buffer.
+
+    This is the fused form of :func:`indexer.select_candidate_blocks`: instead
+    of re-reading the ``[b, n, nb]`` score row, it consumes the per-block
+    maxima the coarse pass already computed (``block_maxima`` [b, n, nb_blocks]
+    fp32, unreachable/out-of-block columns already ``-inf``). Returns a bool
+    mask ``[b, n, nb_blocks * block_size]`` truncated to ``nb`` — exactly what
+    the production candidate mask is.
+
+    Semantics match production: the block holding each query's newest position
+    is pinned (its max forced to ``+inf``) before the top-``topk_blocks``
+    argpartition, and a block is kept iff it contains a visible column (its
+    max ``> -inf``). ``block_maxima`` may be built on a padded block grid
+    (``nb_blocks = ceil(nb / block_size)``); the trailing block's own max
+    already accounts for out-of-range columns, which the coarse pass masks to
+    ``-inf``.
+    """
+    nb_blocks, block = block_maxima.shape[-1], int(block_size)
+    width = nb_blocks * block
+    # block j's true column span is [j*block, (j+1)*block); its stored max was
+    # reduced over exactly that span (coarse pass), so no re-pad is needed.
+    last = (lens - 1) // block                                   # [n, 1]
+    pin = mx.arange(nb_blocks)[None, :] == last                  # [n, NB]
+    blocks = mx.where(pin[None], POS_INF, block_maxima)
+
+    k = min(int(topk_blocks), nb_blocks)
+    top_idx = mx.argpartition(-blocks, k - 1, axis=-1)[..., :k]
+    top_val = mx.take_along_axis(blocks, top_idx, axis=-1)
+    keep = mx.zeros(blocks.shape, dtype=mx.bool_)
+    keep = mx.put_along_axis(keep, top_idx, top_val > NEG_INF, axis=-1)
+    return mx.repeat(keep, block, axis=-1)[..., :width]
+
+
 # --------------------------------------------------------------------------
 # 3. exact re-score, streamed
 # --------------------------------------------------------------------------
 def exact_rescore_streaming(q32: mx.array, index_k: mx.array, w32: mx.array,
                             lens: mx.array, blocks: mx.array,
                             strip: int = HIER_STRIP, k: int = 512,
-                            block: int = HIER_BLOCK):
+                            block: int = HIER_BLOCK, col_mask: mx.array | None = None):
     """Exact fp32 top-k over only the candidate blocks' columns, streamed.
 
     ``blocks`` [b, n, kb] int32 (from :func:`top_blocks`). Processes
     ``bp = max(1, strip // block)`` blocks per strip: build the global column
     indices of those blocks (``bid*block + arange(block)``), gather their keys,
     score fp32, mask invisible/out-of-range columns to ``-inf``, and merge into
-    a running top-k over global indices. Returns ``(top_v [b,n,k], top_i
-    [b,n,k] int32)`` sorted ascending by index — the same shape/ordering/index
-    space as :func:`indexer.topk_from_row`. Non-finite values mark padding and
-    an unusable index, exactly as production. Largest score transient:
-    ``[b, n, bp*block]``; largest key transient: ``[b, n, bp*block, d]``.
+    a running top-k over global indices. ``col_mask`` [b, n, nb] bool, optional,
+    additionally masks columns (consumer-layer composition). Returns ``(top_v
+    [b,n,k], top_i [b,n,k] int32)`` sorted ascending by index — the same
+    shape/ordering/index space as :func:`indexer.topk_from_row`. Non-finite
+    values mark padding and an unusable index, exactly as production. Largest
+    score transient: ``[b, n, bp*block]``; largest key transient:
+    ``[b, n, bp*block, d]``.
     """
     bsz, n, _h, _d = q32.shape
     nb = index_k.shape[1]
@@ -317,6 +362,8 @@ def exact_rescore_streaming(q32: mx.array, index_k: mx.array, w32: mx.array,
         keys = _gather_rows(index_k, safe).astype(mx.float32)  # [b, n, c, d]
         s = _score_gathered_columns(q32, keys, w32)            # [b, n, c]
         vis = (gcols < lens) & (gcols < nb)
+        if col_mask is not None:
+            vis = vis & mx.take_along_axis(col_mask, safe, axis=2)
         s = mx.where(vis, s, NEG_INF)
         mx.eval(s)
 
@@ -355,3 +402,73 @@ def hierarchical_topk(q32: mx.array, index_k: mx.array, w32: mx.array,
     blocks = top_blocks(bm, k_blocks, block_size=block)
     return exact_rescore_streaming(q32, index_k, w32, lens, blocks, strip=strip,
                                    k=k, block=block)
+
+
+# --------------------------------------------------------------------------
+# 5. production integration entry point (M2)
+# --------------------------------------------------------------------------
+def hierarchical_topk_prod(q32: mx.array, index_k: mx.array, w32: mx.array,
+                           lens: mx.array, k: int, block: int, coarse_strip: int,
+                           exact_strip: int, overfetch: int,
+                           coarse_dtype=mx.bfloat16, *,
+                           cand_mask: mx.array | None = None,
+                           cand_src: tuple[int, int] | None = None):
+    """The single coarse sweep, then top-blocks, exact re-score, and (if this
+    layer is the candidate source) candidate-mask publishing — fused.
+
+    This is the production entry point for the M2 hierarchical path
+    (``DSV41_INDEXER_HIER=1``). It mirrors :func:`indexer._tiled_scores_buffer`'s
+    contract exactly:
+
+    * ``q32`` [b, n, h, d] fp32, ``index_k`` [b, nb, d], ``w32`` [b, n, h] fp32,
+      ``lens`` [n, 1];
+    * ``cand_mask`` [b, n, nb] bool or None restricts the columns (consumer
+      layers 24..36 — the exact re-score runs *within* the candidate set);
+    * ``cand_src=(candidate_topk_blocks, candidate_block_size)`` makes this
+      layer the candidate source (layer 20): the *same* coarse maxima buffer
+      that feeds ``top_blocks`` also publishes the candidate mask, so there is
+      no second full-row pass (the fusion the M1 design called for).
+
+    The two strips are separate knobs (M1 design §9): ``coarse_strip`` is the
+    coarse score transient width (``[b, n, coarse_strip]`` bf16), while
+    ``exact_strip`` sizes the exact pass and must be derived from the *key*
+    budget ``c <= M / (b*n*(6d+4))`` — see :func:`indexer.hier_strip_for_budget`.
+    Both are interpreted as **columns** and rounded down to a block multiple
+    internally.
+
+    Returns ``(top_v [b,n,k], top_i [b,n,k] int32, block_mask [b,n,nb] bool or
+    None)`` — the production return shape. ``top_i`` is raw compressed-column
+    space (before ``+offset`` / ``-1`` masking by :class:`indexer.Indexer`).
+    """
+    bsz, n, _h, _d = q32.shape
+    nb = index_k.shape[1]
+    kk = min(max(0, int(k)), nb)
+    block = max(1, int(block))
+    nb_blocks = -(-nb // block)
+
+    # ONE coarse sweep over nb (bf16, stripped) -> [b, n, nb_blocks] fp32 maxima.
+    # Never allocates [b, n, nb]; the resident buffer is nb/block-wide.
+    bm = coarse_block_scores(q32, index_k, w32, lens, block=block,
+                             strip=coarse_strip, dtype=coarse_dtype,
+                             col_mask=cand_mask)
+
+    # Candidate publishing (layer 20) is derived from the SAME maxima buffer:
+    # no score row, no second pass. (Fused here so the coarse sweep runs once.)
+    # The mask is block-aligned to `block` (the coarse block), so the caller
+    # must pass block == candidate_block_size when this layer is the source.
+    mask = None
+    if cand_src is not None:
+        mask = candidate_mask_from_block_maxima(bm, lens, cand_src[0], block)
+        mask = mask[:, :, :nb]          # production mask width is exactly nb
+
+    # Exact top-k: top-(k+overfetch) blocks by coarse max, then a streamed fp32
+    # re-score of only those blocks' columns. For a consumer layer the coarse
+    # maxima already excluded non-candidate columns (col_mask above), so this
+    # composes within shared.candidates — the two-level semantics are preserved
+    # (block-prune, then exact top-k), just never materializing the row.
+    k_blocks = min(nb_blocks, kk + int(overfetch))
+    blocks = top_blocks(bm, k_blocks, block_size=block)
+    top_v, top_i = exact_rescore_streaming(
+        q32, index_k, w32, lens, blocks, strip=exact_strip, k=k, block=block,
+        col_mask=cand_mask)
+    return top_v, top_i, mask

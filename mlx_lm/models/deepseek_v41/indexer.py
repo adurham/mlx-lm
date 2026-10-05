@@ -78,6 +78,7 @@ import mlx.nn as nn
 from .config import ModelArgs
 from .fakequant import fake_quant_fp4_ue8m0
 from .layers import RMSNorm, cos_sin_at, rope_tail
+from . import indexer_hierarchical as _hier
 
 NEG_INF = float("-inf")
 POS_INF = float("inf")
@@ -107,6 +108,45 @@ _COMPILED_BODIES: dict = {}
 # fp32 regardless (see _tiled_scores_buffer).
 _ROW_DTYPE = (mx.float32 if os.environ.get("DSV41_INDEXER_ROW_BF16", "1") == "0"
               else mx.bfloat16)
+
+# --- hierarchical / streamed exact pass (M2) --------------------------------
+# DSV41_INDEXER_HIER (default "0" = OFF) replaces the [b, n, nb] score row's
+# materialization for the exact-top-k owner roles (2/8/14/20, layer 20's
+# candidate publishing fused off the same coarse maxima) and composes it with
+# shared.candidates for the consumer roles (24..36). With the gate OFF the
+# production path is byte-for-byte what it was (no code below it runs). Read
+# once at import, like the DSV41_INDEXER_TILE* neighbours.
+_HIER = os.environ.get("DSV41_INDEXER_HIER", "0") == "1"
+_HIER_BLOCK = int(os.environ.get("DSV41_INDEXER_HIER_BLOCK", "8"))
+# Coarse score transient: [b, n, strip] bf16 (ranking only, so wide is cheap).
+_HIER_STRIP = int(os.environ.get("DSV41_INDEXER_HIER_STRIP", "4096"))
+_HIER_OVERFETCH = int(os.environ.get("DSV41_INDEXER_HIER_OVERFETCH", "16"))
+# Exact-pass budget (MiB) for the key-gather limiter (see hier_strip_for_budget).
+# Default mirrors DSV41_INDEXER_TILE_MB so the two paths share one memory target.
+_HIER_EXACT_MB = float(os.environ.get("DSV41_INDEXER_HIER_EXACT_MB",
+                                      os.environ.get("DSV41_INDEXER_TILE_MB", "128")))
+# Column budget for the exact pass's key gather, overridable directly. 0 = derive
+# it per call from _HIER_EXACT_MB and the shape (the (6d+4) formula).
+_HIER_EXACT_STRIP = int(os.environ.get("DSV41_INDEXER_HIER_EXACT_STRIP", "0"))
+
+
+def hier_strip_for_budget(bsz: int, n: int, head_dim: int, budget_bytes: int,
+                          block: int = _HIER_BLOCK) -> int:
+    """Exact-pass column-strip width from the **key-budget** (M1 design §5/§9).
+
+    The exact pass's memory limiter is the per-row key gather ``[b, n, c, d]``
+    in both its gathered (bf16, 2 B/elt) and fp32 working-cast (4 B/elt) forms,
+    plus the ``[b, n, c]`` fp32 score — i.e. ``c <= M / (b*n*(6d + 4))``. The
+    old ``4 + 4d`` (score + fp32-only keys) underestimates it by ~1.5x; this is
+    the M1-review correction. Returns a column count rounded **down** to a
+    multiple of ``block`` (so a strip is a whole number of blocks), floored at
+    ``block``. At ``n=2048, d=128, b=1, M=128 MiB`` that is ~87 columns ⇒ ~10-11
+    blocks per strip (NOT the 15 a score-only bound would give).
+    """
+    per_col = max(1, int(bsz) * int(n) * (6 * int(head_dim) + 4))
+    cols = max(1, int(budget_bytes) // per_col)
+    cols = max(int(block), (cols // int(block)) * int(block))
+    return cols
 
 
 def tile_width(bsz: int, n: int, n_heads: int, nb: int, align: int) -> int:
@@ -449,6 +489,42 @@ class Indexer(nn.Module):
 
         align = self.candidate_block_size if self.is_candidate_source else 1
         tile = tiled(bsz, n, self.n_heads, nb, align)
+
+        if _HIER:
+            # ---- hierarchical / streamed exact pass (M2), env-gated -----------
+            # Replaces the [b, n, nb] row materialization for every exact-top-k
+            # role: coarse (bf16, block maxima, stripped) -> top-(k+overfetch)
+            # blocks -> streamed fp32 re-score of only those blocks' columns.
+            # Layer 20's candidate mask is published off the SAME coarse maxima
+            # buffer (fused; no second row pass); consumer layers (24..36)
+            # compose within shared.candidates. Never allocates [b, n, nb]; the
+            # exact-pass strip is sized from the KEY budget (6d+4), not the row.
+            k = min(self.index_topk, nb)
+            # Block size for the coarse stage == candidate_block_size when this
+            # layer publishes candidates (the mask is derived from the coarse
+            # block maxima, so the two grids must coincide). Verified once here.
+            hier_block = _HIER_BLOCK
+            if self.is_candidate_source:
+                assert self.candidate_block_size == hier_block, (
+                    f"DSV41_INDEXER_HIER_BLOCK ({hier_block}) must equal "
+                    f"candidate_block_size ({self.candidate_block_size}) on the "
+                    f"candidate-source layer")
+            cmask = shared.candidates if (self.uses_candidates
+                                          and shared.candidates is not None) else None
+            estrip = (_HIER_EXACT_STRIP if _HIER_EXACT_STRIP > 0
+                      else hier_strip_for_budget(bsz, n, self.head_dim,
+                                                 int(_HIER_EXACT_MB * (1 << 20)),
+                                                 block=hier_block))
+            v, i, blk = _hier.hierarchical_topk_prod(
+                q.astype(mx.float32), index_k, w.astype(mx.float32), lens,
+                k, hier_block, _HIER_STRIP, estrip, _HIER_OVERFETCH,
+                cand_mask=cmask,
+                cand_src=((self.candidate_topk_blocks, self.candidate_block_size)
+                          if self.is_candidate_source else None))
+            if self.is_candidate_source:
+                shared.candidates = blk
+            valid = mx.isfinite(v) & (i < lens.astype(mx.int32)[None])
+            return mx.where(valid, i + offset, mx.array(-1, mx.int32))
 
         if tile < nb:
             # ---- tiled path: one [b, n, heads, tile] score transient at a time
