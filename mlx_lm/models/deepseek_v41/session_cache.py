@@ -374,8 +374,16 @@ class SessionCache:
         self._snaps[pos] = snap
         self._snaps.move_to_end(pos)
         while len(self._snaps) > self.max_snapshots:
-            # oldest first -- the newest checkpoint (cancel's target) always stays
-            del self._snaps[next(iter(self._snaps))]
+            # Keep the offset-0 origin: it is the permanent fallback boundary,
+            # so a legitimate rewind near the start of a long conversation
+            # stays a reuse instead of a RollbackError once the ladder has
+            # pushed many higher checkpoints through the cap. Evict the oldest
+            # *other* checkpoint instead (insertion order is offset-ascending),
+            # so survivors are 0 plus the newest max_snapshots-1 checkpoints.
+            victim = next((p for p in self._snaps if p != 0), None)
+            if victim is None:          # only offset 0 remains: nothing to drop
+                break
+            del self._snaps[victim]
         return snap
 
     def _boundary_le(self, target: int) -> int:
