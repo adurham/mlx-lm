@@ -53,6 +53,17 @@ pick is implementation-defined, the same class round 1 documented). Measured 0
 differing rows on synthetic tensors (nb 4096..20000, tiles 256..1024) and on
 real activations (49152 rows, ``wsB-ab``).
 
+Row precision (local change, exo phase 20 prefill quick-win). The stored
+``[b, n, nb]`` score row is **bf16** by default (``DSV41_INDEXER_ROW_BF16=0``
+restores the fp32 row); bf16 halves the row (8.6 GB -> 4.3 GB per index layer
+at n=2048, nb=1M — full context) and routes the score GEMM through 16-bit
+paths. The per-tile ``[b, n, heads, tile]`` transient that feeds the head-sum
+stays **fp32** — softmax-style accumulations in reduced precision are where
+quality dies; only the *stored* row is bf16. This is NOT bit-exact: scores
+that round to the same bf16 value can flip which of them lands in the top-k.
+Recall, not bitwise equality, is the gate; the near-tie flip rate is measured
+by ``tests/test_dsv41_indexer_bf16_row.py``.
+
 ``DSV41_INDEXER_TILE=0`` restores the untiled path for any nb;
 ``DSV41_INDEXER_TILE_MIN_NB=0`` runs tiled at any nb (used by parity tests).
 """
@@ -67,6 +78,7 @@ import mlx.nn as nn
 from .config import ModelArgs
 from .fakequant import fake_quant_fp4_ue8m0
 from .layers import RMSNorm, cos_sin_at, rope_tail
+from . import indexer_hierarchical as _hier
 
 NEG_INF = float("-inf")
 POS_INF = float("inf")
@@ -90,6 +102,51 @@ _TILED_IMPL = os.environ.get("DSV41_INDEXER_TILED_IMPL", "buffer")
 # harness exercises). DSV41_INDEXER_COMPILE=0 falls back to the eager expression.
 _INDEXER_COMPILE = os.environ.get("DSV41_INDEXER_COMPILE", "1") == "1"
 _COMPILED_BODIES: dict = {}
+# Stored score-row precision. bf16 (default) halves the [b, n, nb] row and its
+# GEMM; fp32 restores the exact-precision row for A/B. Read once at import, so
+# flipping it needs a process restart. The per-tile head-sum transient stays
+# fp32 regardless (see _tiled_scores_buffer).
+_ROW_DTYPE = (mx.float32 if os.environ.get("DSV41_INDEXER_ROW_BF16", "1") == "0"
+              else mx.bfloat16)
+
+# --- hierarchical / streamed exact pass (M2) --------------------------------
+# DSV41_INDEXER_HIER (default "0" = OFF) replaces the [b, n, nb] score row's
+# materialization for the exact-top-k owner roles (2/8/14/20, layer 20's
+# candidate publishing fused off the same coarse maxima) and composes it with
+# shared.candidates for the consumer roles (24..36). With the gate OFF the
+# production path is byte-for-byte what it was (no code below it runs). Read
+# once at import, like the DSV41_INDEXER_TILE* neighbours.
+_HIER = os.environ.get("DSV41_INDEXER_HIER", "0") == "1"
+_HIER_BLOCK = int(os.environ.get("DSV41_INDEXER_HIER_BLOCK", "8"))
+# Coarse score transient: [b, n, strip] bf16 (ranking only, so wide is cheap).
+_HIER_STRIP = int(os.environ.get("DSV41_INDEXER_HIER_STRIP", "4096"))
+_HIER_OVERFETCH = int(os.environ.get("DSV41_INDEXER_HIER_OVERFETCH", "16"))
+# Exact-pass budget (MiB) for the key-gather limiter (see hier_strip_for_budget).
+# Default mirrors DSV41_INDEXER_TILE_MB so the two paths share one memory target.
+_HIER_EXACT_MB = float(os.environ.get("DSV41_INDEXER_HIER_EXACT_MB",
+                                      os.environ.get("DSV41_INDEXER_TILE_MB", "128")))
+# Column budget for the exact pass's key gather, overridable directly. 0 = derive
+# it per call from _HIER_EXACT_MB and the shape (the (6d+4) formula).
+_HIER_EXACT_STRIP = int(os.environ.get("DSV41_INDEXER_HIER_EXACT_STRIP", "0"))
+
+
+def hier_strip_for_budget(bsz: int, n: int, head_dim: int, budget_bytes: int,
+                          block: int = _HIER_BLOCK) -> int:
+    """Exact-pass column-strip width from the **key-budget** (M1 design §5/§9).
+
+    The exact pass's memory limiter is the per-row key gather ``[b, n, c, d]``
+    in both its gathered (bf16, 2 B/elt) and fp32 working-cast (4 B/elt) forms,
+    plus the ``[b, n, c]`` fp32 score — i.e. ``c <= M / (b*n*(6d + 4))``. The
+    old ``4 + 4d`` (score + fp32-only keys) underestimates it by ~1.5x; this is
+    the M1-review correction. Returns a column count rounded **down** to a
+    multiple of ``block`` (so a strip is a whole number of blocks), floored at
+    ``block``. At ``n=2048, d=128, b=1, M=128 MiB`` that is ~87 columns ⇒ ~10-11
+    blocks per strip (NOT the 15 a score-only bound would give).
+    """
+    per_col = max(1, int(bsz) * int(n) * (6 * int(head_dim) + 4))
+    cols = max(1, int(budget_bytes) // per_col)
+    cols = max(int(block), (cols // int(block)) * int(block))
+    return cols
 
 
 def tile_width(bsz: int, n: int, n_heads: int, nb: int, align: int) -> int:
@@ -100,7 +157,9 @@ def tile_width(bsz: int, n: int, n_heads: int, nb: int, align: int) -> int:
     """
     if _TILE <= 0:
         return nb
-    cap = max(align, _TILE_BUDGET // max(1, bsz * n * n_heads * 4))
+    # bsz*n*nb elements of _ROW_DTYPE per head-sum output; the tile transient is
+    # bsz*n*n_heads*tile elements of fp32 (the head-sum accumulation stays fp32).
+    cap = max(align, _TILE_BUDGET // max(1, bsz * n * (n_heads * 4 + _ROW_DTYPE.size)))
     t = max(align, (min(_TILE, cap) // align) * align)
     return min(nb, t)
 
@@ -120,7 +179,8 @@ def tiled(bsz: int, n: int, n_heads: int, nb: int, align: int = 1) -> int:
     tile = tile_width(bsz, n, n_heads, nb, align)
     if nb < _TILE_MIN_NB or tile >= nb:
         return nb
-    if not _TILE_FORCE and bsz * n * n_heads * nb * 4 <= _TILE_BUDGET:
+    # untiled peak ~= the [b, n, heads, nb] fp32 transient + the [b, n, nb] row
+    if not _TILE_FORCE and bsz * n * nb * (n_heads * 4 + _ROW_DTYPE.size) <= _TILE_BUDGET:
         return nb
     return tile
 
@@ -200,13 +260,15 @@ def _tiled_scores_buffer(q32: mx.array, index_k: mx.array, w32: mx.array,
     layers 24..36); ``cand_src=(topk_blocks, block_size)`` makes this layer the
     candidate source (layer 20).
 
-    Per tile: score ([b, n, h, tile] transient, fenced), mask visibility, append
-    the ``[b, n, tile]`` collapse to a ``[b, n, nb]`` row (the untiled
-    ``[b, n, h, nb]`` 1.07 GB transient becomes a 335 MB fp32 row at nb=16384,
-    n=512, of which only the masked 1.07 GB-worth of head reductions are ever
-    live one tile at a time). The top-k and the candidate block selection are
-    then each ONE exact global pass over that row / over the per-tile block
-    maxima.
+    Per tile: score ([b, n, h, tile] **fp32** transient, fenced), mask
+    visibility, append the ``[b, n, tile]`` collapse to a ``[b, n, nb]`` row.
+    The row is bf16 by default (:data:`_ROW_DTYPE`): at nb=16384, n=512 the
+    untiled ``[b, n, h, nb]`` 1.07 GB fp32 transient becomes a 168 MB bf16 row;
+    at n=2048, nb=1M (full context) the fp32 row would be 8.6 GB and the bf16
+    row 4.3 GB — one index layer each. The tile transient stays fp32 (reduced-
+    precision head-sum accumulation is where quality dies); only the *stored*
+    row is bf16. The top-k and the candidate block selection are then each ONE
+    exact global pass over that row / over the per-tile block maxima.
 
     Returns ``(top_v [b,n,k], top_i [b,n,k], block_mask [b,n,nb] bool or None)``.
     ``top_i`` slots whose ``top_v`` is ``-inf`` are padding: drop them.
@@ -216,10 +278,13 @@ def _tiled_scores_buffer(q32: mx.array, index_k: mx.array, w32: mx.array,
     topk_blocks, block_size = cand_src if cand else (0, 1)
     body = _score_body(bsz, n, q32.shape[2], q32.shape[3], tile)
 
-    # The whole buffer is written by the loop before anything reads it, so an
-    # uninitialized allocation is safe here and skips a full zero-fill of
-    # ``b*n*nb`` fp32 (335 MB at nb=16384, n=512 — measured ~0.8 ms).
-    row = mx.empty((bsz, n, nb), dtype=mx.float32)
+    # ``zeros`` (not ``empty``): in this MLX build ``mx.empty`` is a pure
+    # alias of ``mx.zeros`` (no uninitialized allocation exists), and older
+    # dev builds lack the alias entirely -- so zeros is the portable spelling
+    # and fills every row element before the loop overwrites it. The per-tile
+    # head-sum ``s`` stays fp32 (see module docstring); only the stored row is
+    # _ROW_DTYPE, and the fp32->bf16 slice-assign cast is the entire change.
+    row = mx.zeros((bsz, n, nb), dtype=_ROW_DTYPE)
     for c0 in range(0, nb, tile):
         c1 = min(c0 + tile, nb)
         s = body(q32, index_k[:, c0:c1].astype(mx.float32), w32)
@@ -231,17 +296,20 @@ def _tiled_scores_buffer(q32: mx.array, index_k: mx.array, w32: mx.array,
         # would equal the untiled path and the whole exercise be pointless.
         # (Same finding, same fix as deepseek_v4.py _indexer_score_tiled.)
         mx.eval(s)
+        # s is fp32; the slice assign casts to _ROW_DTYPE (bf16 by default).
         row[:, :, c0:c1] = s
     # The candidate selection is ONE exact global pass over the completed row —
     # the same two-level block max / top-k the untiled path runs, just fed from
     # the buffered row instead of the full [b, n, heads, nb] tensor. This is
     # what took layer 20's call from ~42 ms (per-tile block merge) to ~20 ms.
+    # Runs natively in _ROW_DTYPE: max and comparison of *stored* scores are
+    # exact-in-dtype, so the block bookkeeping cannot drift.
     if cand:
         mask = select_candidate_blocks(row, lens, topk_blocks, block_size)
     else:
         mask = None
     if cand_mask is not None:
-        row = mx.where(cand_mask, row, NEG_INF)
+        row = mx.where(cand_mask, row, NEG_INF)          # -inf is bf16-exact
     v, i = topk_from_row(row, k)
     return v, i, mask
 
@@ -422,6 +490,42 @@ class Indexer(nn.Module):
         align = self.candidate_block_size if self.is_candidate_source else 1
         tile = tiled(bsz, n, self.n_heads, nb, align)
 
+        if _HIER:
+            # ---- hierarchical / streamed exact pass (M2), env-gated -----------
+            # Replaces the [b, n, nb] row materialization for every exact-top-k
+            # role: coarse (bf16, block maxima, stripped) -> top-(k+overfetch)
+            # blocks -> streamed fp32 re-score of only those blocks' columns.
+            # Layer 20's candidate mask is published off the SAME coarse maxima
+            # buffer (fused; no second row pass); consumer layers (24..36)
+            # compose within shared.candidates. Never allocates [b, n, nb]; the
+            # exact-pass strip is sized from the KEY budget (6d+4), not the row.
+            k = min(self.index_topk, nb)
+            # Block size for the coarse stage == candidate_block_size when this
+            # layer publishes candidates (the mask is derived from the coarse
+            # block maxima, so the two grids must coincide). Verified once here.
+            hier_block = _HIER_BLOCK
+            if self.is_candidate_source:
+                assert self.candidate_block_size == hier_block, (
+                    f"DSV41_INDEXER_HIER_BLOCK ({hier_block}) must equal "
+                    f"candidate_block_size ({self.candidate_block_size}) on the "
+                    f"candidate-source layer")
+            cmask = shared.candidates if (self.uses_candidates
+                                          and shared.candidates is not None) else None
+            estrip = (_HIER_EXACT_STRIP if _HIER_EXACT_STRIP > 0
+                      else hier_strip_for_budget(bsz, n, self.head_dim,
+                                                 int(_HIER_EXACT_MB * (1 << 20)),
+                                                 block=hier_block))
+            v, i, blk = _hier.hierarchical_topk_prod(
+                q.astype(mx.float32), index_k, w.astype(mx.float32), lens,
+                k, hier_block, _HIER_STRIP, estrip, _HIER_OVERFETCH,
+                cand_mask=cmask,
+                cand_src=((self.candidate_topk_blocks, self.candidate_block_size)
+                          if self.is_candidate_source else None))
+            if self.is_candidate_source:
+                shared.candidates = blk
+            valid = mx.isfinite(v) & (i < lens.astype(mx.int32)[None])
+            return mx.where(valid, i + offset, mx.array(-1, mx.int32))
+
         if tile < nb:
             # ---- tiled path: one [b, n, heads, tile] score transient at a time
             k = min(self.index_topk, nb)
@@ -443,11 +547,14 @@ class Indexer(nn.Module):
             valid = mx.isfinite(v) & (i < lens.astype(mx.int32)[None])
             return mx.where(valid, i + offset, mx.array(-1, mx.int32))
 
-        # ---- untiled reference path (unchanged) ----
+        # ---- untiled reference path ----
         scores = mx.einsum("bshd,btd->bsht", q.astype(mx.float32),
                            index_k.astype(mx.float32))
         scores = mx.maximum(scores, 0.0) * w[..., None].astype(mx.float32)
-        scores = mx.sum(scores, axis=2)                          # [b, n, nb]
+        # head-sum stays fp32; the STORED row takes the same precision as the
+        # tiled path's buffer (_ROW_DTYPE, bf16 by default) so the two paths and
+        # the DSV41_INDEXER_ROW_BF16 A/B are directly comparable.
+        scores = mx.sum(scores, axis=2).astype(_ROW_DTYPE)      # [b, n, nb]
 
         vis = mx.arange(nb)[None, :] < lens                            # [n, nb]
         scores = mx.where(vis[None], scores, NEG_INF)
