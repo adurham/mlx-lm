@@ -465,13 +465,19 @@ class IndexerCallIntegrationTest(unittest.TestCase):
 
     def setUp(self):
         self._saved = {"tile": IX._TILE, "min_nb": IX._TILE_MIN_NB,
-                       "force": IX._TILE_FORCE, "row": IX._ROW_DTYPE}
+                       "force": IX._TILE_FORCE, "row": IX._ROW_DTYPE,
+                       # These tests exercise the TILED/UNTILED production paths
+                       # directly; with HIER default-ON (2026-10-06) they must
+                       # pin it off so the non-HIER paths are what runs.
+                       "hier": IX._HIER}
+        IX._HIER = False
 
     def tearDown(self):
         IX._TILE = self._saved["tile"]
         IX._TILE_MIN_NB = self._saved["min_nb"]
         IX._TILE_FORCE = self._saved["force"]
         IX._ROW_DTYPE = self._saved["row"]
+        IX._HIER = self._saved["hier"]
 
     def _run(self, *, tiled: bool, row_dtype=None, want_mask=False):
         from mlx_lm.models.deepseek_v41.model import SharedState

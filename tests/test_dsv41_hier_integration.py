@@ -222,9 +222,11 @@ class _GateFixture(unittest.TestCase):
 # 1. env OFF == production, byte-identical
 # --------------------------------------------------------------------------
 class EnvOffByteIdentityTest(_GateFixture):
-    def test_default_gate_is_off(self):
-        self.assertFalse(IX._HIER, "DSV41_INDEXER_HIER must default to OFF")
-        record({"case": "gate_default_off", "hier": IX._HIER})
+    def test_default_gate_is_on(self):
+        # Flipped 2026-10-06: the A/B (+15.2% delta) + live battery PASSED, so
+        # the hierarchical pass is the shipped default; =0 forces the old path.
+        self.assertTrue(IX._HIER, "DSV41_INDEXER_HIER must default to ON")
+        record({"case": "gate_default_on", "hier": IX._HIER})
 
     def test_off_never_enters_hier_branch(self):
         """With the gate off, hierarchical_topk_prod is never called."""
