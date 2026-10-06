@@ -290,12 +290,15 @@ class AttentionIntegrationTest(unittest.TestCase):
         orig, seen = self.orig, self.seen
         attmod = self.attmod
 
-        def patched(q, kv, sink, idx, sc, chunk=64, kv2=None, split=None):
+        def patched(q, kv, sink, idx, sc, chunk=64, kv2=None, split=None,
+                    colsplit=None):
             seen.append(("none" if kv2 is None else str(kv2.dtype), split))
             if kv2 is not None and materialize:
                 kv = mx.concatenate([kv, kv2], axis=1)   # legacy dense material
                 kv2 = None
-            return orig(q, kv, sink, idx, sc, chunk, kv2=kv2, split=split)
+                colsplit = None                          # no second source
+            return orig(q, kv, sink, idx, sc, chunk, kv2=kv2, split=split,
+                        colsplit=colsplit)
 
         attmod.sparse_attn = patched
 

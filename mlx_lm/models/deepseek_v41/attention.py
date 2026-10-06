@@ -50,6 +50,11 @@ from ...profiler import span
 # module's own knobs). Does NOT touch decode: the fence is skipped for
 # single-row forwards regardless. A/B knob: DSV41_SPARSE_PREFILL_CHUNK.
 _PREFILL_CHUNK = int(os.environ.get("DSV41_SPARSE_PREFILL_CHUNK", "64"))
+# C1 column-partitioned gather gate, read here (same env, same import-time
+# read) so the DEFAULT call site is byte-identical: colsplit is passed to
+# sparse_attn ONLY when the gate is set. sparse_attention re-derives and
+# re-checks the boundary regardless, so a mismatched value cannot mis-gather.
+_COLSPLIT = os.environ.get("DSV41_SPARSE_COLSPLIT", "0") == "1"
 
 
 def window_idx_matrix(wp: int, n: int, window: int) -> mx.array:
@@ -144,8 +149,14 @@ class Attention(nn.Module):
             prev = lc.window_chrono(start_pos)                      # [b, Wp, hd]
             wp = prev.shape[1]
             kv_all = mx.concatenate([prev.astype(kv.dtype), kv], axis=1) if wp else kv
+            w_eff = min(self.window_size, wp + n)
             idxs = mx.broadcast_to(window_idx_matrix(wp, n, self.window_size)[None],
-                                   (bsz, n, min(self.window_size, wp + n)))
+                                   (bsz, n, w_eff))
+            # The window block is idxs' leading w_eff columns; the compressed
+            # top-k (when present) is concatenated after it. That is exactly the
+            # column layout sparse_attn's C1 gate needs declared (DSV41_SPARSE_
+            # COLSPLIT): columns [0, n_window) index concat-space rows < offset.
+            n_window = int(w_eff)
             lc.write_window(start_pos, kv)
         offset = wp + n                                          # compressed entries follow
 
@@ -198,8 +209,11 @@ class Attention(nn.Module):
                 kv2 = src.comp_kv[:bsz, :compress_len]
         sink = mx.zeros_like(self.attn_sink) if self._break_sink else self.attn_sink
         with span("attn.sdpa"):
+            # C1: declare the window-block width as the column boundary ONLY when
+            # the gate is on, so the default call stays byte-identical.
+            extra = {"colsplit": n_window} if _COLSPLIT else {}
             o = sparse_attn(q, kv_all, sink, idxs, self.softmax_scale,
-                            chunk=_PREFILL_CHUNK, kv2=kv2, split=offset)
+                            chunk=_PREFILL_CHUNK, kv2=kv2, split=offset, **extra)
 
         # --- inverse rope, grouped block-diagonal output LoRA ---
         with span("attn.o_proj"):
