@@ -111,13 +111,14 @@ _ROW_DTYPE = (mx.float32 if os.environ.get("DSV41_INDEXER_ROW_BF16", "1") == "0"
               else mx.bfloat16)
 
 # --- hierarchical / streamed exact pass (M2) --------------------------------
-# DSV41_INDEXER_HIER (default "0" = OFF) replaces the [b, n, nb] score row's
+# DSV41_INDEXER_HIER (default "1" = ON since the 2026-10-06 A/B+battery; "0"
+# forces OFF for A/B) replaces the [b, n, nb] score row's
 # materialization for the exact-top-k owner roles (2/8/14/20, layer 20's
 # candidate publishing fused off the same coarse maxima) and composes it with
 # shared.candidates for the consumer roles (24..36). With the gate OFF the
 # production path is byte-for-byte what it was (no code below it runs). Read
 # once at import, like the DSV41_INDEXER_TILE* neighbours.
-_HIER = os.environ.get("DSV41_INDEXER_HIER", "0") == "1"
+_HIER = os.environ.get("DSV41_INDEXER_HIER", "1") == "1"
 _HIER_BLOCK = int(os.environ.get("DSV41_INDEXER_HIER_BLOCK", "8"))
 # Coarse score transient: [b, n, strip] bf16 (ranking only, so wide is cheap).
 _HIER_STRIP = int(os.environ.get("DSV41_INDEXER_HIER_STRIP", "4096"))
