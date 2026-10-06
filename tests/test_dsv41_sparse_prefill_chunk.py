@@ -44,11 +44,12 @@ def test_sparse_attn_chunk_invariance_bit_identical():
     assert np.array_equal(outs[0], outs[2]), "chunk 64 vs 2048 diverged"
 
 
-def test_attention_default_chunk_is_64_and_follows_env():
-    # default (this process imported with env unset)
+def test_attention_default_chunk_is_256_and_follows_env():
+    # default 256 since 2026-10-06 (shipped with the qtile=256 winner; bigger
+    # tiles => fewer per-tile fences). 64 remains the escape-hatch value.
     from mlx_lm.models.deepseek_v41 import attention as at
     if os.environ.get("DSV41_SPARSE_PREFILL_CHUNK") is None:
-        assert at._PREFILL_CHUNK == 64, "shipped default must stay 64"
+        assert at._PREFILL_CHUNK == 256, "shipped default must be 256"
     # env-follows, in a clean interpreter
     r = subprocess.run(
         [sys.executable, "-c",

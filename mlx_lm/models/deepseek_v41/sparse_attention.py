@@ -77,7 +77,7 @@ MASK_LOGIT = float("-inf")
 # --------------------------------------------------------------------------
 # tiling / numerics knobs
 # --------------------------------------------------------------------------
-_QTILE = int(os.environ.get("DSV41_SPARSE_QTILE", "64"))
+_QTILE = int(os.environ.get("DSV41_SPARSE_QTILE", "256"))
 # 0 = auto: take the widest key tile whose largest intermediate fits the budget
 # (at the production shape that is the whole 128-window + top-512 range in one
 # tile). A smaller fixed value trades dispatches for a smaller footprint.
@@ -113,7 +113,7 @@ _FENCE_MIN_ROWS = int(os.environ.get("DSV41_SPARSE_FENCE_MIN_ROWS", "16"))
 # accumulator. The tile plan shrinks the key tile and then the query tile until
 # every one of them fits, so the peak transient is bounded at any geometry
 # (42 MB for the gather at Tq=64, k=640, d=512, bf16).
-_BUDGET_BYTES = int(os.environ.get("DSV41_SPARSE_BUDGET_MB", "64")) << 20
+_BUDGET_BYTES = int(os.environ.get("DSV41_SPARSE_BUDGET_MB", "256")) << 20
 
 # Column-partitioned two-source gather (workstream C1, 2026-10-06). OFF by
 # default = byte-identical to the where-select path. When ON and the caller's
@@ -127,7 +127,7 @@ _BUDGET_BYTES = int(os.environ.get("DSV41_SPARSE_BUDGET_MB", "64")) << 20
 # is PROVEN from the indices themselves once per call (``_column_boundary``);
 # on any ambiguity the call silently falls back to the exact where-select path,
 # so a violated invariant can never mis-gather.
-_COLSPLIT = os.environ.get("DSV41_SPARSE_COLSPLIT", "0") == "1"
+_COLSPLIT = os.environ.get("DSV41_SPARSE_COLSPLIT", "1") == "1"
 # Async per-tile fence (workstream C3, 2026-10-06). OFF by default = the
 # blocking per-tile ``mx.eval`` documented above (``qtile``). When ON the
 # per-tile fence becomes ``mx.async_eval`` -- the tile is queued without a host

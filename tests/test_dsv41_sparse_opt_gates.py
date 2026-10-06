@@ -117,11 +117,15 @@ def _run(q, kv1, kv2, sink, idx, split, nwin, *, chunk=64, colsplit_param=True):
 
 
 # -- 1. defaults -------------------------------------------------------------
-def test_gates_default_off():
+def test_gates_defaults():
+    # C1 (colsplit) shipped default-ON 2026-10-06: +2-3% fresh/+2% delta in the
+    # 4-arm A/B (Arm3/Arm4 vs Arm1, clean isolation), battery PASSED. C3 (async
+    # fence) stays default-OFF FOREVER: the same A/B measured it as a -6/-8%
+    # REGRESSION (the blocking per-tile eval is load-bearing at prefill).
     if os.environ.get("DSV41_SPARSE_COLSPLIT") is None:
-        assert sa._COLSPLIT is False, "C1 gate must default OFF"
+        assert sa._COLSPLIT is True, "C1 gate must default ON (shipped)"
     if os.environ.get("DSV41_SPARSE_ASYNC_FENCE") is None:
-        assert sa._FENCE_ASYNC is False, "C3 gate must default OFF"
+        assert sa._FENCE_ASYNC is False, "C3 gate must stay default OFF"
 
 
 def test_gates_follow_env_at_import():
