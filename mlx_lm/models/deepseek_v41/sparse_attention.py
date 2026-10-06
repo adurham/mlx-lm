@@ -50,7 +50,9 @@ those fp32 operands. This version:
 Knobs (all env-gated for A/B and rollback): ``DSV41_SPARSE_IMPL``
 (``tiled``|``ref``), ``DSV41_SPARSE_QTILE``, ``DSV41_SPARSE_KTILE``,
 ``DSV41_SPARSE_WDTYPE`` (``auto``|``bf16``|``fp16``|``fp32``),
-``DSV41_SPARSE_COMPILE``, ``DSV41_SPARSE_BUDGET_MB``.
+``DSV41_SPARSE_COMPILE``, ``DSV41_SPARSE_BUDGET_MB``,
+``DSV41_SPARSE_COLSPLIT`` (column-partitioned two-source gather, default 0),
+``DSV41_SPARSE_ASYNC_FENCE`` (async per-tile fence, default 0).
 
 Two-source gather (gather-direct comp_kv). ``sparse_attn`` also accepts
 ``kv2``/``split``: index rows ``< split`` gather from ``kv``, rows
@@ -112,6 +114,32 @@ _FENCE_MIN_ROWS = int(os.environ.get("DSV41_SPARSE_FENCE_MIN_ROWS", "16"))
 # every one of them fits, so the peak transient is bounded at any geometry
 # (42 MB for the gather at Tq=64, k=640, d=512, bf16).
 _BUDGET_BYTES = int(os.environ.get("DSV41_SPARSE_BUDGET_MB", "64")) << 20
+
+# Column-partitioned two-source gather (workstream C1, 2026-10-06). OFF by
+# default = byte-identical to the where-select path. When ON and the caller's
+# layout invariant holds (window block entirely ``< split``, compressed block
+# entirely ``>= split``), each query row's columns are routed to a SINGLE
+# source instead of gathering BOTH sources for every row and ``mx.where``-
+# selecting: the window columns need only ``kv`` and the top-k columns only
+# ``kv2``. At the production tile shape [1, 64, 640, 512] bf16 the old path
+# gathered ~80 MB per query tile (window + top-k from both buffers) and threw
+# half of it away; the comp_kv gather is what dominates the tile. The boundary
+# is PROVEN from the indices themselves once per call (``_column_boundary``);
+# on any ambiguity the call silently falls back to the exact where-select path,
+# so a violated invariant can never mis-gather.
+_COLSPLIT = os.environ.get("DSV41_SPARSE_COLSPLIT", "0") == "1"
+# Async per-tile fence (workstream C3, 2026-10-06). OFF by default = the
+# blocking per-tile ``mx.eval`` documented above (``qtile``). When ON the
+# per-tile fence becomes ``mx.async_eval`` -- the tile is queued without a host
+# round-trip -- plus ONE blocking ``mx.eval`` after the final tile, so the call
+# still returns an evaluated tensor. Rationale: at the production chunk=64 a
+# 2048-row prefill call issues 32 blocking syncs/layer; async removes those
+# round-trips. Memory expectation: the async commits keep the per-tile live set
+# bounded exactly as the blocking eval does (the 202 MB fenced figure above),
+# and across layers the model.py prefill host sync (rows>16) is what bounds the
+# queue; the gate does NOT trade the bound away. The exact async peak is
+# UNMEASURED on the real model (see the branch report).
+_FENCE_ASYNC = os.environ.get("DSV41_SPARSE_ASYNC_FENCE", "0") == "1"
 
 _COMPILED: dict = {}
 
@@ -188,6 +216,80 @@ def _gather_split(kv: mx.array, kv2: mx.array, idx: mx.array, split: int) -> mx.
     return mx.where(take_b[..., None], gathered_b, gathered_a)
 
 
+def _gather_cols(kv: mx.array, kv2: mx.array, icb: mx.array, split: int,
+                 colsplit: int, ks: int) -> mx.array:
+    """C1 gather for one key tile: route each COLUMN range to its own source.
+
+    ``icb`` [b, m, Tk] is key columns ``[ks, ks + Tk)`` of the call's index
+    matrix. Columns ``< colsplit`` address ``kv`` (window, already clamped to
+    ``[0, split)`` with ``-1`` -> row 0) and columns ``>= colsplit`` address
+    ``kv2`` (at ``row - split``). A tile entirely inside one region is one
+    gather from that source; a tile straddling the boundary is the two column
+    ranges gathered separately and concatenated. The caller only reaches here
+    after ``_column_boundary`` proved the layout, so the two ranges are known
+    clean and no ``mx.where`` select is needed.
+    """
+    k = int(icb.shape[-1])
+    cs = min(max(colsplit - ks, 0), k)                    # left columns in tile
+    if cs <= 0:
+        return _gather_kv(kv2, mx.maximum(icb - split, 0))
+    if cs >= k:
+        return _gather_kv(kv, mx.minimum(mx.maximum(icb, 0), split - 1))
+    left = icb[:, :, :cs]
+    right = icb[:, :, cs:]
+    gathered_a = _gather_kv(kv, mx.minimum(mx.maximum(left, 0), split - 1))
+    gathered_b = _gather_kv(kv2, mx.maximum(right - split, 0))
+    return mx.concatenate([gathered_a, gathered_b], axis=2)
+
+
+def _column_boundary(icb: mx.array, split: int, colsplit: int) -> int | None:
+    """Column split for the C1 two-source path, or ``None`` to fall back.
+
+    ``icb`` [b, m, k] addresses ``concat(kv[split], kv2[...])``. ``attention.py``
+    passes the window block FIRST (columns ``< split``, ``-1`` padded) and the
+    top-k compressed block SECOND (columns ``>= split``). ``colsplit`` is the
+    window block width the caller declares, or ``-1`` to derive it.
+
+    A column split at ``w`` is only valid when every column ``[0, w)`` is
+    provably ``< split`` (or a negative mask) and every column ``[w, k)`` is
+    provably ``>= split`` (or a negative mask). Negative entries are the
+    indexer's ``-1`` mask; their logit is replaced by ``-inf`` downstream, so
+    they may sit in EITHER region without changing a single output bit (the
+    existing where-select already substitutes an arbitrary row for them). Any
+    value in ``[0, split)`` inside the right region -- a real window index the
+    caller misplaced -- fails the check and forces the exact where-select path,
+    so a violated layout can never mis-gather.
+
+    The whole ``[b, m, k]`` compare runs ONCE per call (cheap); ``None`` means
+    fall back. Derivation (``colsplit=-1``): the boundary is the smallest
+    per-row leading run of ``< split`` columns, which absorbs the window
+    block's right-edge ``-1`` pads.
+    """
+    k = int(icb.shape[-1])
+    if k == 0:
+        return 0
+    n_window = colsplit if colsplit >= 0 else _leading_window_columns(icb, split)
+    if not 0 < n_window < k:
+        return None
+    left_ok = bool(mx.all(icb[:, :, :n_window] < split).item())
+    right = icb[:, :, n_window:]
+    right_ok = bool(mx.all((right >= split) | (right < 0)).item())
+    if not (left_ok and right_ok):
+        return None
+    return n_window
+
+
+def _leading_window_columns(icb: mx.array, split: int) -> int:
+    """Smallest per-row leading run of ``< split`` columns in ``icb``.
+
+    ``-1`` pads count as ``< split`` so the window block's right-edge mask is
+    absorbed; the minimum over rows keeps every row's ``[0, w)`` clean.
+    """
+    lead = (icb < split).astype(mx.int32)                  # [b, m, k]
+    run = mx.cumprod(lead, axis=-1)                        # 1 until first >=
+    return int(mx.min(mx.sum(run, axis=-1)))
+
+
 # --------------------------------------------------------------------------
 # per-(query, key)-tile body: the online-softmax step
 #
@@ -235,7 +337,7 @@ def _body(fn, first: bool, qc, kvc, wdtype):
 
 def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.array,
                 softmax_scale: float, chunk: int = 64, kv2: mx.array | None = None,
-                split: int | None = None) -> mx.array:
+                split: int | None = None, colsplit: int | None = None) -> mx.array:
     """q [b,m,h,d], kv [b,n,d], attn_sink [h], topk_idxs [b,m,k] (-1 = masked).
 
     ``chunk`` caps the query rows per tile; the tiling plan shrinks it (and the
@@ -246,6 +348,16 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
     the indices address ``concat(kv, kv2)``. Both sources are gathered directly,
     with ``kv2`` never concatenated into a dense buffer (see ``_gather_split``).
     ``kv2=None`` is the exact single-source path.
+
+    ``colsplit`` (two-source only) declares the COLUMN boundary of the layout
+    ``attention.py`` builds: columns ``[0, colsplit)`` are the window block
+    (indices ``< split``) and columns ``[colsplit, k)`` the top-k compressed
+    block (indices ``>= split``). When ``DSV41_SPARSE_COLSPLIT`` is ON and the
+    layout invariant is proven (``_column_boundary``), each tile gathers only
+    what it needs: one source for a tile wholly inside a region, two column
+    ranges for a straddling tile. ``colsplit=None`` or a violated invariant
+    keeps the exact where-select path, byte-for-byte. Gate OFF ignores it
+    entirely.
     """
     if _IMPL == "ref":
         return sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale,
@@ -278,6 +390,18 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
     # step, defeating the per-layer async_eval pipeline (measured on the full
     # two-node model: ~124 vs ~110 ms per spec round).
     fence_ok = m > _FENCE_MIN_ROWS
+    fence_on = _FENCE in ("qtile", "ktile") and fence_ok
+    # Whether the per-tile fences block (default) or only queue an async commit
+    # (C3). With no fence and no async gate the loop below is unchanged.
+    async_fence = fence_on and _FENCE_ASYNC
+    # C1: resolve the column boundary ONCE for the whole call. Both query tiles
+    # and key tiles are full k-wide slices of the same matrix, so a clean
+    # boundary proves every tile's two regions. None => exact where-select path.
+    colsplit_i: int = -1
+    if kv2 is not None and _COLSPLIT:
+        w = _column_boundary(topk_idxs, split_i, -1 if colsplit is None else int(colsplit))
+        if w is not None:
+            colsplit_i = w
     sink = attn_sink.astype(mx.float32).reshape(1, h, 1)
 
     outs = []
@@ -291,6 +415,12 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
             icb = ic[:, :, ks:ke]                         # [b, Tq, Tk]
             if kv2 is None:
                 kvc = _gather_kv(kv, icb)                 # [b, Tq, Tk, d]
+            elif colsplit_i >= 0:
+                # Column-partitioned gather (C1): columns of this key tile that
+                # fall wholly in one region are gathered from that ONE source;
+                # a tile straddling the boundary gathers the two column ranges
+                # separately. No `where` select -- the boundary is proven.
+                kvc = _gather_cols(kv, kv2, icb, split_i, colsplit_i, ks)
             else:
                 # Two sources: gather each row directly from its own buffer.
                 kvc = _gather_split(kv, kv2, icb, split_i)
@@ -302,16 +432,23 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
                 m_run, l_run, acc = fn(qc, icb, kvc, m_run, l_run, acc,
                                        softmax_scale)
             if _FENCE == "ktile" and fence_ok:
-                mx.eval(m_run, l_run, acc)
+                (mx.async_eval if async_fence else mx.eval)(m_run, l_run, acc)
         assert acc is not None and l_run is not None
         out = (acc / l_run).astype(q.dtype)
-        if _FENCE in ("qtile", "ktile") and fence_ok:
+        if fence_on:
             # Evaluates this query tile's state and output before the next tile
-            # is built, so only one tile's intermediates are ever live.
-            mx.eval(out)
+            # is built, so only one tile's intermediates are ever live. C3
+            # queues it (mx.async_eval) instead of blocking, and the single
+            # mx.eval below keeps the "returns an evaluated tensor" contract.
+            (mx.async_eval if async_fence else mx.eval)(out)
         outs.append(out)
 
-    return mx.concatenate(outs, axis=1) if len(outs) > 1 else outs[0]
+    out = mx.concatenate(outs, axis=1) if len(outs) > 1 else outs[0]
+    if async_fence:
+        # One blocking eval per call: the returned tensor must be evaluated
+        # under every fence mode, exactly as the per-tile mx.eval path is.
+        mx.eval(out)
+    return out
 
 
 # --------------------------------------------------------------------------
