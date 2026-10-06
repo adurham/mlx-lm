@@ -30,6 +30,7 @@ import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from .config import ModelArgs
+from ...profiler import span
 
 
 class ClampedSwiGLU(nn.Module):
@@ -129,9 +130,11 @@ class MoE(nn.Module):
     def __call__(self, x: mx.array, image_mask: mx.array | None = None) -> mx.array:
         shape = x.shape
         xf = x.reshape(-1, self.dim)
-        weights, indices = self.gate(
-            xf, None if image_mask is None else image_mask.reshape(-1))
-        y = self.experts(xf, indices)                            # [tokens, topk, dim]
+        with span("moe.gate"):
+            weights, indices = self.gate(
+                xf, None if image_mask is None else image_mask.reshape(-1))
+        with span("moe.switch_mlp"):
+            y = self.experts(xf, indices)                        # [tokens, topk, dim]
         y = mx.sum(y.astype(mx.float32) * weights[..., None], axis=-2)
         if self.group is not None and self.shared_sharded:
             y = y + self.shared_experts(xf).astype(mx.float32)

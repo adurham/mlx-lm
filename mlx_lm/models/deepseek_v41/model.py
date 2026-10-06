@@ -33,6 +33,7 @@ from .hyper_connections import hc_mixes, hc_post, hc_pre, make_identity_pre_mix
 from .layers import RMSNorm
 from .moe import MoE
 from .hc_fused import hc_expand, mixes_and_collapse
+from ...profiler import span
 
 import logging
 import os
@@ -119,7 +120,8 @@ class Block(nn.Module):
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
             self.hc_mult, self.hc_iters, self.norm_eps, self.hc_eps)
         h = hc_pre(x, pre_mix)
-        h = self.attn(self.attn_norm(h), start_pos, cache, shared)
+        with span("attn"):
+            h = self.attn(self.attn_norm(h), start_pos, cache, shared)
         x = hc_post(h, residual, attn_post, attn_comb)
 
         residual = x
@@ -127,7 +129,8 @@ class Block(nn.Module):
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
             self.hc_mult, self.hc_iters, self.norm_eps, self.hc_eps)
         h = hc_pre(x, attn_pre)
-        h = self.ffn(self.ffn_norm(h), getattr(shared, "image_mask", None))
+        with span("ffn"):
+            h = self.ffn(self.ffn_norm(h), getattr(shared, "image_mask", None))
         x = hc_post(h, residual, ffn_post, ffn_comb)
         return x, ffn_pre
 
@@ -135,12 +138,14 @@ class Block(nn.Module):
         h, attn_pre, attn_post, attn_comb = mixes_and_collapse(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, pre_mix,
             self.hc_iters, self.norm_eps, self.hc_eps)
-        h = self.attn(self.attn_norm(h), start_pos, cache, shared)
+        with span("attn"):
+            h = self.attn(self.attn_norm(h), start_pos, cache, shared)
         x = hc_expand(h, x, attn_post, attn_comb)
         h, ffn_pre, ffn_post, ffn_comb = mixes_and_collapse(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, attn_pre,
             self.hc_iters, self.norm_eps, self.hc_eps)
-        h = self.ffn(self.ffn_norm(h), getattr(shared, "image_mask", None))
+        with span("ffn"):
+            h = self.ffn(self.ffn_norm(h), getattr(shared, "image_mask", None))
         x = hc_expand(h, x, ffn_post, ffn_comb)
         return x, ffn_pre
 
