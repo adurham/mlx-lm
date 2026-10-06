@@ -135,13 +135,29 @@ class MoE(nn.Module):
                 xf, None if image_mask is None else image_mask.reshape(-1))
         with span("moe.switch_mlp"):
             y = self.experts(xf, indices)                        # [tokens, topk, dim]
-        y = mx.sum(y.astype(mx.float32) * weights[..., None], axis=-2)
+        # Attribution spans only (zero wall cost): the tail below was previously
+        # charged to the enclosing block span because its work drains at the
+        # block's exit eval. Naming it here is what makes the per-op share
+        # legible in the sync-span profile (design note: the 2026-10-06 MoE
+        # re-span -- v4 kept these spans, v41 dropped them).
+        with span("moe.post_combine"):
+            y = mx.sum(y.astype(mx.float32) * weights[..., None], axis=-2)
+        # Order preserved exactly from the pre-span version: the sharded case
+        # adds the shared expert BEFORE the collective; the replicated case
+        # collects first, then adds. (Do not "simplify" this -- it is the
+        # correctness-neutral attribution pass, and the operand order of the
+        # add vs collective is load-bearing.)
         if self.group is not None and self.shared_sharded:
-            y = y + self.shared_experts(xf).astype(mx.float32)
-            y = _coll.all_sum(y, group=self.group)
+            with span("moe.shared_experts"):
+                y = y + self.shared_experts(xf).astype(mx.float32)
+            with span("moe.all_sum"):
+                y = _coll.all_sum(y, group=self.group)
         elif self.group is not None:
-            y = _coll.all_sum(y, group=self.group)
-            y = y + self.shared_experts(xf).astype(mx.float32)
+            with span("moe.all_sum"):
+                y = _coll.all_sum(y, group=self.group)
+            with span("moe.shared_experts"):
+                y = y + self.shared_experts(xf).astype(mx.float32)
         else:
-            y = y + self.shared_experts(xf).astype(mx.float32)
+            with span("moe.shared_experts"):
+                y = y + self.shared_experts(xf).astype(mx.float32)
         return y.reshape(shape).astype(x.dtype)
