@@ -39,6 +39,7 @@ from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp8_ue8m0
 from .indexer import Indexer
 from .layers import RMSNorm, cos_sin_at, rope_freqs, rope_tail
 from .sparse_attention import sparse_attn
+from ...profiler import span
 
 
 def window_idx_matrix(wp: int, n: int, window: int) -> mx.array:
@@ -117,23 +118,25 @@ class Attention(nn.Module):
         # Query rows: exactly the n positions this forward's rows occupy.
         c_q, s_q = self._cos_sin(mx.arange(start_pos, end_pos))
 
-        # --- queries ---
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).reshape(bsz, n, self.n_heads, self.head_dim)
-        q = rope_tail(q, rd, c_q, s_q)
+        with span("attn.proj_qkv"):
+            # --- queries ---
+            qr = self.q_norm(self.wq_a(x))
+            q = self.wq_b(qr).reshape(bsz, n, self.n_heads, self.head_dim)
+            q = rope_tail(q, rd, c_q, s_q)
 
-        # --- window KV: rope tail, FP8 fake-quant over the whole vector ---
-        kv = self.kv_norm(self.wkv(x))
-        kv = rope_tail(kv, rd, c_q, s_q)
-        kv = fake_quant_fp8_ue8m0(kv, 32)
+            # --- window KV: rope tail, FP8 fake-quant over the whole vector ---
+            kv = self.kv_norm(self.wkv(x))
+            kv = rope_tail(kv, rd, c_q, s_q)
+            kv = fake_quant_fp8_ue8m0(kv, 32)
 
-        lc = cache.layers[self.layer_id]
-        prev = lc.window_chrono(start_pos)                      # [b, Wp, hd]
-        wp = prev.shape[1]
-        kv_all = mx.concatenate([prev.astype(kv.dtype), kv], axis=1) if wp else kv
-        idxs = mx.broadcast_to(window_idx_matrix(wp, n, self.window_size)[None],
-                               (bsz, n, min(self.window_size, wp + n)))
-        lc.write_window(start_pos, kv)
+        with span("attn.kv_cache"):
+            lc = cache.layers[self.layer_id]
+            prev = lc.window_chrono(start_pos)                      # [b, Wp, hd]
+            wp = prev.shape[1]
+            kv_all = mx.concatenate([prev.astype(kv.dtype), kv], axis=1) if wp else kv
+            idxs = mx.broadcast_to(window_idx_matrix(wp, n, self.window_size)[None],
+                                   (bsz, n, min(self.window_size, wp + n)))
+            lc.write_window(start_pos, kv)
         offset = wp + n                                          # compressed entries follow
 
         kv2 = None                                               # second K/V source
@@ -143,7 +146,8 @@ class Attention(nn.Module):
 
             latents = None
             if self.is_kv_source:
-                latents = self.compressor(x, start_pos, lc.comp_state)
+                with span("attn.compressor"):
+                    latents = self.compressor(x, start_pos, lc.comp_state)
                 shared.kv_src_cache = src = lc
 
             # indexer runs on the pre-RoPE latents, before the cache write
@@ -156,8 +160,9 @@ class Attention(nn.Module):
                     cidx = mx.zeros((bsz, n, 0), dtype=mx.int32)
                 else:
                     index_k = shared.index_src_cache.index_k[:bsz, :compress_len]
-                    cidx = self.indexer(x, qr, start_pos, offset, self._freqvec,
-                                        index_k, shared)
+                    with span("attn.indexer"):
+                        cidx = self.indexer(x, qr, start_pos, offset, self._freqvec,
+                                            index_k, shared)
                 shared.topk_idxs = cidx
             else:
                 cidx = shared.topk_idxs
@@ -182,19 +187,22 @@ class Attention(nn.Module):
                 idxs = mx.concatenate([idxs, cidx], axis=-1)
                 kv2 = src.comp_kv[:bsz, :compress_len]
         sink = mx.zeros_like(self.attn_sink) if self._break_sink else self.attn_sink
-        o = sparse_attn(q, kv_all, sink, idxs, self.softmax_scale,
-                        kv2=kv2, split=offset)
+        with span("attn.sdpa"):
+            o = sparse_attn(q, kv_all, sink, idxs, self.softmax_scale,
+                            kv2=kv2, split=offset)
 
         # --- inverse rope, grouped block-diagonal output LoRA ---
-        if not self._break_rope_inverse:
-            o = rope_tail(o, rd, c_q, s_q, inverse=True)
-        o = o.reshape(bsz, n, self.n_groups, -1)
-        if isinstance(self.wo_a, nn.Linear):
-            wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
-            o = mx.einsum("bsgd,grd->bsgr", o.astype(mx.float32), wo_a.astype(mx.float32))
-        else:
-            o = self.wo_a(o)                                     # grouped module -> [b, s, g, r]
-        out = self.wo_b(o.reshape(bsz, n, -1).astype(x.dtype))
+        with span("attn.o_proj"):
+            if not self._break_rope_inverse:
+                o = rope_tail(o, rd, c_q, s_q, inverse=True)
+            o = o.reshape(bsz, n, self.n_groups, -1)
+            if isinstance(self.wo_a, nn.Linear):
+                wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
+                o = mx.einsum("bsgd,grd->bsgr", o.astype(mx.float32), wo_a.astype(mx.float32))
+            else:
+                o = self.wo_a(o)                                 # grouped module -> [b, s, g, r]
+            out = self.wo_b(o.reshape(bsz, n, -1).astype(x.dtype))
         if self.group is not None:                   # heads sharded: sum partials
-            out = _coll.all_sum(out, group=self.group)
+            with span("attn.all_sum"):
+                out = _coll.all_sum(out, group=self.group)
         return out

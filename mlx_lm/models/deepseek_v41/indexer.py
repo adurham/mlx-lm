@@ -79,6 +79,7 @@ from .config import ModelArgs
 from .fakequant import fake_quant_fp4_ue8m0
 from .layers import RMSNorm, cos_sin_at, rope_tail
 from . import indexer_hierarchical as _hier
+from ...profiler import span
 
 NEG_INF = float("-inf")
 POS_INF = float("inf")
@@ -515,12 +516,13 @@ class Indexer(nn.Module):
                       else hier_strip_for_budget(bsz, n, self.head_dim,
                                                  int(_HIER_EXACT_MB * (1 << 20)),
                                                  block=hier_block))
-            v, i, blk = _hier.hierarchical_topk_prod(
-                q.astype(mx.float32), index_k, w.astype(mx.float32), lens,
-                k, hier_block, _HIER_STRIP, estrip, _HIER_OVERFETCH,
-                cand_mask=cmask,
-                cand_src=((self.candidate_topk_blocks, self.candidate_block_size)
-                          if self.is_candidate_source else None))
+            with span("attn.indexer.score"):
+                v, i, blk = _hier.hierarchical_topk_prod(
+                    q.astype(mx.float32), index_k, w.astype(mx.float32), lens,
+                    k, hier_block, _HIER_STRIP, estrip, _HIER_OVERFETCH,
+                    cand_mask=cmask,
+                    cand_src=((self.candidate_topk_blocks, self.candidate_block_size)
+                              if self.is_candidate_source else None))
             if self.is_candidate_source:
                 shared.candidates = blk
             valid = mx.isfinite(v) & (i < lens.astype(mx.int32)[None])
@@ -532,11 +534,12 @@ class Indexer(nn.Module):
             mask = shared.candidates if (self.uses_candidates
                                          and shared.candidates is not None) else None
             impl = _tiled_scores_merge if _TILED_IMPL == "merge" else _tiled_scores_buffer
-            v, i, blk = impl(
-                q.astype(mx.float32), index_k, w.astype(mx.float32), lens, nb, k, tile,
-                cand_mask=mask,
-                cand_src=((self.candidate_topk_blocks, self.candidate_block_size)
-                          if self.is_candidate_source else None))
+            with span("attn.indexer.score"):
+                v, i, blk = impl(
+                    q.astype(mx.float32), index_k, w.astype(mx.float32), lens, nb, k, tile,
+                    cand_mask=mask,
+                    cand_src=((self.candidate_topk_blocks, self.candidate_block_size)
+                              if self.is_candidate_source else None))
             if self.is_candidate_source:
                 shared.candidates = blk
             if _TILED_IMPL == "merge":
@@ -548,25 +551,26 @@ class Indexer(nn.Module):
             return mx.where(valid, i + offset, mx.array(-1, mx.int32))
 
         # ---- untiled reference path ----
-        scores = mx.einsum("bshd,btd->bsht", q.astype(mx.float32),
-                           index_k.astype(mx.float32))
-        scores = mx.maximum(scores, 0.0) * w[..., None].astype(mx.float32)
-        # head-sum stays fp32; the STORED row takes the same precision as the
-        # tiled path's buffer (_ROW_DTYPE, bf16 by default) so the two paths and
-        # the DSV41_INDEXER_ROW_BF16 A/B are directly comparable.
-        scores = mx.sum(scores, axis=2).astype(_ROW_DTYPE)      # [b, n, nb]
+        with span("attn.indexer.score"):
+            scores = mx.einsum("bshd,btd->bsht", q.astype(mx.float32),
+                               index_k.astype(mx.float32))
+            scores = mx.maximum(scores, 0.0) * w[..., None].astype(mx.float32)
+            # head-sum stays fp32; the STORED row takes the same precision as the
+            # tiled path's buffer (_ROW_DTYPE, bf16 by default) so the two paths and
+            # the DSV41_INDEXER_ROW_BF16 A/B are directly comparable.
+            scores = mx.sum(scores, axis=2).astype(_ROW_DTYPE)      # [b, n, nb]
 
-        vis = mx.arange(nb)[None, :] < lens                            # [n, nb]
-        scores = mx.where(vis[None], scores, NEG_INF)
+            vis = mx.arange(nb)[None, :] < lens                            # [n, nb]
+            scores = mx.where(vis[None], scores, NEG_INF)
 
-        if self.is_candidate_source:
-            shared.candidates = select_candidate_blocks(
-                scores, lens, self.candidate_topk_blocks, self.candidate_block_size)
-        elif self.uses_candidates and shared.candidates is not None:
-            scores = mx.where(shared.candidates, scores, NEG_INF)
+            if self.is_candidate_source:
+                shared.candidates = select_candidate_blocks(
+                    scores, lens, self.candidate_topk_blocks, self.candidate_block_size)
+            elif self.uses_candidates and shared.candidates is not None:
+                scores = mx.where(shared.candidates, scores, NEG_INF)
 
-        k = min(self.index_topk, nb)
-        idx = mx.argpartition(-scores, k - 1, axis=-1)[..., :k].astype(mx.int32)
-        idx = mx.sort(idx, axis=-1)                              # position order
+            k = min(self.index_topk, nb)
+            idx = mx.argpartition(-scores, k - 1, axis=-1)[..., :k].astype(mx.int32)
+            idx = mx.sort(idx, axis=-1)                              # position order
         visible = idx < lens.astype(mx.int32)[None]
         return mx.where(visible, idx + offset, mx.array(-1, mx.int32))
