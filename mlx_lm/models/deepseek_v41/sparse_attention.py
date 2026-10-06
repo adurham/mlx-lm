@@ -89,12 +89,19 @@ _COMPILE = os.environ.get("DSV41_SPARSE_COMPILE", "1") == "1"
 # before the value matmul; that rounding is the single largest precision loss in
 # the tiled path (weights live in [0, 1] and bf16 carries 8 mantissa bits, so the
 # ~0.4% per-weight error survives as a ~5e-3 relative error in the output and
-# compounds across layers). ON (default) keeps the weights in fp32 and promotes
-# the matmul, which costs ~20% of the PV GEMM rate and no extra memory beyond
-# the fp32 weight tile that already exists. The gather dtype itself is NOT a
-# precision knob: the cached K/V is bf16, and bf16 -> fp32 is exact, so a bf16
-# gather holds bit-identical values to the reference's fp32 gather.
-_PV32 = os.environ.get("DSV41_SPARSE_PV32", "1") == "1"
+# compounds across layers). ON keeps the weights in fp32 and promotes the matmul,
+# which costs ~20% of the PV GEMM rate and no extra memory beyond the fp32
+# weight tile that already exists. The gather dtype itself is NOT a precision
+# knob: the cached K/V is bf16, and bf16 -> fp32 is exact, so a bf16 gather holds
+# bit-identical values to the reference's fp32 gather.
+# DEFAULT FLIPPED 1 -> 0 (2026-10-06): the precision concern above was NEVER
+# measured against the live battery; it was a conservative port-time default.
+# Isolated bench: PV32=0 cuts the sparse body 38.7 -> 29.4 ms/call (-24%);
+# on the wire fresh +2.8%/delta +2.3% on top of chunk=4096. The 350K live
+# battery (needles 6/6, tools 10/10, prose 0 DIRTY/0 REVIEW, park True) PASSED
+# on the PV32=0 arm -- the detector set calibrated for exactly this error class.
+# =1 restores the fp32-promoted PV for A/B.
+_PV32 = os.environ.get("DSV41_SPARSE_PV32", "0") == "1"
 # Live-graph fence. The tile plan bounds any SINGLE tensor, but MLX is lazy: the
 # gathered K/V, fp32 logits and accumulator of EVERY query tile stay live until
 # something forces evaluation, so the measured peak of one 512-row prefill call
