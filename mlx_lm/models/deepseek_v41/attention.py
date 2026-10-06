@@ -28,6 +28,8 @@ are the same code path.
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 from . import collective as _coll
@@ -40,6 +42,14 @@ from .indexer import Indexer
 from .layers import RMSNorm, cos_sin_at, rope_freqs, rope_tail
 from .sparse_attention import sparse_attn
 from ...profiler import span
+
+# Prefill query-row cap handed to ``sparse_attn``'s tiled loop. The loop fences
+# (mx.eval) once per query tile, so this is BOTH the compile/tile size and the
+# per-call sync count at prefill: at 2048-row chunks, chunk=64 => 32 tiles+syncs
+# per layer per call; chunk=256 => 8. Read once at import (like the sparse
+# module's own knobs). Does NOT touch decode: the fence is skipped for
+# single-row forwards regardless. A/B knob: DSV41_SPARSE_PREFILL_CHUNK.
+_PREFILL_CHUNK = int(os.environ.get("DSV41_SPARSE_PREFILL_CHUNK", "64"))
 
 
 def window_idx_matrix(wp: int, n: int, window: int) -> mx.array:
@@ -189,7 +199,7 @@ class Attention(nn.Module):
         sink = mx.zeros_like(self.attn_sink) if self._break_sink else self.attn_sink
         with span("attn.sdpa"):
             o = sparse_attn(q, kv_all, sink, idxs, self.softmax_scale,
-                            kv2=kv2, split=offset)
+                            chunk=_PREFILL_CHUNK, kv2=kv2, split=offset)
 
         # --- inverse rope, grouped block-diagonal output LoRA ---
         with span("attn.o_proj"):
