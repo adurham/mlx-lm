@@ -49,7 +49,7 @@ from ...profiler import span
 # per layer per call; chunk=256 => 8. Read once at import (like the sparse
 # module's own knobs). Does NOT touch decode: the fence is skipped for
 # single-row forwards regardless. A/B knob: DSV41_SPARSE_PREFILL_CHUNK.
-_PREFILL_CHUNK = int(os.environ.get("DSV41_SPARSE_PREFILL_CHUNK", "64"))
+_PREFILL_CHUNK = int(os.environ.get("DSV41_SPARSE_PREFILL_CHUNK", "256"))
 # C1 column-partitioned gather gate, read here (same env, same import-time
 # read) so the DEFAULT call site is byte-identical: colsplit is passed to
 # sparse_attn ONLY when the gate is set. sparse_attention re-derives and
