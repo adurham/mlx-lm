@@ -70,6 +70,7 @@ by ``tests/test_dsv41_indexer_bf16_row.py``.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import mlx.core as mx
@@ -80,6 +81,8 @@ from .fakequant import fake_quant_fp4_ue8m0
 from .layers import RMSNorm, cos_sin_at, rope_tail
 from . import indexer_hierarchical as _hier
 from ...profiler import span
+
+logger = logging.getLogger(__name__)
 
 NEG_INF = float("-inf")
 POS_INF = float("inf")
@@ -149,6 +152,32 @@ def hier_strip_for_budget(bsz: int, n: int, head_dim: int, budget_bytes: int,
     cols = max(1, int(budget_bytes) // per_col)
     cols = max(int(block), (cols // int(block)) * int(block))
     return cols
+
+
+_GEOMETRY_LOGGED: set = set()
+
+
+def _log_hier_geometry(bsz: int, n: int, head_dim: int, estrip: int,
+                       block: int) -> None:
+    """Emit the resolved exact-pass geometry once per (shape, strip) key.
+
+    The strip width sets the per-strip blocking-eval count: strips per layer
+    = ceil((k+overfetch)/ (estrip/block)), 2 evals each before the eval-merge
+    (1 after). A one-line census makes the deployed geometry checkable from
+    the runner log — the mechanism gate for any strip-size A/B.
+    """
+    key = (int(bsz), int(n), int(head_dim), int(estrip), int(block))
+    if key in _GEOMETRY_LOGGED:
+        return
+    _GEOMETRY_LOGGED.add(key)
+    bp = max(1, int(estrip) // max(1, int(block)))
+    strips = -(-(int(_HIER_OVERFETCH) + 512) // bp)  # k+overfetch at k=512
+    evals = strips * 1  # merged: one blocking eval per strip
+    logger.info(
+        "[DSV41] hier geometry: exact_mb=%g estrip=%d block=%d bp=%d "
+        "strips/indexer-layer=%d evals/indexer-layer=%d (merged)",
+        _HIER_EXACT_MB, estrip, block, bp, strips, evals,
+    )
 
 
 def tile_width(bsz: int, n: int, n_heads: int, nb: int, align: int) -> int:
@@ -517,6 +546,7 @@ class Indexer(nn.Module):
                       else hier_strip_for_budget(bsz, n, self.head_dim,
                                                  int(_HIER_EXACT_MB * (1 << 20)),
                                                  block=hier_block))
+            _log_hier_geometry(bsz, n, self.head_dim, estrip, hier_block)
             with span("attn.indexer.score"):
                 v, i, blk = _hier.hierarchical_topk_prod(
                     q.astype(mx.float32), index_k, w.astype(mx.float32), lens,

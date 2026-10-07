@@ -278,10 +278,15 @@ def _column_boundary(icb: mx.array, split: int, colsplit: int) -> int | None:
     n_window = colsplit if colsplit >= 0 else _leading_window_columns(icb, split)
     if not 0 < n_window < k:
         return None
-    left_ok = bool(mx.all(icb[:, :, :n_window] < split).item())
+    # ONE host round-trip: both predicates in one array, one .item(). The
+    # two-array form cost two blocking syncs per layer per chunk on the
+    # prefill critical path (an invariant check is not worth a GPU drain).
     right = icb[:, :, n_window:]
-    right_ok = bool(mx.all((right >= split) | (right < 0)).item())
-    if not (left_ok and right_ok):
+    checks = mx.stack([
+        mx.all(icb[:, :, :n_window] < split),
+        mx.all((right >= split) | (right < 0)),
+    ])
+    if not bool(mx.all(checks).item()):
         return None
     return n_window
 

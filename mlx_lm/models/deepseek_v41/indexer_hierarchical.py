@@ -365,13 +365,17 @@ def exact_rescore_streaming(q32: mx.array, index_k: mx.array, w32: mx.array,
         if col_mask is not None:
             vis = vis & mx.take_along_axis(col_mask, safe, axis=2)
         s = mx.where(vis, s, NEG_INF)
-        mx.eval(s)
 
         v = mx.concatenate([best_v, s], axis=-1)
         ii = mx.concatenate([best_i, gcols], axis=-1)
         part = mx.argpartition(-v, kk - 1, axis=-1)[..., :kk]
         best_v = mx.take_along_axis(v, part, axis=-1)
         best_i = mx.take_along_axis(ii, part, axis=-1)
+        # ONE blocking eval per strip: the fused graph includes the gather,
+        # score, mask, merge and the next-iteration's read of best_v/best_i,
+        # which is exactly the set the old mid-strip `mx.eval(s)` bounded
+        # (peak = max(score transient, merged [b,n,kk*2])). Halves the strip
+        # sync count on the dominant per-chunk host-round-trip site.
         mx.eval(best_v, best_i)
 
     order = mx.argsort(best_i, axis=-1)                        # position order
