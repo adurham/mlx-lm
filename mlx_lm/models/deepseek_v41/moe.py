@@ -42,11 +42,13 @@ logger = logging.getLogger(__name__)
 #: to the peer rank as fp32: [1, 2048, 5120] x 4 B = 41.94 MB per call, 40 calls
 #: per 2048-row chunk. bf16 halves the wire payload; the cost is an fp32 -> bf16
 #: rounding of each rank's partial BEFORE the cross-rank sum (~2^-8 relative),
-#: i.e. a real numerics change -- gated OFF by default, promoted only past the
-#: live quality battery (the v4 model has the downcast precedent; v41 ships
-#: exact fp32 because combine_argmax carries token ids -- that path is NOT
-#: affected: only the weighted-sum partial, never an argmax, is rounded).
-_MOE_ALLSUM_BF16 = os.environ.get("DSV41_MOE_ALLSUM_BF16", "0") == "1"
+#: i.e. a real numerics change. PROMOTED DEFAULT-ON 2026-10-07: A/B fresh median
+#: 274.0 vs 265.8 (merge-only) = +3.1%; +4.1% vs next9 263.3 -- the largest
+#: single lever found on the shallow floor; live quality battery PASSED on the
+#: bf16 arm (2026-10-07, recorded in PERFORMANCE_HISTORY). The v4 model has the
+#: same downcast; v41's combine_argmax token-id path is NOT affected (only the
+#: weighted-sum partial, never an argmax, is rounded). =0 restores exact fp32.
+_MOE_ALLSUM_BF16 = os.environ.get("DSV41_MOE_ALLSUM_BF16", "1") == "1"
 logger.info("[DSV41] moe.all_sum payload: %s",
             "bf16 (halved)" if _MOE_ALLSUM_BF16 else "fp32 (exact)")
 
