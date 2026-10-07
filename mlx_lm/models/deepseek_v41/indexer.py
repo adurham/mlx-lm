@@ -70,8 +70,8 @@ by ``tests/test_dsv41_indexer_bf16_row.py``.
 
 from __future__ import annotations
 
-import logging
 import os
+import sys
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -81,8 +81,6 @@ from .fakequant import fake_quant_fp4_ue8m0
 from .layers import RMSNorm, cos_sin_at, rope_tail
 from . import indexer_hierarchical as _hier
 from ...profiler import span
-
-logger = logging.getLogger(__name__)
 
 NEG_INF = float("-inf")
 POS_INF = float("inf")
@@ -173,10 +171,14 @@ def _log_hier_geometry(bsz: int, n: int, head_dim: int, estrip: int,
     bp = max(1, int(estrip) // max(1, int(block)))
     strips = -(-(int(_HIER_OVERFETCH) + 512) // bp)  # k+overfetch at k=512
     evals = strips * 1  # merged: one blocking eval per strip
-    logger.info(
-        "[DSV41] hier geometry: exact_mb=%g estrip=%d block=%d bp=%d "
-        "strips/indexer-layer=%d evals/indexer-layer=%d (merged)",
-        _HIER_EXACT_MB, estrip, block, bp, strips, evals,
+    # stderr, not logging: the runner's root logger filters mlx_lm INFO
+    # records, while stderr is captured verbatim (same channel as the
+    # [PROFILER] table). One line per geometry key, first call only.
+    print(
+        f"[DSV41] hier geometry: exact_mb={_HIER_EXACT_MB:g} estrip={estrip} "
+        f"block={block} bp={bp} strips/indexer-layer={strips} "
+        f"evals/indexer-layer={evals} (merged)",
+        file=sys.stderr, flush=True,
     )
 
 
