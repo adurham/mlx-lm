@@ -131,6 +131,11 @@ _HIER_EXACT_MB = float(os.environ.get("DSV41_INDEXER_HIER_EXACT_MB",
 # Column budget for the exact pass's key gather, overridable directly. 0 = derive
 # it per call from _HIER_EXACT_MB and the shape (the (6d+4) formula).
 _HIER_EXACT_STRIP = int(os.environ.get("DSV41_INDEXER_HIER_EXACT_STRIP", "0"))
+# Consumer layers (24..36) score only the candidate blocks in the coarse pass
+# instead of all nb columns then masking (bit-identical block maxima, so the
+# selected top-k is unchanged). Default ON; "0" restores the full-width coarse
+# sweep for A/B. Only meaningful with DSV41_INDEXER_HIER on.
+_HIER_CONSUMER_SKIP = os.environ.get("DSV41_INDEXER_CONSUMER_SKIP", "1") == "1"
 
 
 def hier_strip_for_budget(bsz: int, n: int, head_dim: int, budget_bytes: int,
@@ -544,6 +549,16 @@ class Indexer(nn.Module):
                     f"candidate-source layer")
             cmask = shared.candidates if (self.uses_candidates
                                           and shared.candidates is not None) else None
+            if cmask is not None:
+                # The consumer coarse pass relies on the published mask being
+                # block-constant on the SAME grid as the coarse blocks (the
+                # source layer derives it from block maxima at hier_block).
+                # A mismatch is a configuration error: refuse loudly rather
+                # than rank on a straddling block grid.
+                assert self.candidate_block_size == hier_block, (
+                    f"DSV41_INDEXER_HIER_BLOCK ({hier_block}) must equal "
+                    f"candidate_block_size ({self.candidate_block_size}) on "
+                    f"candidate-consumer layer {self.layer_id}")
             estrip = (_HIER_EXACT_STRIP if _HIER_EXACT_STRIP > 0
                       else hier_strip_for_budget(bsz, n, self.head_dim,
                                                  int(_HIER_EXACT_MB * (1 << 20)),
@@ -555,7 +570,8 @@ class Indexer(nn.Module):
                     k, hier_block, _HIER_STRIP, estrip, _HIER_OVERFETCH,
                     cand_mask=cmask,
                     cand_src=((self.candidate_topk_blocks, self.candidate_block_size)
-                              if self.is_candidate_source else None))
+                              if self.is_candidate_source else None),
+                    consumer_skip=_HIER_CONSUMER_SKIP)
             if self.is_candidate_source:
                 shared.candidates = blk
             valid = mx.isfinite(v) & (i < lens.astype(mx.int32)[None])
