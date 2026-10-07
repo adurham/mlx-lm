@@ -23,6 +23,9 @@ replace the reference's per-expert Python loop.
 
 from __future__ import annotations
 
+import logging
+import os
+
 import mlx.core as mx
 
 from . import collective as _coll
@@ -31,6 +34,31 @@ from mlx_lm.models.switch_layers import SwitchGLU
 
 from .config import ModelArgs
 from ...profiler import span
+
+logger = logging.getLogger(__name__)
+
+#: MoE tail collective payload dtype. The routed-expert partial is computed in
+#: fp32 (the top-k combine is a weighted sum over fp32 gate weights) and shipped
+#: to the peer rank as fp32: [1, 2048, 5120] x 4 B = 41.94 MB per call, 40 calls
+#: per 2048-row chunk. bf16 halves the wire payload; the cost is an fp32 -> bf16
+#: rounding of each rank's partial BEFORE the cross-rank sum (~2^-8 relative),
+#: i.e. a real numerics change -- gated OFF by default, promoted only past the
+#: live quality battery (the v4 model has the downcast precedent; v41 ships
+#: exact fp32 because combine_argmax carries token ids -- that path is NOT
+#: affected: only the weighted-sum partial, never an argmax, is rounded).
+_MOE_ALLSUM_BF16 = os.environ.get("DSV41_MOE_ALLSUM_BF16", "0") == "1"
+logger.info("[DSV41] moe.all_sum payload: %s",
+            "bf16 (halved)" if _MOE_ALLSUM_BF16 else "fp32 (exact)")
+
+
+def _all_sum_tail(y: mx.array, group: mx.distributed.Group | None) -> mx.array:
+    """The MoE tail collective, payload dtype per the ``DSV41_MOE_ALLSUM_BF16``
+    gate. The bf16 arm rounds each rank's fp32 partial before the sum and
+    upcasts the result back to fp32 (exact); the shared-expert add and the
+    final cast to ``x.dtype`` are unchanged either way."""
+    if _MOE_ALLSUM_BF16:
+        return _coll.all_sum(y.astype(mx.bfloat16), group=group).astype(mx.float32)
+    return _coll.all_sum(y, group=group)
 
 
 class ClampedSwiGLU(nn.Module):
@@ -151,10 +179,10 @@ class MoE(nn.Module):
             with span("moe.shared_experts"):
                 y = y + self.shared_experts(xf).astype(mx.float32)
             with span("moe.all_sum"):
-                y = _coll.all_sum(y, group=self.group)
+                y = _all_sum_tail(y, self.group)
         elif self.group is not None:
             with span("moe.all_sum"):
-                y = _coll.all_sum(y, group=self.group)
+                y = _all_sum_tail(y, self.group)
             with span("moe.shared_experts"):
                 y = y + self.shared_experts(xf).astype(mx.float32)
         else:
