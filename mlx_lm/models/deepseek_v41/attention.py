@@ -54,6 +54,18 @@ _PREFILL_CHUNK = int(os.environ.get("DSV41_SPARSE_PREFILL_CHUNK", "256"))
 # read) so the DEFAULT call site is byte-identical: colsplit is passed to
 # sparse_attn ONLY when the gate is set. sparse_attention re-derives and
 # re-checks the boundary regardless, so a mismatched value cannot mis-gather.
+#
+# WHY THE DEFAULTS DISAGREE (documented foot-gun; twin gate in
+# sparse_attention.py). This gate defaults OFF while sparse_attention's own
+# ``_COLSPLIT`` gate defaults ON (that module ships the C1 gather). At the
+# production env (DSV41_SPARSE_COLSPLIT unset) this module therefore passes
+# ``colsplit=None``, and sparse_attention used to reach ``_column_boundary``'s
+# derivation branch -- ``int(mx.min(...))`` plus ``bool(mx.all(...).item())``,
+# TWO host round-trips -- on EVERY compressing layer of EVERY decode (m=1) and
+# 4-row verify forward, for nothing. That is safe again only because
+# sparse_attention now gates the whole boundary derivation+check on the call's
+# row count (``m > _FENCE_MIN_ROWS``). Keeping THIS default OFF stays correct
+# (the default call site is byte-identical); it was never what needed changing.
 _COLSPLIT = os.environ.get("DSV41_SPARSE_COLSPLIT", "0") == "1"
 
 

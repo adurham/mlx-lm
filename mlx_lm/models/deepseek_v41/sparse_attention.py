@@ -51,7 +51,9 @@ Knobs (all env-gated for A/B and rollback): ``DSV41_SPARSE_IMPL``
 (``tiled``|``ref``), ``DSV41_SPARSE_QTILE``, ``DSV41_SPARSE_KTILE``,
 ``DSV41_SPARSE_WDTYPE`` (``auto``|``bf16``|``fp16``|``fp32``),
 ``DSV41_SPARSE_COMPILE``, ``DSV41_SPARSE_BUDGET_MB``,
-``DSV41_SPARSE_COLSPLIT`` (column-partitioned two-source gather, default 0),
+``DSV41_SPARSE_COLSPLIT`` (column-partitioned two-source gather, default 1;
+small-m calls skip the boundary derivation and use the value-identical
+where-select path -- see ``sparse_attn``),
 ``DSV41_SPARSE_ASYNC_FENCE`` (async per-tile fence, default 0).
 
 Two-source gather (gather-direct comp_kv). ``sparse_attn`` also accepts
@@ -122,8 +124,8 @@ _FENCE_MIN_ROWS = int(os.environ.get("DSV41_SPARSE_FENCE_MIN_ROWS", "16"))
 # (42 MB for the gather at Tq=64, k=640, d=512, bf16).
 _BUDGET_BYTES = int(os.environ.get("DSV41_SPARSE_BUDGET_MB", "256")) << 20
 
-# Column-partitioned two-source gather (workstream C1, 2026-10-06). OFF by
-# default = byte-identical to the where-select path. When ON and the caller's
+# Column-partitioned two-source gather (workstream C1, 2026-10-06). When OFF =
+# byte-identical to the where-select path. When ON and the caller's
 # layout invariant holds (window block entirely ``< split``, compressed block
 # entirely ``>= split``), each query row's columns are routed to a SINGLE
 # source instead of gathering BOTH sources for every row and ``mx.where``-
@@ -134,6 +136,19 @@ _BUDGET_BYTES = int(os.environ.get("DSV41_SPARSE_BUDGET_MB", "256")) << 20
 # is PROVEN from the indices themselves once per call (``_column_boundary``);
 # on any ambiguity the call silently falls back to the exact where-select path,
 # so a violated invariant can never mis-gather.
+#
+# WHY THIS DEFAULT IS ON while attention.py's twin gate defaults OFF (the
+# documented foot-gun): the two gates disagree by design-of-history -- this
+# module owns/ships the C1 gather (default ON), the caller's gate was added
+# later default OFF so the DEFAULT call site passes ``colsplit=None``. With the
+# caller silent, ``_column_boundary(-1)`` used to DERIVE the boundary, and that
+# derivation (``_leading_window_columns``' ``int(mx.min(...))`` +
+# ``bool(mx.all(...).item())``) is TWO host round-trips. On every compressing
+# layer of every decode (m=1) and 4-row verify forward that was pure waste (and
+# a per-layer GPU drain). What makes the ON default safe for small m is the
+# row-count guard at the call site below: for ``m <= _FENCE_MIN_ROWS`` the
+# whole derivation+check is skipped and the call falls back to the
+# VALUE-IDENTICAL ``_gather_split``. Do not remove that guard.
 _COLSPLIT = os.environ.get("DSV41_SPARSE_COLSPLIT", "1") == "1"
 # Async per-tile fence (workstream C3, 2026-10-06). OFF by default = the
 # blocking per-tile ``mx.eval`` documented above (``qtile``). When ON the
@@ -409,8 +424,23 @@ def sparse_attn(q: mx.array, kv: mx.array, attn_sink: mx.array, topk_idxs: mx.ar
     # C1: resolve the column boundary ONCE for the whole call. Both query tiles
     # and key tiles are full k-wide slices of the same matrix, so a clean
     # boundary proves every tile's two regions. None => exact where-select path.
+    #
+    # SMALL-m GUARD (Phase-3 lever, 2026-10-08). The boundary derivation+check
+    # below is TWO host round-trips (``_leading_window_columns``' ``int()`` and
+    # the ``.item()`` check). It only pays off at prefill, where the C1 gather
+    # stops the tile from materializing BOTH sources; at decode (m=1) and in the
+    # 4-row verify there is a single small tile and nothing to save. Running it
+    # there put a host sync in every compressing layer of every decode round for
+    # nothing. Gate it on the SAME row-count threshold the fence already uses
+    # (``m > _FENCE_MIN_ROWS``): large m keeps C1 exactly as before, small m
+    # falls back to ``_gather_split``. That fallback is VALUE-IDENTICAL, not an
+    # approximation: for a real index (>= 0) both routes select the same source
+    # buffer row, and a ``-1`` mask pad resolves to row 0 of ``kv``, whose logit
+    # is forced to ``-inf`` downstream (``_tile_init``/``_tile_step``), so it
+    # cannot contribute -- the exact property ``_column_boundary``'s docstring
+    # already relies on to let masks live in either region.
     colsplit_i: int = -1
-    if kv2 is not None and _COLSPLIT:
+    if kv2 is not None and _COLSPLIT and m > _FENCE_MIN_ROWS:
         w = _column_boundary(topk_idxs, split_i, -1 if colsplit is None else int(colsplit))
         if w is not None:
             colsplit_i = w
