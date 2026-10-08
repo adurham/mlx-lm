@@ -71,6 +71,8 @@ import os
 
 import mlx.core as mx
 
+from ._gates import _FENCE_MIN_ROWS
+
 NEG_INF = -1e30
 # Masked logit. -inf (not -1e30) makes exp(logit - m) exactly 0 for every masked
 # key without a second `where` pass over the weights; see the module docstring.
@@ -116,7 +118,11 @@ _PV32 = os.environ.get("DSV41_SPARSE_PV32", "0") == "1"
 # 1.3 GB live). This is the knob that actually delivers the bounded-memory
 # property; tile_bytes() alone does not.
 _FENCE = os.environ.get("DSV41_SPARSE_FENCE", "qtile")
-_FENCE_MIN_ROWS = int(os.environ.get("DSV41_SPARSE_FENCE_MIN_ROWS", "16"))
+# Row-count threshold, now READ FROM THE SHARED ``_gates`` module (deploy/next18
+# hoisted it there so the lever-1 C1 guard and the lever-2 indexer-HIER guard
+# share ONE symbol and can never disagree; the twin-default foot-gun M3 §7.4
+# flagged is retired). Env: DSV41_SPARSE_FENCE_MIN_ROWS (default 16; 0 disables).
+# The import at the top of this module binds the same int object.
 # Ceiling on any SINGLE intermediate a (query, key) tile may hold, in MB: the
 # gathered K/V tile, the fp32 logits, the softmax weights or the fp32 output
 # accumulator. The tile plan shrinks the key tile and then the query tile until

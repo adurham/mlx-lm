@@ -80,6 +80,7 @@ from .config import ModelArgs
 from .fakequant import fake_quant_fp4_ue8m0
 from .layers import RMSNorm, cos_sin_at, rope_tail
 from . import indexer_hierarchical as _hier
+from ._gates import _FENCE_MIN_ROWS
 from ...profiler import span
 
 NEG_INF = float("-inf")
@@ -119,6 +120,20 @@ _ROW_DTYPE = (mx.float32 if os.environ.get("DSV41_INDEXER_ROW_BF16", "1") == "0"
 # shared.candidates for the consumer roles (24..36). With the gate OFF the
 # production path is byte-for-byte what it was (no code below it runs). Read
 # once at import, like the DSV41_INDEXER_TILE* neighbours.
+#
+# ROW-COUNT GUARD (deploy/next18, lever-2 code fix). The hierarchical path's
+# coarse-pass + streamed-exact machinery exists to bound the huge [b, n, nb]
+# row at LARGE n (prefill). At decode (n=1) and 4-row verify (n=4) the fallback's
+# score row is a single/small row and the hierarchy is pure overhead (measured
+# ~29 ms/round at 91K agentic on next17, PHASE3B §6). So the entry is gated
+# ``_HIER and n > _FENCE_MIN_ROWS`` -- mirroring the lever-1 C1 guard in
+# sparse_attention.py, and reading the SAME threshold symbol from the shared
+# ``_gates`` module so the two levers can never disagree. ``n`` is the forward's
+# query-row count (== the ``m`` lever-1 guards on); the candidate-source layers
+# (2/8/14/20) and the consumer layers (24..36) all see the same ``n`` within one
+# forward, so this single predicate keeps the published ``shared.candidates``
+# mask produced and consumed on the same path. ``DSV41_SPARSE_FENCE_MIN_ROWS=0``
+# restores always-HIER (historical); ``DSV41_INDEXER_HIER=0`` still forces off.
 _HIER = os.environ.get("DSV41_INDEXER_HIER", "1") == "1"
 _HIER_BLOCK = int(os.environ.get("DSV41_INDEXER_HIER_BLOCK", "8"))
 # Coarse score transient: [b, n, strip] bf16 (ranking only, so wide is cheap).
@@ -528,8 +543,12 @@ class Indexer(nn.Module):
         align = self.candidate_block_size if self.is_candidate_source else 1
         tile = tiled(bsz, n, self.n_heads, nb, align)
 
-        if _HIER:
+        if _HIER and n > _FENCE_MIN_ROWS:
             # ---- hierarchical / streamed exact pass (M2), env-gated -----------
+            # Large-n only (see the row-count guard note above): the hierarchy
+            # bounds the [b, n, nb] row at prefill. Small n (decode 1 / verify 4)
+            # falls through to the tiled/untiled fallback below, value-identical
+            # (proven by test_dsv41_indexer_smallm_hier.py).
             # Replaces the [b, n, nb] row materialization for every exact-top-k
             # role: coarse (bf16, block maxima, stripped) -> top-(k+overfetch)
             # blocks -> streamed fp32 re-score of only those blocks' columns.
