@@ -93,6 +93,12 @@ class AffineProj(nn.Module):
                 f"AffineProj: in_features {w.shape[-1]} not divisible by group {group}")
         self._q = mx.quantize(w, group_size=group, bits=bits)
         mx.eval(self._q)
+        # Release the fp16 reconstruct/transpose/slice intermediates. They stay
+        # in MLX's buffer cache otherwise (measured ~1.5 GiB residue after one
+        # layer's affine dense roster; exl3 leaves 0), inflating the rank's
+        # footprint going into the load warmup (110-114.6 GB affine vs 105.5 GB
+        # exl3 on the cluster, ROUND-Q1B). Affine-only: exl3 never builds this.
+        mx.clear_cache()
         self._bits, self._group = bits, group
         self.out_features = w.shape[0]
 

@@ -340,7 +340,7 @@ def decode_prime(model, cache, *, enabled: bool = True) -> float:
 def load_warmup(model, head=None, *, chunk: int | None = None,
                 long_chunk: int | None = None, decode: bool = True,
                 fence_every: int | None = None, clear: bool = True,
-                spec_rows: int = 4) -> dict:
+                spec_rows: int = 4, fence_hook=None) -> dict:
     """Compile every kernel shape the serving workload uses, at load time.
 
     MUST be called before the first real forward on a rank. Measured
@@ -357,13 +357,23 @@ def load_warmup(model, head=None, *, chunk: int | None = None,
     buffer waiting past the watchdog. ``head`` (the DSpark draft head, already
     built) additionally warms the spec-verify shape, which is the shape decode
     runs. Returns per-stage seconds like :func:`warmup`.
+
+    ``fence_hook`` (optional, observation-only -- same contract as
+    :func:`prefill`) is forwarded to :func:`warmup`, so the caller gets a beat
+    after every ``fence_every`` layers of each multi-row warmup forward. This
+    is the load-time liveness signal: the first ``chunk`` forward is a
+    ~50 s compile storm (measured 48 s exl3 at world=2) that otherwise emits
+    nothing, which left the exo supervisor's 45 s + 20 s silence watchdog ~13 s
+    from killing a healthy exl3 warmup and DID kill the slower affine one
+    (ROUND-Q1B). A genuinely wedged collective blocks the fence eval, so it
+    still produces no beat. ``None`` (default) is byte-identical to before.
     """
     import time as _t
     from . import collective as _coll
     with _coll.sync_collectives():
         t0 = _t.perf_counter()
         times = warmup(model, chunk=chunk, long_chunk=long_chunk, decode=decode,
-                       fence_every=fence_every, clear=False)
+                       fence_every=fence_every, fence_hook=fence_hook, clear=False)
         if head is not None and spec_rows:
             scratch = model.make_cache(1, max_seq_len=2 * (chunk or BASE_CHUNK) + 64)
             try:
