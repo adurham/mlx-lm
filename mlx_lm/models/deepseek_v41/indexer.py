@@ -112,6 +112,47 @@ _COMPILED_BODIES: dict = {}
 _ROW_DTYPE = (mx.float32 if os.environ.get("DSV41_INDEXER_ROW_BF16", "1") == "0"
               else mx.bfloat16)
 
+# --- L2-full: small-n full-width fp32 row (lever-2 ship design) --------------
+# WHY. The row-count guard (`n > _FENCE_MIN_ROWS`) sends decode (n=1) and verify
+# (n=4) through the full-width fallback instead of the hierarchical pass. That
+# fallback's STORED row is `_ROW_DTYPE` (bf16 by default) while the hierarchical
+# path's exact re-score is fp32; at the k-th boundary bf16 rounds distinct fp32
+# scores into exact ties that fp32 does not have, and the two sides break them
+# differently (measured: `fallback(fp32 row) vs hier = 0 diffs/165,924 slots`,
+# `fallback(bf16 row) vs hier = 264 diffs`). L2-full removes that precision
+# mismatch at small n only: the fallback row is stored in fp32, exactly the
+# precision the hierarchical exact pass ranks, so both branches run the SAME
+# top-k op (`_tiled_scores_buffer`'s global `topk_from_row`) over a bitwise-
+# identical fp32 row and select identical indices -- including under exact ties.
+# It is trivially sound: at n<=16 the full-width row is small, so nothing is
+# pruned and there is no overfetch heuristic to trust.
+#
+# SCOPE. Engages only for `_HIER`-on forwards with `n <= _FENCE_MIN_ROWS` (the
+# same predicate the guard already uses); large-n keeps `_ROW_DTYPE` bf16 (there
+# the hierarchical path's bounded row is the whole point). With the guard
+# disabled (`DSV41_SPARSE_FENCE_MIN_ROWS=0`) it never engages, so every historical
+# config stays reproducible for A/B.
+#   DSV41_INDEXER_L2_FULL=0        -> revert to the plain `_ROW_DTYPE` row at
+#                                     small n (the pre-L2-full behaviour).
+#   DSV41_INDEXER_SMALLN_ROW_BF16=1 -> force the small-n row back to `_ROW_DTYPE`
+#                                     (diagnostic; re-creates the ties).
+_L2_FULL = os.environ.get("DSV41_INDEXER_L2_FULL", "1") == "1"
+_SMALLN_ROW_BF16 = os.environ.get("DSV41_INDEXER_SMALLN_ROW_BF16", "0") == "1"
+
+
+def _row_dtype(n: int):
+    """Stored score-row dtype for a forward with ``n`` query rows.
+
+    Returns fp32 for small-n fallback forwards (decode n=1 / verify n=4) when
+    L2-full is active, so the fallback row matches the hierarchical path's fp32
+    exact re-score; otherwise the shipped :data:`_ROW_DTYPE` (bf16 by default).
+    The row size this feeds (:func:`tile_width` / :func:`tiled`) is measured in
+    this dtype, so a large-n forward is unaffected (``n > _FENCE_MIN_ROWS``).
+    """
+    if _L2_FULL and n <= _FENCE_MIN_ROWS:
+        return _ROW_DTYPE if _SMALLN_ROW_BF16 else mx.float32
+    return _ROW_DTYPE
+
 # --- hierarchical / streamed exact pass (M2) --------------------------------
 # DSV41_INDEXER_HIER (default "1" = ON since the 2026-10-06 A/B+battery; "0"
 # forces OFF for A/B) replaces the [b, n, nb] score row's
@@ -210,9 +251,11 @@ def tile_width(bsz: int, n: int, n_heads: int, nb: int, align: int) -> int:
     """
     if _TILE <= 0:
         return nb
-    # bsz*n*nb elements of _ROW_DTYPE per head-sum output; the tile transient is
+    # bsz*n*nb elements of the row dtype (``_row_dtype(n)``; bf16 large-n, fp32
+    # small-n under L2-full) per head-sum output; the tile transient is
     # bsz*n*n_heads*tile elements of fp32 (the head-sum accumulation stays fp32).
-    cap = max(align, _TILE_BUDGET // max(1, bsz * n * (n_heads * 4 + _ROW_DTYPE.size)))
+    row_size = _row_dtype(n).size
+    cap = max(align, _TILE_BUDGET // max(1, bsz * n * (n_heads * 4 + row_size)))
     t = max(align, (min(_TILE, cap) // align) * align)
     return min(nb, t)
 
@@ -233,7 +276,8 @@ def tiled(bsz: int, n: int, n_heads: int, nb: int, align: int = 1) -> int:
     if nb < _TILE_MIN_NB or tile >= nb:
         return nb
     # untiled peak ~= the [b, n, heads, nb] fp32 transient + the [b, n, nb] row
-    if not _TILE_FORCE and bsz * n * nb * (n_heads * 4 + _ROW_DTYPE.size) <= _TILE_BUDGET:
+    # (row dtype = _row_dtype(n): bf16 large-n, fp32 small-n under L2-full).
+    if not _TILE_FORCE and bsz * n * nb * (n_heads * 4 + _row_dtype(n).size) <= _TILE_BUDGET:
         return nb
     return tile
 
@@ -330,6 +374,7 @@ def _tiled_scores_buffer(q32: mx.array, index_k: mx.array, w32: mx.array,
     cand = cand_src is not None
     topk_blocks, block_size = cand_src if cand else (0, 1)
     body = _score_body(bsz, n, q32.shape[2], q32.shape[3], tile)
+    row_dtype = _row_dtype(n)
 
     # ``zeros`` (not ``empty``): in this MLX build ``mx.empty`` is a pure
     # alias of ``mx.zeros`` (no uninitialized allocation exists), and older
@@ -337,7 +382,7 @@ def _tiled_scores_buffer(q32: mx.array, index_k: mx.array, w32: mx.array,
     # and fills every row element before the loop overwrites it. The per-tile
     # head-sum ``s`` stays fp32 (see module docstring); only the stored row is
     # _ROW_DTYPE, and the fp32->bf16 slice-assign cast is the entire change.
-    row = mx.zeros((bsz, n, nb), dtype=_ROW_DTYPE)
+    row = mx.zeros((bsz, n, nb), dtype=row_dtype)
     for c0 in range(0, nb, tile):
         c1 = min(c0 + tile, nb)
         s = body(q32, index_k[:, c0:c1].astype(mx.float32), w32)
@@ -624,9 +669,10 @@ class Indexer(nn.Module):
                                index_k.astype(mx.float32))
             scores = mx.maximum(scores, 0.0) * w[..., None].astype(mx.float32)
             # head-sum stays fp32; the STORED row takes the same precision as the
-            # tiled path's buffer (_ROW_DTYPE, bf16 by default) so the two paths and
-            # the DSV41_INDEXER_ROW_BF16 A/B are directly comparable.
-            scores = mx.sum(scores, axis=2).astype(_ROW_DTYPE)      # [b, n, nb]
+            # tiled path's buffer (``_row_dtype(n)``: bf16 by default, fp32 at
+            # small n under L2-full) so the two paths and the
+            # DSV41_INDEXER_ROW_BF16 A/B are directly comparable.
+            scores = mx.sum(scores, axis=2).astype(_row_dtype(n))     # [b, n, nb]
 
             vis = mx.arange(nb)[None, :] < lens                            # [n, nb]
             scores = mx.where(vis[None], scores, NEG_INF)
