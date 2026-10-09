@@ -59,6 +59,38 @@ class AffineProj(nn.Module):
         super().__init__()
         from ..exl3.reconstruct import reconstruct_public_mlx
         w = mx.contiguous(reconstruct_public_mlx(layer).T)       # [out, in] fp16
+        self._set_weight(w, bits, group)
+
+    @classmethod
+    def from_weight(cls, w: mx.array, bits: int, group: int, *,
+                    expect: tuple[int, int] | None = None) -> "AffineProj":
+        """``AffineProj`` from an already-reconstructed fp16 ``[out, in]`` weight.
+
+        ``w`` must already be ``[out, in]`` -- the layout ``__init__`` builds
+        after its ``.T``. This is the affine half of a TP slice: the caller
+        reconstructs the dense group, slices the fp16 weight on 128-wide block
+        boundaries, and hands the slice here (see ``_dense_slice``). A weight
+        still in ``[in, out]`` would quantize the wrong axis and pass silently
+        whenever both dims are multiples of ``group``; pass ``expect=(out, in)``
+        to pin the orientation so a transposed projection cannot pass.
+        """
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        self._set_weight(w, bits, group, expect=expect)
+        return self
+
+    def _set_weight(self, w: mx.array, bits: int, group: int, *,
+                    expect: tuple[int, int] | None = None) -> None:
+        if w.ndim != 2:
+            raise ValueError(f"AffineProj: expected a 2-D [out, in] weight, got {w.shape}")
+        if expect is not None and tuple(w.shape) != tuple(expect):
+            raise ValueError(
+                f"AffineProj: weight {tuple(w.shape)} != expected [out, in] "
+                f"{tuple(expect)} -- a transposed projection cannot pass")
+        w = mx.contiguous(w.astype(mx.float16))
+        if w.shape[-1] % group:
+            raise ValueError(
+                f"AffineProj: in_features {w.shape[-1]} not divisible by group {group}")
         self._q = mx.quantize(w, group_size=group, bits=bits)
         mx.eval(self._q)
         self._bits, self._group = bits, group
@@ -273,6 +305,19 @@ def _fuse_block(blk: nn.Module, pre: str, ck: Exl3Checkpoint) -> int:
     return n
 
 
+def _block_bounds(n: int, rank: int, world: int, label: str, key: str) -> tuple[int, int]:
+    """Rank's ``[a, b)`` slice of ``n`` 16-wide tiles, on 128-wide blocks.
+
+    The single geometry shared by the trellis slice (:func:`_slice_dense`) and
+    the post-reconstruction weight slice (:func:`_slice_weight`): each rank
+    owns an integer number of 128-wide blocks, so the blockwise Hadamard
+    rotations AND the affine groups (size 64) never straddle a slice boundary.
+    """
+    if n % (8 * world):
+        raise ValueError(f"{key}: {label} {n} not divisible into 128-blocks x {world}")
+    return rank * n // world, (rank + 1) * n // world
+
+
 def _slice_dense(layer, *, axis: str, rank: int, world: int):
     """One rank's slice of a dense EXL3 group, on 128-wide Hadamard blocks
     (exact: the rotations are blockwise). axis="out" slices the output
@@ -280,20 +325,55 @@ def _slice_dense(layer, *, axis: str, rank: int, world: int):
     from ..exl3.ref.layer import EXL3Layer
     t = layer.trellis
     if axis == "out":
-        n = t.shape[1]
-        if n % (8 * world):
-            raise ValueError(f"{layer.key}: out_tiles {n} not divisible into 128-blocks x {world}")
-        a, b = rank * n // world, (rank + 1) * n // world
+        a, b = _block_bounds(t.shape[1], rank, world, "out_tiles", layer.key)
         return EXL3Layer(key=f"{layer.key}#out{rank}/{world}", in_features=layer.in_features,
                          out_features=(b - a) * 16, k=layer.k, trellis=np.ascontiguousarray(t[:, a:b]),
                          suh=layer.suh, svh=layer.svh[a * 16:b * 16], mul1=layer.mul1)
-    n = t.shape[0]
-    if n % (8 * world):
-        raise ValueError(f"{layer.key}: in_tiles {n} not divisible into 128-blocks x {world}")
-    a, b = rank * n // world, (rank + 1) * n // world
+    a, b = _block_bounds(t.shape[0], rank, world, "in_tiles", layer.key)
     return EXL3Layer(key=f"{layer.key}#in{rank}/{world}", in_features=(b - a) * 16,
                      out_features=layer.out_features, k=layer.k, trellis=np.ascontiguousarray(t[a:b]),
                      suh=layer.suh[a * 16:b * 16], svh=layer.svh, mul1=layer.mul1)
+
+
+def _slice_weight(layer, *, axis: str, rank: int, world: int) -> mx.array:
+    """One rank's fp16 ``[out, in]`` slice of a dense group, sliced AFTER the
+    reconstruction instead of on the trellis (the affine path). The Hadamard
+    rotations are blockwise on 128-wide blocks, so a block-boundary slice
+    commutes with the reconstruction: this weight equals
+    ``reconstruct_public_mlx(_slice_dense(layer, ...))``. axis="out" slices the
+    output features, axis="in" the input features."""
+    from ..exl3.reconstruct import reconstruct_public_mlx
+    w = reconstruct_public_mlx(layer)                        # [in, out] fp16
+    # Orientation guard: reconstruct_public_mlx returns [in, out]; assert it
+    # against the layer's own metadata so a transposed weight cannot be sliced
+    # along the wrong axis and pass silently.
+    if tuple(w.shape) != (layer.in_features, layer.out_features):
+        raise ValueError(
+            f"{layer.key}: reconstruct gave {tuple(w.shape)}, expected [in, out] "
+            f"({layer.in_features}, {layer.out_features})")
+    w = mx.contiguous(w.T)                                   # [out, in]
+    if axis == "out":
+        a, b = _block_bounds(layer.out_features // 16, rank, world, "out_tiles", layer.key)
+        return mx.contiguous(w[a * 16:b * 16])
+    a, b = _block_bounds(layer.in_features // 16, rank, world, "in_tiles", layer.key)
+    return mx.contiguous(w[:, a * 16:b * 16])
+
+
+def _dense_slice(ck: Exl3Checkpoint, name: str, *, axis: str, rank: int, world: int):
+    """One rank's TP slice of dense group ``name``, in the active ``DENSE_MODE``'s
+    format: the trellis slice re-wrapped as an ``EXL3Linear`` (exl3), or the
+    reconstructed fp16 weight sliced on the same 128-wide block boundaries and
+    affine-quantized (affineN)."""
+    from ..exl3.loader import load_dense_layer
+    lay = load_dense_layer(ck, name)
+    if DENSE_MODE.startswith("affine"):
+        bits = int(DENSE_MODE[6:])
+        w = _slice_weight(lay, axis=axis, rank=rank, world=world)
+        expect = ((w.shape[0], lay.in_features) if axis == "out"
+                  else (lay.out_features, w.shape[1]))
+        return AffineProj.from_weight(w, bits, 64, expect=expect)
+    from ..exl3 import EXL3Linear
+    return Exl3Proj(EXL3Linear(_slice_dense(lay, axis=axis, rank=rank, world=world)))
 
 
 class ShardedHead(nn.Module):
@@ -458,7 +538,11 @@ def _groups(ck: Exl3Checkpoint, prefix: str) -> set[str]:
             if k.startswith(prefix) and k.endswith(".trellis")}
 
 
-DENSE_MODE = os.environ.get("DSV41_DENSE", "exl3")          # exl3 | affine8 | affine6
+DENSE_MODE = os.environ.get("DSV41_DENSE", "exl3")          # exl3 | affine8 | affine6 | affine5
+# DSV41_DENSE_TP=0 forces the affine modes back to the REPLICATED (unsharded)
+# dense path -- the cluster A/B needs sharded vs replicated vs exl3. Ignored by
+# exl3 mode, which is always sharded.
+_DENSE_TP = os.environ.get("DSV41_DENSE_TP", "1") == "1"
 
 
 def _dense(ck: Exl3Checkpoint, name: str):
@@ -512,7 +596,14 @@ def build_block(ck: Exl3Checkpoint, args: ModelArgs, layer_id: int, *,
     dense = {g for g in _groups(ck, pre) if ".ffn.experts." not in g}
     wo_a = sorted((g for g in dense if ".attn.wo_a.slice." in g),
                   key=lambda g: int(g.rsplit(".", 1)[1]))
-    attn_tp = world > 1 and _SHARD_ATTN and DENSE_MODE == "exl3" and group is not None
+    # Affine modes TP-shard EXACTLY like exl3: same head-split of wo_a, same
+    # 128-wide block slices of wq_b/wo_b and the shared experts -- only the
+    # per-rank projection differs (AffineProj instead of EXL3Proj). The
+    # DENSE_MODE gate that previously forced affine to load every dense group
+    # FULL (each rank computed the full slice -> roughly break-even, not the
+    # priced 2.4x) is gone; DSV41_DENSE_TP=0 restores the replicated behavior.
+    tp_on = _DENSE_TP or not DENSE_MODE.startswith("affine")
+    attn_tp = world > 1 and _SHARD_ATTN and tp_on and group is not None
     if attn_tp:
         # heads split contiguously: rank r owns heads [r*H/w, (r+1)*H/w) and the
         # wo_a groups over exactly those heads; wo_b takes the matching input slice
@@ -526,23 +617,17 @@ def build_block(ck: Exl3Checkpoint, args: ModelArgs, layer_id: int, *,
         blk.attn.wo_a = _Grouped([_dense(ck, g) for g in mine])
     elif wo_a:
         blk.attn.wo_a = _Grouped([_dense(ck, g) for g in wo_a])
-    shared_tp = world > 1 and _SHARD_SHARED and DENSE_MODE == "exl3"
+    shared_tp = world > 1 and _SHARD_SHARED and tp_on
     for g in sorted(set(dense) - set(wo_a)):
         tail = g[len(pre):]
         if attn_tp and tail in ("attn.wq_b", "attn.wo_b"):
-            from ..exl3 import EXL3Linear
-            from ..exl3.loader import load_dense_layer
-            lay = _slice_dense(load_dense_layer(ck, g),
-                               axis="out" if tail == "attn.wq_b" else "in",
-                               rank=rank, world=world)
-            _set(blk, tail, Exl3Proj(EXL3Linear(lay)))
+            _set(blk, tail, _dense_slice(
+                ck, g, axis="out" if tail == "attn.wq_b" else "in",
+                rank=rank, world=world))
         elif shared_tp and tail.startswith("ffn.shared_experts."):
-            from ..exl3 import EXL3Linear
-            from ..exl3.loader import load_dense_layer
-            lay = load_dense_layer(ck, g)
-            lay = _slice_dense(lay, axis="in" if tail.endswith("w2") else "out",
-                               rank=rank, world=world)
-            _set(blk, tail, Exl3Proj(EXL3Linear(lay)))
+            _set(blk, tail, _dense_slice(
+                ck, g, axis="in" if tail.endswith("w2") else "out",
+                rank=rank, world=world))
         else:
             _set(blk, tail, _dense(ck, g))
     if shared_tp:
