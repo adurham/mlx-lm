@@ -73,6 +73,25 @@ ENV
 * ``DSV41_NEXT18_CAPTURE_STORE_K``"0" to skip storing the full index_k buffer.
 * ``DSV41_NEXT18_CAPTURE_FLUSH``  flush every K calls in addition to atexit
                                    (default = ring size). "1" => flush each call.
+
+FLUSH IS OFF the request thread (R1b fix). ``flush()`` snapshots the ring on the
+calling thread (cheap: a list copy) and does the expensive `np.savez_compressed`
++ `os.replace` + meta write in a **single daemon writer thread**. A single-slot
+pending buffer coalesces back-to-back flushes so a slow deflate never queues up
+or blocks a forward. The R1 SIGKILL was the inline `np.savez_compressed` of a
+~197 MB `.npz` (full `index_k` per record) starving the runner event channel;
+this makes the request thread return immediately.
+
+RUNTIME GATE (never capture during a timing arm). Because the hook is installed
+once at engine construction, capture cannot be turned on/off by the launch env
+alone without a reboot. ``DSV41_NEXT18_CAPTURE_GATE`` names a sentinel path; if
+that file EXISTS the hook is an immediate no-op (~one stat per indexer call, no
+tensor conversion, no A/B). Timing arms run with the sentinel present; the
+capture leg ``rm``s it. Unset => always active (R1 behaviour).
+
+* ``DSV41_NEXT18_CAPTURE_GATE``   sentinel path; hook is inert while it exists.
+* ``DSV41_NEXT18_CAPTURE_INTERVAL`` seconds between interval flushes (default 30;
+                                   0 => no interval flush, atexit/ring only).
 """
 
 from __future__ import annotations
@@ -122,12 +141,20 @@ def _env_ns(name: str, default=(1, 4)) -> tuple[int, ...]:
     return tuple(out) or tuple(default)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 # --------------------------------------------------------------------------
 # capture state
 # --------------------------------------------------------------------------
 class _Capture:
     def __init__(self, path: str, ns, max_calls: int, ab: bool,
-                 store_k: bool, flush_every: int):
+                 store_k: bool, flush_every: int,
+                 gate_path: str | None = None, interval: float = 30.0):
         self.path = path
         self.ns = set(int(x) for x in ns)
         self.max_calls = int(max_calls)          # 0 => unlimited (avoid)
@@ -144,6 +171,25 @@ class _Capture:
         self._orig_call = None
         self._orig_hier = None
         self._orig_fence = None
+        # R1b: off-thread flush + runtime gate.
+        # ``gate_path`` is a sentinel file; while it EXISTS the hook is inert
+        # (timing-arm guard). ``interval`` > 0 starts a daemon interval-flusher.
+        self.gate_path = gate_path
+        self.interval = float(interval)
+        self._flush_lock = threading.Lock()       # serialize writer-thread flushes
+        self._pending: list[dict[str, Any]] | None = None
+        self._wake = threading.Event()
+        self._writer: threading.Thread | None = None
+        self._timer: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def _gated(self) -> bool:
+        """True while the timing-arm sentinel exists (hook must be a no-op).
+
+        One ``os.path.exists`` per indexer call: no tensor conversion, no A/B,
+        no ring append -- the cost of a disabled hook is one stat.
+        """
+        return bool(self.gate_path) and os.path.exists(self.gate_path)
 
     # -- numpy conversion helpers -----------------------------------------
     @staticmethod
@@ -204,9 +250,14 @@ class _Capture:
             self._since_flush += 1
             due = (self._since_flush >= self.flush_every)
         if due:
-            self.flush()
+            # R1b: schedule the flush OFF the request thread. ``flush()`` only
+            # snapshots the ring here and returns; the writer thread does the
+            # savez_compressed. A blocking call would re-create the R1 SIGKILL.
+            self.flush(block=False)
 
     def _maybe_capture(self, ix, x, qr, start_pos, offset, freqvec, index_k, shared, out):
+        if self._gated():
+            return                                     # timing-arm sentinel present
         from mlx_lm.models.deepseek_v41.layers import cos_sin_at, rope_tail
         from mlx_lm.models.deepseek_v41.fakequant import fake_quant_fp4_ue8m0
 
@@ -292,13 +343,70 @@ class _Capture:
         pos = np.argwhere(a != b)[:32].astype(np.int32) if nd else np.zeros((0, 3), np.int32)
         return nd, pos
 
-    # -- flush (atomic, ring-bounded) --------------------------------------
-    def flush(self):
+    # -- flush (atomic, ring-bounded, OFF the request thread) -------------
+    def flush(self, block: bool = False, wait: float | None = None):
+        """Snapshot the ring and hand it to the daemon writer thread.
+
+        R1b: this NEVER deflates on the calling thread. The R1 SIGKILL was a
+        synchronous ``np.savez_compressed`` of a ~197 MB ``.npz`` inline on the
+        server's request thread (multi-minute zlib), so no runner events were
+        emitted and the 45 s hang-watchdog killed the runner. Here the expensive
+        work happens in ``_writer_loop``.
+
+        ``block=True`` (used by atexit / the final capture flush) waits for the
+        write to land. In the hook path it is called with ``block=False`` so the
+        forward returns immediately.
+        """
         with self._lock:
             if not self.ring:
                 return
             recs = list(self.ring)
             self._since_flush = 0
+        # Single-slot coalescing: if a flush is already pending, replace it with
+        # this (newer) snapshot. The ring is cumulative, so the newest snapshot
+        # is a superset -- no data is lost, and flushes never queue up.
+        with self._flush_lock:
+            self._pending = recs
+        self._wake.set()
+
+        if block:
+            deadline = time.time() + (wait if wait is not None else 120.0)
+            while time.time() < deadline:
+                with self._flush_lock:
+                    done = self._pending is None
+                if done:
+                    return
+                time.sleep(0.05)
+
+    def _writer_loop(self):
+        while not self._stop.is_set():
+            self._wake.wait(timeout=0.2)
+            self._wake.clear()
+            with self._flush_lock:
+                if self._pending is None:
+                    continue
+                recs, self._pending = self._pending, None
+            try:
+                self._write_ring(recs)
+            except Exception as e:  # a capture must NEVER take down the server
+                import traceback
+                print(f"[next18_capture] flush error: {e}\n"
+                      + traceback.format_exc(), file=sys.stderr, flush=True)
+
+    def _timer_loop(self):
+        while not self._stop.wait(self.interval):
+            self.flush(block=False)
+
+    def _start_workers(self):
+        self._writer = threading.Thread(target=self._writer_loop,
+                                        name="next18-capture-writer", daemon=True)
+        self._writer.start()
+        if self.interval and self.interval > 0:
+            self._timer = threading.Thread(target=self._timer_loop,
+                                           name="next18-capture-timer", daemon=True)
+            self._timer.start()
+
+    def _write_ring(self, recs):
         arrays: dict[str, np.ndarray] = {}
         meta_rows = []
         _ARR_KEYS = ("out", "q", "w", "lens", "index_k", "qr", "x", "freqvec",
@@ -323,8 +431,9 @@ class _Capture:
         d = os.path.dirname(os.path.abspath(path)) or "."
         os.makedirs(d, exist_ok=True)
         # np.savez_compressed APPENDS '.npz' when the name lacks it, so the temp
-        # name must already end in '.npz' or os.replace cannot find it.
-        tmp = f"{path}.tmp.{os.getpid()}.npz"
+        # name must already end in '.npz' or os.replace cannot find it. Unique
+        # per write so successive flushes never share a temp file.
+        tmp = f"{path}.tmp.{os.getpid()}.{self.flushed}.npz"
         np.savez_compressed(tmp, **arrays)
         os.replace(tmp, path)
         # metadata sidecar (human-readable, small): OVERWRITE so it stays bounded
@@ -352,7 +461,8 @@ _CAP: _Capture | None = None
 
 def install(path: str | None = None, *, ns=None, max_calls: int | None = None,
             ab: bool | None = None, store_k: bool | None = None,
-            flush_every: int | None = None) -> _Capture:
+            flush_every: int | None = None, gate: str | None = None,
+            interval: float | None = None) -> _Capture:
     """Install the capture hook (idempotent). Returns the live _Capture."""
     global _CAP
     if _CAP is not None:
@@ -370,14 +480,28 @@ def install(path: str | None = None, *, ns=None, max_calls: int | None = None,
                else _env_bool("DSV41_NEXT18_CAPTURE_STORE_K", True))
     flush_every = (flush_every if flush_every is not None
                    else _env_int("DSV41_NEXT18_CAPTURE_FLUSH", max_calls or 1))
-    cap = _Capture(path, ns, max_calls, ab, store_k, flush_every)
+    gate = gate if gate is not None else (os.environ.get("DSV41_NEXT18_CAPTURE_GATE")
+                                          or (path + ".gate"))
+    interval = (interval if interval is not None
+                else _env_float("DSV41_NEXT18_CAPTURE_INTERVAL", 30.0))
+    cap = _Capture(path, ns, max_calls, ab, store_k, flush_every,
+                   gate_path=gate, interval=interval)
     cap.install()
+    cap._start_workers()                      # R1b: daemon writer (+ interval timer)
     _CAP = cap
     atexit.register(cap.uninstall)
-    atexit.register(cap.flush)
+
+    def _final_flush():                        # blocking so atexit waits for the write
+        try:
+            cap.flush(block=True, wait=180.0)
+        except Exception:
+            pass
+
+    atexit.register(_final_flush)
     print(f"[next18_capture] installed: path={path} ns={sorted(cap.ns)} "
           f"max_calls={max_calls} ab={ab} store_k={store_k} "
-          f"flush_every={flush_every}", file=sys.stderr, flush=True)
+          f"flush_every={flush_every} gate={gate} interval={interval} "
+          f"off_thread_flush=True", file=sys.stderr, flush=True)
     return cap
 
 
