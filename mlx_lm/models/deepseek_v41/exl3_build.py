@@ -13,6 +13,8 @@ the checkpoint, and every checkpoint group of a built layer must be consumed.
 
 from __future__ import annotations
 
+import fnmatch
+import json
 import os
 from typing import Iterable
 
@@ -366,18 +368,19 @@ def _slice_weight(layer, *, axis: str, rank: int, world: int) -> mx.array:
 
 
 def _dense_slice(ck: Exl3Checkpoint, name: str, *, axis: str, rank: int, world: int):
-    """One rank's TP slice of dense group ``name``, in the active ``DENSE_MODE``'s
+    """One rank's TP slice of dense group ``name``, in the resolved policy
     format: the trellis slice re-wrapped as an ``EXL3Linear`` (exl3), or the
     reconstructed fp16 weight sliced on the same 128-wide block boundaries and
     affine-quantized (affineN)."""
     from ..exl3.loader import load_dense_layer
     lay = load_dense_layer(ck, name)
-    if DENSE_MODE.startswith("affine"):
-        bits = int(DENSE_MODE[6:])
+    kind, bits, group = _resolve_dense_mode(name, _DENSE_POLICY, DENSE_MODE)
+    if kind == "affine":
+        assert bits is not None and group is not None
         w = _slice_weight(lay, axis=axis, rank=rank, world=world)
         expect = ((w.shape[0], lay.in_features) if axis == "out"
                   else (lay.out_features, w.shape[1]))
-        return AffineProj.from_weight(w, bits, 64, expect=expect)
+        return AffineProj.from_weight(w, bits, group, expect=expect)
     from ..exl3 import EXL3Linear
     return Exl3Proj(EXL3Linear(_slice_dense(lay, axis=axis, rank=rank, world=world)))
 
@@ -550,11 +553,94 @@ DENSE_MODE = os.environ.get("DSV41_DENSE", "exl3")          # exl3 | affine8 | a
 # exl3 mode, which is always sharded.
 _DENSE_TP = os.environ.get("DSV41_DENSE_TP", "1") == "1"
 
+# DSV41_DENSE_POLICY: per-tensor dense-quant override on top of DSV41_DENSE.
+# Either an inline spec ("selector=mode,selector=mode") or an absolute path to
+# a JSON file (a dict {selector: mode} or a list of [selector, mode] pairs).
+# Selectors are fnmatch globs matched against the FULL tensor name (e.g.
+# "layers.20.attn.wq_b"); the LAST matching selector wins, and a tensor matched
+# by none (or an unset/empty policy) falls back to the global DSV41_DENSE
+# behavior above -- so an unset policy is byte-identical to the pre-policy
+# engine. This changes ONLY the per-tensor quant FORMAT, never the sharding.
+_POLICY_MODES = {                                  # policy mode -> (kind, bits, group)
+    "exl3": ("exl3", None, None),
+    "q6g64": ("affine", 6, 64),
+    "q6g32": ("affine", 6, 32),
+    "q8g64": ("affine", 8, 64),
+}
+
+
+def _parse_dense_policy(spec) -> list[tuple[str, str]]:
+    """Parse a ``DSV41_DENSE_POLICY`` spec into ordered ``(selector, mode)`` pairs.
+
+    ``spec`` is either an inline comma-separated ``selector=mode`` string or the
+    path to a JSON file (a dict -- insertion order preserved -- or a list of
+    ``[selector, mode]`` pairs). Modes are validated here, so a typo fails at
+    build time instead of silently falling back mid-load.
+    """
+    if not spec:
+        return []
+    # a filesystem path to a JSON spec is the only non-inline form
+    if isinstance(spec, str) and os.path.isfile(spec):
+        with open(spec) as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            pairs = list(data.items())
+        elif isinstance(data, list):
+            pairs = [(p[0], p[1]) for p in data]
+        else:
+            raise ValueError(
+                f"DSV41_DENSE_POLICY {spec!r}: JSON must be a dict or a list "
+                f"of [selector, mode] pairs, got {type(data).__name__}")
+    else:
+        pairs = []
+        for item in spec.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            sel, sep, mode = item.partition("=")
+            if not sep:
+                raise ValueError(
+                    f"DSV41_DENSE_POLICY: bad entry {item!r}; expected selector=mode")
+            pairs.append((sel.strip(), mode.strip()))
+    out = []
+    for sel, mode in pairs:
+        if mode not in _POLICY_MODES:
+            raise ValueError(
+                f"DSV41_DENSE_POLICY: unknown mode {mode!r} for selector {sel!r}; "
+                f"allowed: {', '.join(sorted(_POLICY_MODES))}")
+        out.append((sel, mode))
+    return out
+
+
+def _resolve_dense_mode(name: str, policy: list[tuple[str, str]],
+                        base_mode: str) -> tuple[str, int | None, int | None]:
+    """Resolve tensor ``name`` to ``(kind, bits, group)`` (``kind`` exl3|affine).
+
+    Selectors match the full name with ``fnmatch.fnmatchcase`` (``*`` crosses
+    ``.``); the LAST match wins. No match -- or an empty policy -- returns
+    ``base_mode``'s global behavior, so an unset policy reproduces the current
+    engine exactly (byte-identical modules).
+    """
+    hit = None
+    for sel, mode in policy:
+        if fnmatch.fnmatchcase(name, sel):
+            hit = mode                                     # last match wins
+    if hit is not None:
+        return _POLICY_MODES[hit]
+    if base_mode.startswith("affine"):
+        return "affine", int(base_mode[6:]), 64
+    return "exl3", None, None
+
+
+_DENSE_POLICY = _parse_dense_policy(os.environ.get("DSV41_DENSE_POLICY", ""))
+
 
 def _dense(ck: Exl3Checkpoint, name: str):
-    if DENSE_MODE.startswith("affine"):
+    kind, bits, group = _resolve_dense_mode(name, _DENSE_POLICY, DENSE_MODE)
+    if kind == "affine":
+        assert bits is not None and group is not None
         from ..exl3.loader import load_dense_layer
-        return AffineProj(load_dense_layer(ck, name), int(DENSE_MODE[6:]), 64)
+        return AffineProj(load_dense_layer(ck, name), bits, group)
     return Exl3Proj(load_dense_linear(ck, name))
 
 
