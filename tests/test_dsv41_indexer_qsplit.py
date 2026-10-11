@@ -85,8 +85,9 @@ def _indexer(args: ModelArgs, layer_id: int) -> IX.Indexer:
     return idx
 
 
-def _inputs(rng, args, *, b=1, n=64, nb=120):
-    sp = 2 * nb                                   # every column visible
+def _inputs(rng, args, *, b=1, n=64, nb=120, sp=None):
+    if sp is None:
+        sp = 2 * nb                               # every column visible
     x = mx.array(rng.standard_normal((b, n, args.dim)).astype(np.float32))
     qr = mx.array(rng.standard_normal((b, n, args.q_lora_rank)).astype(np.float32))
     ik = mx.array(rng.standard_normal((b, nb, args.index_head_dim)).astype(np.float32))
@@ -203,13 +204,21 @@ def _run_full(idx, x, qr, sp, fv, ik, *, offset=0):
 
 class RowIndependenceTest(_GateFixture):
     def _check_band_equals_slice(self, *, hier: bool, source: bool, b: int,
-                                 n: int, nb: int, seed: int) -> None:
+                                 n: int, nb: int, seed: int,
+                                 sp: int | None = None,
+                                 force_untiled: bool = False,
+                                 check_overlap: bool = True) -> None:
         IX._QSPLIT = True
-        IX._TILE, IX._TILE_MIN_NB, IX._TILE_FORCE = 8, 0, True
+        if force_untiled:
+            # tile >= nb -> the UNTILED reference branch (`if tile < nb` false)
+            IX._TILE, IX._TILE_MIN_NB, IX._TILE_FORCE = 512, 0, False
+        else:
+            IX._TILE, IX._TILE_MIN_NB, IX._TILE_FORCE = 8, 0, True
         IX._HIER = hier
         args = _args(candidate_source_layer=(0 if source else -1))
         idx = _indexer(args, 0)
-        x, qr, sp, fv, ik = _inputs(np.random.default_rng(seed), args, b=b, n=n, nb=nb)
+        x, qr, sp, fv, ik = _inputs(np.random.default_rng(seed), args,
+                                    b=b, n=n, nb=nb, sp=sp)
         offset = 37                                     # exercise the +offset path
         g0, g1 = FakeGroup(0), FakeGroup(1)
 
@@ -232,10 +241,19 @@ class RowIndependenceTest(_GateFixture):
         # the padded tensor is zero outside this rank's band (disjoint contributors)
         self.assertTrue(np.all(pad0[:, half:, :] == 0))
         self.assertTrue(np.all(pad1[:, :half, :] == 0))
-        overlap = _overlap(recon, full)
-        self.assertEqual(overlap, 1.0, "top-k overlap < 1.0 vs the full run")
-        record({"case": "band_eq_slice", "hier": hier, "source": source, "b": b,
-                "n": n, "nb": nb, "overlap": overlap})
+        if check_overlap:
+            # a redundant, weaker check than np.array_equal above: it counts the
+            # DISTINCT top-k indices, so it is only meaningful when a row's top-k
+            # holds distinct values. Heavily-masked frames fill rows with the -1
+            # sentinel (a duplicate), collapsing the fraction -- those cases rely
+            # on the byte-equality assertion instead (check_overlap=False).
+            overlap = _overlap(recon, full)
+            self.assertEqual(overlap, 1.0, "top-k overlap < 1.0 vs the full run")
+            record({"case": "band_eq_slice", "hier": hier, "source": source,
+                    "b": b, "n": n, "nb": nb, "overlap": overlap})
+        else:
+            record({"case": "band_eq_slice", "hier": hier, "source": source,
+                    "b": b, "n": n, "nb": nb, "overlap": "byte-exact"})
 
     def test_hier_source(self) -> None:
         self._check_band_equals_slice(hier=True, source=True, b=1, n=64, nb=120, seed=3)
@@ -272,6 +290,31 @@ class RowIndependenceTest(_GateFixture):
         self.assertTrue(np.all(full[:, 2:4, :] == 0))
         record({"case": "negative_sentinel"})
 
+    def test_causal_frame_visibility_is_absolute(self) -> None:
+        """T1 (audit gap): with a band, the visibility ``lens`` must use ABSOLUTE
+        positions (like the rope), not band-relative ones. Every other case here
+        uses ``sp = 2*nb`` (all columns visible), so ``lens`` is inert and the
+        mutation M5 ('lens band-relative, rope absolute') escaped the suite. A
+        causal frame (``sp=0``, ``nb=n/2``) leaves many columns invisible, so the
+        two ranks' frames genuinely differ and a band-relative ``lens`` breaks the
+        reconstruction. The masked rows carry duplicate ``-1`` sentinels, so the
+        distinct-index overlap metric is degenerate here -- byte-equality is the
+        exactness assertion."""
+        self._check_band_equals_slice(hier=True, source=True, b=1, n=64, nb=32,
+                                      seed=21, sp=0, check_overlap=False)
+        self._check_band_equals_slice(hier=False, source=True, b=1, n=64, nb=32,
+                                      seed=22, sp=0, check_overlap=False)
+
+    def test_untiled_path_is_banded_and_reconstructed(self) -> None:
+        """T2 (audit gap): the UNTILED reference return site must wrap its ``cidx``
+        in ``_finish_rows`` too. Every other banded case forces tiling or the
+        hierarchy, so this site was uncovered (mutation M10 -- drop the untiled
+        wrap -- escaped; a rank would return a ``[b, n/2, k]`` band
+        unreconstructed, with no collective issued). Until it is wrapped this test
+        fails with ``KeyError 'padded'``."""
+        self._check_band_equals_slice(hier=False, source=True, b=1, n=64, nb=120,
+                                      seed=31, force_untiled=True)
+
 
 # --------------------------------------------------------------------------
 # 4. flag-off identity
@@ -295,6 +338,182 @@ class FlagOffTest(_GateFixture):
         out, _ = _run_full(idx, x, qr, sp, fv, ik, offset=5)
         self.assertEqual(out.shape, (1, 64, args.index_topk))
         record({"case": "band_none_never_collects"})
+
+
+# --------------------------------------------------------------------------
+# 5. D2 — the band fence must use the BAND's row count, not the full n
+# --------------------------------------------------------------------------
+class D2BandFenceTest(_GateFixture):
+    """Audit D2 regression: ``query_band`` gated on the FULL ``n``
+    (``n <= _FENCE_MIN_ROWS``) while the indexer routes on the BAND's row count
+    (``indexer.py`` ``n = qpos.shape[0]``). For ``17 <= n_full <= 32`` at world=2
+    the band's 9..16 rows took the small-n fp32 fallback while the replicated run
+    took the hier/bf16 path -> not byte-identical. The fix fences on ``n // world``;
+    these tests pin the boundary the shipped suite left open (the audit's M16 was
+    an expected-green control because nothing exercised it)."""
+
+    def test_fence_applies_to_the_band_row_count(self) -> None:
+        IX._QSPLIT = True
+        fence = IX._FENCE_MIN_ROWS                              # 16
+        # n_full 17..32 at world=2 -> band rows 9..16 <= fence -> replicated
+        for n in range(fence + 1, fence * 2 + 1):
+            self.assertIsNone(IX.query_band(n, FakeGroup(0)), f"rank0 n={n}")
+            self.assertIsNone(IX.query_band(n, FakeGroup(1)), f"rank1 n={n}")
+        # just above the boundary: band rows = fence + 1 -> banded
+        n = fence * 2 + 2                                      # 34
+        self.assertEqual(IX.query_band(n, FakeGroup(0)), (0, fence + 1))
+        self.assertEqual(IX.query_band(n, FakeGroup(1)), (fence + 1, n))
+        # decode / verify sized stays replicated
+        for small in (1, 4, fence):
+            self.assertIsNone(IX.query_band(small, FakeGroup(0)))
+        record({"case": "d2_fence_on_band_rows", "fence": fence})
+
+    def test_pre_fix_band_splits_the_regime(self) -> None:
+        """The D2 mechanism, deterministically: at ``n_full=32`` HIER-on the
+        PRE-FIX band (rows=16) does NOT reach the hierarchical pass while the full
+        ``n=32`` does -- the regime split D2 reports. The gate now returns ``None``
+        for this shape (so the split cannot occur); the replicated output equals the
+        full run's."""
+        IX._QSPLIT = True
+        IX._HIER = True
+        args = _args()
+        idx = _indexer(args, 0)
+        x, qr, sp, fv, ik = _inputs(np.random.default_rng(7), args, b=1, n=32, nb=64)
+        calls = {"hier": 0}
+        real_hier = IX._hier.hierarchical_topk_prod
+        real_sum = IX._coll.all_sum
+
+        def hier_spy(*a, **k):                                 # noqa: ANN002, ANN003
+            calls["hier"] += 1
+            return real_hier(*a, **k)
+
+        IX._hier.hierarchical_topk_prod = hier_spy
+        IX._coll.all_sum = lambda t, group=None: t             # noqa: ARG005
+        try:
+            out_full = idx(x, qr, sp, 0, fv, ik, SharedState())        # band=None
+            mx.eval(out_full)
+            hier_full = calls["hier"]
+            calls["hier"] = 0
+            out_band = idx(x, qr, sp, 0, fv, ik, SharedState(),
+                           band=(0, 16), group=FakeGroup(0))          # pre-fix band
+            mx.eval(out_band)
+            hier_band = calls["hier"]
+        finally:
+            IX._hier.hierarchical_topk_prod = real_hier
+            IX._coll.all_sum = real_sum
+        self.assertEqual(hier_full, 1, "full n=32 must take the hierarchical pass")
+        self.assertEqual(hier_band, 0, "band rows=16 must NOT take the hier pass")
+        # the gate now refuses to band this shape at all (the D2 fix)
+        self.assertIsNone(IX.query_band(32, FakeGroup(0)))
+        record({"case": "d2_pre_fix_regime_split", "hier_full": hier_full,
+                "hier_band": hier_band})
+
+
+# --------------------------------------------------------------------------
+# 6. D1 + T3 — the attention.py CALL SITE
+# --------------------------------------------------------------------------
+class AttentionCallSiteTest(_GateFixture):
+    """D1 + T3/M12: exercise the real ``Attention.__call__`` call site, which the
+    direct Indexer-level tests never touch.
+
+    D1: attention.py must not pass ``band=``/``group=`` when the flag is off, or a
+        FIXED positional-signature monkeypatch of ``Indexer.__call__`` (the
+        supported ``DSV41_NEXT18_CAPTURE`` hook, ``bench/next18_capture.py:222``)
+        raises ``TypeError`` on every indexer call.
+    T3/M12: with the flag + a TP group ON and a prefill-sized forward, the call
+        site must actually pass the band (mutation M12, 'attention never bands',
+        is not caught by any direct Indexer test).
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from mlx_lm.models.deepseek_v41.attention import Attention
+        from mlx_lm.models.deepseek_v41.cache import ModelCache
+        self._Attention = Attention
+        self._ModelCache = ModelCache
+
+    def _build(self, *, n0: int):
+        args = _args(n_layers=1, max_seq_len=64)
+        mx.random.seed(0)
+        att = self._Attention(0, args)
+        mx.eval(att.parameters())
+        cache = self._ModelCache(args, 1, 64)
+        cache.ensure_capacity(n0)
+        return att, cache
+
+    @staticmethod
+    def _indexer_class(att):
+        """The ``Indexer`` class THIS Attention instance actually calls.
+
+        Deliberately ``type(att.indexer)``, not ``IX.Indexer``:
+        ``tests/test_dsv41_indexer_bf16_row.py`` ends with an
+        ``importlib.reload(indexer)`` (it models the import-time env read that
+        way), which rebinds a SECOND ``Indexer`` class in the reloaded module
+        while ``attention`` still holds the first. When that test runs earlier in
+        the directory (alphabetically it does), ``IX.Indexer`` is the new class and
+        ``attention.Indexer`` the old -- patching ``IX.Indexer`` would silently
+        miss the instance. Patching the instance's own class is correct under
+        either state."""
+        return type(att.indexer)
+
+    def test_flag_off_survives_a_fixed_positional_wrapper(self) -> None:
+        """D1 regression: a fixed-arity capture-style wrapper still binds with the
+        flag OFF -- the base call form, with no keyword at all."""
+        IX._QSPLIT = False
+        att, cache = self._build(n0=8)
+        idx_cls = self._indexer_class(att)
+        orig = idx_cls.__call__
+        calls = {"n": 0}
+
+        def fixed(self_ix, x, qr, start_pos, offset, freqvec, index_k, shared):
+            calls["n"] += 1
+            return orig(self_ix, x, qr, start_pos, offset, freqvec, index_k, shared)
+
+        setattr(idx_cls, "__call__", fixed)
+        try:
+            mx.random.seed(3)
+            x = mx.random.normal((1, 8, att.dim)) * 0.5
+            out = att(x, 0, cache, SharedState())
+            mx.eval(out)
+        finally:
+            setattr(idx_cls, "__call__", orig)
+        self.assertGreater(calls["n"], 0, "the indexer was never reached")
+        self.assertEqual(out.shape, (1, 8, att.dim))
+        record({"case": "d1_fixed_positional_wrapper", "flag": "off",
+                "indexer_calls": calls["n"]})
+
+    def test_attention_passes_the_band_when_flag_and_group_on(self) -> None:
+        """T3/M12: with the flag + a TP group ON and a prefill-sized forward the
+        call site must pass ``band`` (and ``group``)."""
+        IX._QSPLIT = True
+        IX._HIER = True
+        att, cache = self._build(n0=40)
+        setattr(att, "group", FakeGroup(0))
+        att_group = getattr(att, "group")
+        seen: list[dict[str, Any]] = []
+        idx_cls = self._indexer_class(att)
+        orig = idx_cls.__call__
+        real_sum = IX._coll.all_sum
+
+        def recording(self_ix, *a, **kw):                      # noqa: ANN002, ANN003
+            seen.append(kw)
+            return orig(self_ix, *a, **kw)
+
+        setattr(idx_cls, "__call__", recording)
+        IX._coll.all_sum = lambda t, group=None: t             # noqa: ARG005
+        try:
+            mx.random.seed(4)
+            x = mx.random.normal((1, 40, att.dim)) * 0.5
+            out = att(x, 0, cache, SharedState())
+            mx.eval(out)
+        finally:
+            setattr(idx_cls, "__call__", orig)
+            IX._coll.all_sum = real_sum
+        self.assertTrue(seen, "the indexer was never called")
+        self.assertEqual(seen[0].get("band"), (0, 20),
+                         "attention did not band (M12)")
+        self.assertIs(seen[0].get("group"), att_group)
+        record({"case": "t3_attention_bands", "band": list(seen[0]["band"])})
 
 
 if __name__ == "__main__":

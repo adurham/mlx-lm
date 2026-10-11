@@ -179,19 +179,25 @@ def query_band(n: int, group: _DistributedGroup | None) -> tuple[int, int] | Non
 
     ``None`` means replicated -- the byte-identical default, and the only outcome
     unless ``DSV41_INDEXER_QSPLIT`` is on. The band engages only when *all* hold:
-    the gate is set, a TP group is present (``world >= 2``), the forward is
-    prefill-sized (``n > _FENCE_MIN_ROWS``: decode m=1 / verify m=4 stay replicated,
-    value-identical), and the rows divide evenly across ranks. The band is a slice
-    of the QUERY axis (``n``) only -- batch is never folded into rows -- so a
-    ``b > 1`` forward bands each batch identically and every row keeps its true
-    ``(batch, position)``. That is the guard against the historical seq-split
-    "batch-unsafe" corruption (PERFORMANCE_HISTORY: the pre-fix reconstruction
-    mishandled the batch axis); see :func:`_reconstruct_rows`.
+    the gate is set, a TP group is present (``world >= 2``), the rows divide evenly
+    across ranks, and THIS rank's BAND is prefill-sized (``n // world >
+    _FENCE_MIN_ROWS``).
+
+    D2 (audit p20-idxsplit-audit-report): the fence is applied to the BAND's row
+    count (``n // world``), NOT the full ``n``. Every downstream regime/path
+    decision (the ``_HIER`` routing and ``_row_dtype``) keys on the band's row
+    count, so gating on the full ``n`` while routing on the band's would put a band
+    of ``n <= _FENCE_MIN_ROWS`` rows on the small-n fp32 fallback while the
+    replicated run took the hier/bf16 path -- breaking the "band == full slice,
+    byte-exact" invariant for ``_FENCE_MIN_ROWS < n <= _FENCE_MIN_ROWS * world``.
+    Testing the same predicate on the band's own rows keeps the band on the SAME
+    regime the replicated run would take; decode m=1 / verify m=4 stay replicated,
+    value-identical.
     """
     if not _QSPLIT or group is None:
         return None
     world = group.size()
-    if world < 2 or n <= _FENCE_MIN_ROWS or n % world:
+    if world < 2 or n % world or n // world <= _FENCE_MIN_ROWS:
         return None
     rows = n // world
     lo = group.rank() * rows

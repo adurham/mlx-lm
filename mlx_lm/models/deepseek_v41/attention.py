@@ -195,16 +195,28 @@ class Attention(nn.Module):
                     index_k = shared.index_src_cache.index_k[:bsz, :compress_len]
                     # Query-band split (DSV41_INDEXER_QSPLIT, default OFF):
                     # query_band returns None unless the gate is on, a TP group
-                    # exists and the forward is prefill-sized, so the default call
-                    # passes band=None and stays byte-identical. The band is
-                    # computed from the SAME (n, group) at every index-source layer
-                    # (candidate source 20 and consumers 24/28/32/36), so the
-                    # published candidate mask is produced and consumed on one band.
+                    # exists and this rank's BAND is prefill-sized, so the default
+                    # call passes NO band keyword at all and stays byte-identical.
+                    # The band is computed from the SAME (n, group) at every
+                    # index-source layer (candidate source 20 and consumers
+                    # 24/28/32/36), so the published candidate mask is produced and
+                    # consumed on one band.
+                    #
+                    # D1 (audit p20-idxsplit-audit-report): the kwargs are passed
+                    # ONLY when band is not None. An always-present ``band=None``
+                    # would still bind the keyword and raise TypeError against a
+                    # FIXED positional-signature monkeypatch of Indexer.__call__
+                    # (bench/next18_capture.py's capture hook, installed by the
+                    # supported DSV41_NEXT18_CAPTURE path) even with the flag OFF.
                     band = query_band(n, self.group)
                     with span("attn.indexer"):
-                        cidx = self.indexer(x, qr, start_pos, offset, self._freqvec,
-                                            index_k, shared, band=band,
-                                            group=self.group)
+                        if band is None:
+                            cidx = self.indexer(x, qr, start_pos, offset,
+                                                self._freqvec, index_k, shared)
+                        else:
+                            cidx = self.indexer(x, qr, start_pos, offset,
+                                                self._freqvec, index_k, shared,
+                                                band=band, group=self.group)
                 shared.topk_idxs = cidx
             else:
                 cidx = shared.topk_idxs
