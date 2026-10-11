@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Protocol, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -140,6 +141,21 @@ _ROW_DTYPE = (mx.float32 if os.environ.get("DSV41_INDEXER_ROW_BF16", "1") == "0"
 _L2_FULL = os.environ.get("DSV41_INDEXER_L2_FULL", "1") == "1"
 _SMALLN_ROW_BF16 = os.environ.get("DSV41_INDEXER_SMALLN_ROW_BF16", "0") == "1"
 
+
+class _DistributedGroup(Protocol):
+    """The slice of ``mx.distributed.Group`` this module touches.
+
+    ``mlx.core.distributed`` is a nanobind extension with no stubs, so ``Group``
+    is ``Any`` and every ``.size()`` / ``.rank()`` reads would otherwise leak
+    ``Unknown`` through the band arithmetic. Narrowing once here (the house
+    "one typed accessor per attribute" rule) keeps the band code fully typed.
+    """
+
+    def size(self) -> int: ...
+
+    def rank(self) -> int: ...
+
+
 # --- query-band split across the TP ranks (P20-P1, default OFF) -------------
 # DSV41_INDEXER_QSPLIT splits the indexer's QUERY side across the 2 tensor-parallel
 # ranks: each rank scores, top-ks and emits half the chunk's query rows, while the
@@ -158,7 +174,7 @@ print(f"[DSV41] indexer qsplit: DSV41_INDEXER_QSPLIT="
       file=sys.stderr, flush=True)
 
 
-def query_band(n: int, group) -> tuple[int, int] | None:
+def query_band(n: int, group: _DistributedGroup | None) -> tuple[int, int] | None:
     """This rank's contiguous query-row band for the indexer split, or ``None``.
 
     ``None`` means replicated -- the byte-identical default, and the only outcome
@@ -183,7 +199,7 @@ def query_band(n: int, group) -> tuple[int, int] | None:
 
 
 def _reconstruct_rows(banded: mx.array, n_full: int, lo: int, hi: int,
-                      group) -> mx.array:
+                      group: _DistributedGroup | None) -> mx.array:
     """Rebuild the full ``[b, n_full, ...]`` tensor from this rank's row band.
 
     Zero-pad the band to the full query axis and issue one ``all_sum`` on the TP
@@ -195,16 +211,16 @@ def _reconstruct_rows(banded: mx.array, n_full: int, lo: int, hi: int,
     full = mx.zeros((banded.shape[0], n_full, *banded.shape[2:]),
                     dtype=banded.dtype)
     full[:, lo:hi, :] = banded
-    return _coll.all_sum(full, group=group)
+    return cast(mx.array, _coll.all_sum(full, group=group))
 
 
-def _finish_rows(cidx: mx.array, band, n_full: int, group) -> mx.array:
+def _finish_rows(cidx: mx.array, band: tuple[int, int] | None, n_full: int,
+                 group: _DistributedGroup | None) -> mx.array:
     """``cidx`` as-is, or the full-row tensor rebuilt from this rank's band."""
     if band is None:
         return cidx
     lo, hi = band
     return _reconstruct_rows(cidx, n_full, lo, hi, group)
-
 
 
 def _row_dtype(n: int):
@@ -631,7 +647,8 @@ class Indexer(nn.Module):
 
     def __call__(self, x: mx.array, qr: mx.array, start_pos: int, offset: int,
                  freqvec: mx.array, index_k: mx.array, shared,
-                 *, band: tuple[int, int] | None = None, group=None) -> mx.array:
+                 *, band: tuple[int, int] | None = None,
+                 group: _DistributedGroup | None = None) -> mx.array:
         """Score and pick top-k compressed positions for each query.
 
         x [b, n, dim] (post-attn-norm), qr [b, n, q_lora_rank],
