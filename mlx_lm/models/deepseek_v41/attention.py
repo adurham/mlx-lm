@@ -38,7 +38,7 @@ import mlx.nn as nn
 from .compressor import Compressor
 from .config import ModelArgs
 from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp8_ue8m0
-from .indexer import Indexer
+from .indexer import Indexer, query_band
 from .layers import RMSNorm, cos_sin_at, rope_freqs, rope_tail
 from .sparse_attention import sparse_attn
 from ...profiler import span
@@ -193,9 +193,18 @@ class Attention(nn.Module):
                     cidx = mx.zeros((bsz, n, 0), dtype=mx.int32)
                 else:
                     index_k = shared.index_src_cache.index_k[:bsz, :compress_len]
+                    # Query-band split (DSV41_INDEXER_QSPLIT, default OFF):
+                    # query_band returns None unless the gate is on, a TP group
+                    # exists and the forward is prefill-sized, so the default call
+                    # passes band=None and stays byte-identical. The band is
+                    # computed from the SAME (n, group) at every index-source layer
+                    # (candidate source 20 and consumers 24/28/32/36), so the
+                    # published candidate mask is produced and consumed on one band.
+                    band = query_band(n, self.group)
                     with span("attn.indexer"):
                         cidx = self.indexer(x, qr, start_pos, offset, self._freqvec,
-                                            index_k, shared)
+                                            index_k, shared, band=band,
+                                            group=self.group)
                 shared.topk_idxs = cidx
             else:
                 cidx = shared.topk_idxs

@@ -79,6 +79,7 @@ import mlx.nn as nn
 from .config import ModelArgs
 from .fakequant import fake_quant_fp4_ue8m0
 from .layers import RMSNorm, cos_sin_at, rope_tail
+from . import collective as _coll
 from . import indexer_hierarchical as _hier
 from ._gates import _FENCE_MIN_ROWS
 from ...profiler import span
@@ -138,6 +139,72 @@ _ROW_DTYPE = (mx.float32 if os.environ.get("DSV41_INDEXER_ROW_BF16", "1") == "0"
 #                                     (diagnostic; re-creates the ties).
 _L2_FULL = os.environ.get("DSV41_INDEXER_L2_FULL", "1") == "1"
 _SMALLN_ROW_BF16 = os.environ.get("DSV41_INDEXER_SMALLN_ROW_BF16", "0") == "1"
+
+# --- query-band split across the TP ranks (P20-P1, default OFF) -------------
+# DSV41_INDEXER_QSPLIT splits the indexer's QUERY side across the 2 tensor-parallel
+# ranks: each rank scores, top-ks and emits half the chunk's query rows, while the
+# KEY side (``index_k`` + the compressor/``wkv``/``wq_a`` that feed it) stays FULL on
+# every rank so the keys stay coherent. A small ``cidx`` [b, n, index_topk] int32
+# exchange reconstructs the full selection on both ranks, so ``sparse_attn`` and the
+# window/compressed consumer are unchanged. The collect is the zero-padded
+# ``all_sum`` (the v4-default, ARQ-reliable path -- see deepseek_v4.py's seq-split
+# reconstruction and exl3_build.ShardedHead, which notes the JACCL mesh rejects some
+# all_gather sizes; int32 all_sum is supported by the jaccl Int32 reducer). Read once
+# at import, like the neighbouring DSV41_INDEXER_* knobs; the EFFECTIVE value is
+# logged once to stderr (the runner's root logger filters mlx_lm INFO records).
+_QSPLIT = os.environ.get("DSV41_INDEXER_QSPLIT", "0") == "1"
+print(f"[DSV41] indexer qsplit: DSV41_INDEXER_QSPLIT="
+      f"{'1' if _QSPLIT else '0'} (effective at import)",
+      file=sys.stderr, flush=True)
+
+
+def query_band(n: int, group) -> tuple[int, int] | None:
+    """This rank's contiguous query-row band for the indexer split, or ``None``.
+
+    ``None`` means replicated -- the byte-identical default, and the only outcome
+    unless ``DSV41_INDEXER_QSPLIT`` is on. The band engages only when *all* hold:
+    the gate is set, a TP group is present (``world >= 2``), the forward is
+    prefill-sized (``n > _FENCE_MIN_ROWS``: decode m=1 / verify m=4 stay replicated,
+    value-identical), and the rows divide evenly across ranks. The band is a slice
+    of the QUERY axis (``n``) only -- batch is never folded into rows -- so a
+    ``b > 1`` forward bands each batch identically and every row keeps its true
+    ``(batch, position)``. That is the guard against the historical seq-split
+    "batch-unsafe" corruption (PERFORMANCE_HISTORY: the pre-fix reconstruction
+    mishandled the batch axis); see :func:`_reconstruct_rows`.
+    """
+    if not _QSPLIT or group is None:
+        return None
+    world = group.size()
+    if world < 2 or n <= _FENCE_MIN_ROWS or n % world:
+        return None
+    rows = n // world
+    lo = group.rank() * rows
+    return (lo, lo + rows)
+
+
+def _reconstruct_rows(banded: mx.array, n_full: int, lo: int, hi: int,
+                      group) -> mx.array:
+    """Rebuild the full ``[b, n_full, ...]`` tensor from this rank's row band.
+
+    Zero-pad the band to the full query axis and issue one ``all_sum`` on the TP
+    group: the two bands cover disjoint row ranges, so every row has exactly one
+    non-zero contributor and ``0 + x == x`` elementwise (exact for int32, including
+    the ``-1`` masked/padding sentinel). Batch (axis 0) is preserved throughout --
+    the pad is applied to axis 1 only, which is why the exchange is batch-safe.
+    """
+    full = mx.zeros((banded.shape[0], n_full, *banded.shape[2:]),
+                    dtype=banded.dtype)
+    full[:, lo:hi, :] = banded
+    return _coll.all_sum(full, group=group)
+
+
+def _finish_rows(cidx: mx.array, band, n_full: int, group) -> mx.array:
+    """``cidx`` as-is, or the full-row tensor rebuilt from this rank's band."""
+    if band is None:
+        return cidx
+    lo, hi = band
+    return _reconstruct_rows(cidx, n_full, lo, hi, group)
+
 
 
 def _row_dtype(n: int):
@@ -563,27 +630,46 @@ class Indexer(nn.Module):
         cache.index_k[:k.shape[0], g0:g0 + g] = k
 
     def __call__(self, x: mx.array, qr: mx.array, start_pos: int, offset: int,
-                 freqvec: mx.array, index_k: mx.array, shared) -> mx.array:
+                 freqvec: mx.array, index_k: mx.array, shared,
+                 *, band: tuple[int, int] | None = None, group=None) -> mx.array:
         """Score and pick top-k compressed positions for each query.
 
         x [b, n, dim] (post-attn-norm), qr [b, n, q_lora_rank],
         index_k [b, nb, head_dim] — the owner's key cache, already sliced to the
         nb = (start_pos+n)//ratio complete groups. Returns [b, n, k] int32
         indices into the concatenated window+compressed KV, -1 = masked.
+
+        ``band`` (with ``group``) engages the DSV41_INDEXER_QSPLIT query-row split:
+        this rank computes only the rows ``[lo, hi)`` of the QUERY axis and the full
+        selection is rebuilt from both ranks' bands by one padded ``all_sum``. The
+        KEY side (``index_k``) is full on every rank. ``band is None`` (the default,
+        and every decode/verify forward) keeps the replicated, byte-identical path.
         """
-        bsz, n, _ = x.shape
+        bsz, n_full, _ = x.shape
         ratio, rd = self.ratio, self.rope_head_dim
         nb = index_k.shape[1]
 
-        q = self.wq_b(qr).reshape(bsz, n, self.n_heads, self.head_dim)
-        # Query rows: exactly this forward's n positions, computed on demand.
-        q = rope_tail(q, rd, *cos_sin_at(freqvec, mx.arange(start_pos, start_pos + n)))
+        # Query-band split: slice the query axis (never batch) and shift the rope
+        # positions to the band's absolute range. With ``band is None`` these two
+        # branches collapse to the original expressions (x, qr, arange(start, start+n)).
+        if band is None:
+            xr, qrr = x, qr
+            qpos = mx.arange(start_pos, start_pos + n_full)
+        else:
+            lo, hi = band
+            xr, qrr = x[:, lo:hi, :], qr[:, lo:hi, :]
+            qpos = mx.arange(start_pos + lo, start_pos + hi)
+        n = qpos.shape[0]
+
+        q = self.wq_b(qrr).reshape(bsz, n, self.n_heads, self.head_dim)
+        # Query rows: exactly this rank's n positions, computed on demand.
+        q = rope_tail(q, rd, *cos_sin_at(freqvec, qpos))
         q = fake_quant_fp4_ue8m0(q, 32)
 
-        w = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        w = self.weights_proj(xr) * (self.softmax_scale * self.n_heads ** -0.5)
 
         # visibility: group j is visible to query i once the query passed its last token
-        lens = ((start_pos + mx.arange(n) + 1) // ratio)[:, None]      # [n, 1]
+        lens = ((qpos + 1) // ratio)[:, None]                          # [n, 1]
 
         align = self.candidate_block_size if self.is_candidate_source else 1
         tile = tiled(bsz, n, self.n_heads, nb, align)
@@ -639,7 +725,8 @@ class Indexer(nn.Module):
             if self.is_candidate_source:
                 shared.candidates = blk
             valid = mx.isfinite(v) & (i < lens.astype(mx.int32)[None])
-            return mx.where(valid, i + offset, mx.array(-1, mx.int32))
+            return _finish_rows(mx.where(valid, i + offset, mx.array(-1, mx.int32)),
+                                band, n_full, group)
 
         if tile < nb:
             # ---- tiled path: one [b, n, heads, tile] score transient at a time
@@ -661,7 +748,8 @@ class Indexer(nn.Module):
                 i = mx.take_along_axis(i, order, axis=-1)
                 v = mx.take_along_axis(v, order, axis=-1)
             valid = mx.isfinite(v) & (i < lens.astype(mx.int32)[None])
-            return mx.where(valid, i + offset, mx.array(-1, mx.int32))
+            return _finish_rows(mx.where(valid, i + offset, mx.array(-1, mx.int32)),
+                                band, n_full, group)
 
         # ---- untiled reference path ----
         with span("attn.indexer.score"):
@@ -687,4 +775,5 @@ class Indexer(nn.Module):
             idx = mx.argpartition(-scores, k - 1, axis=-1)[..., :k].astype(mx.int32)
             idx = mx.sort(idx, axis=-1)                              # position order
         visible = idx < lens.astype(mx.int32)[None]
-        return mx.where(visible, idx + offset, mx.array(-1, mx.int32))
+        return _finish_rows(mx.where(visible, idx + offset, mx.array(-1, mx.int32)),
+                            band, n_full, group)
