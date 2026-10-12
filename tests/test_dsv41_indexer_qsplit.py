@@ -25,6 +25,10 @@ What these tests pin:
    (the historical seq-split "batch-unsafe" corruption class).
 4. FLAG-OFF IDENTITY — with the gate off ``query_band`` is always ``None``, and a
    ``band=None`` forward never issues a collective (spied ``all_sum`` raising).
+5. ROUTE KEYING (D3) — with HIER=0 the tiled/untiled ROUTE keys on the FULL
+   chunk's row count, so a band takes the same path the replicated run does; on
+   its own (smaller) row count a consumer band routed UNTILED where the full run
+   was TILED and diverged (L1: untiled lacks the ``isfinite`` guard).
 
 Run (mlx-lm worktree root, off-repo copy so the outer ``tests/`` package cannot win
 the import race):
@@ -808,6 +812,116 @@ class MultiChunkAttentionTest(_GateFixture):
                 "sel_diff_rows": sel_rows, "out_equal": out_eq})
         self.assertEqual(sel_rows, [0, 0], "cidx differs on a banded chunk")
         self.assertEqual(out_eq, [True, True], "attention output differs")
+
+
+# --------------------------------------------------------------------------
+# 8. D3 — the tiled/untiled ROUTE keys on the FULL chunk's row count
+# --------------------------------------------------------------------------
+# Audit p20-idxsplit-audit2 (REPORT.md, D3): ``indexer.py`` keyed
+# ``tiled(bsz, n, ...)`` on the BAND's row count. Under DSV41_INDEXER_HIER=0 the
+# replicated run (n_full rows) takes the TILED path while a band (n rows) takes
+# UNTILED; the two paths are NOT equivalent on CONSUMER layers (L1: the untiled
+# row has no ``isfinite`` guard, so it emits a real index where tiled emits -1),
+# so the band's consumer selection diverged from the replicated run's (audit:
+# 5/84 shapes; prod h=64, b=1, n=78, nb in [6670, 13339]). The audit's verified
+# control -- ``tiled(bsz, n_full, ...)`` -- is the fix (0/84). This test pins it
+# on the production tile geometry and is RED if line 716 is reverted to
+# ``tiled(bsz, n, ...)``.
+def _prod_args(**over: Any) -> ModelArgs:
+    base: dict[str, Any] = dict(
+        dim=4096, n_layers=2, n_heads=4, head_dim=512, rope_head_dim=64,
+        q_lora_rank=1024, o_lora_rank=32, o_groups=4, window_size=128,
+        compress_ratios=(4, 4), kv_source_layers=(0,), index_source_layers=(0,),
+        index_n_heads=64, index_head_dim=128, index_topk=512, max_seq_len=1 << 16,
+        candidate_source_layer=0, candidate_topk_blocks=64, candidate_block_size=8)
+    base.update(over)
+    return ModelArgs(**base)
+
+
+def _prod_indexer(args: ModelArgs, layer_id: int, seed: int) -> IX.Indexer:
+    mx.random.seed(seed)
+    idx = IX.Indexer(args, layer_id)
+    idx.set_dtype(mx.bfloat16)
+    mx.eval(idx.parameters())
+    return idx
+
+
+def _banded_pair(src, cons, x, qr, sp, fv, ik, *, offset: int):
+    """(recon src, recon cons, full src, full cons) for a source->consumer pair.
+
+    Replicated first (a ``band=None`` forward must touch no collective -- the
+    spied ``all_sum`` raises); then each rank runs the source (publishing that
+    band's candidate mask into one ``SharedState``) followed by the consumer on
+    the SAME state, mirroring the real forward order and the audit harness. The
+    spied collective is an identity, so ``p0 + p1`` IS the two-rank reconstruction.
+    """
+    n = x.shape[1]
+    real = IX._coll.all_sum
+
+    def boom(*_a, **_k):                                  # noqa: ANN002, ANN003
+        raise AssertionError("band=None must never issue a collective")
+
+    IX._coll.all_sum = boom
+    try:
+        sh = SharedState()
+        full = np.array(src(x, qr, sp, offset, fv, ik, sh))
+        fcons = np.array(cons(x, qr, sp, offset, fv, ik, sh))
+        mx.eval(full, fcons)
+    finally:
+        IX._coll.all_sum = real
+
+    IX._coll.all_sum = lambda t, group=None: t             # noqa: ARG005
+    try:
+        recon = np.zeros_like(full)
+        rcons = np.zeros_like(fcons)
+        for r in range(2):
+            lo, hi = r * (n // 2), (r + 1) * (n // 2)
+            sh = SharedState()
+            recon += np.array(src(x, qr, sp, offset, fv, ik, sh,
+                                  band=(lo, hi), group=FakeGroup(r)))
+            rcons += np.array(cons(x, qr, sp, offset, fv, ik, sh,
+                                   band=(lo, hi), group=FakeGroup(r)))
+    finally:
+        IX._coll.all_sum = real
+    return recon, rcons, full, fcons
+
+
+class D3TiledRouteTest(_GateFixture):
+    """D3: HIER=0 on the production tile geometry -- the FULL run is TILED
+    (``tile`` 512 < nb) while the band's own row count would route it UNTILED, and
+    the consumer band diverged (audit probe: 134 of 156 consumer rows). Post-fix
+    the band takes the replicated run's route and the reconstruction is byte-equal.
+    Plain (row-count-invariant) projections: the divergence is the ROUTE, not the
+    GEMM (the projection class is covered separately by the EXL3 tests above)."""
+
+    def test_band_route_keys_on_full_chunk(self) -> None:
+        IX._QSPLIT = True
+        IX._HIER = False
+        IX._TILE, IX._TILE_MIN_NB, IX._TILE_FORCE = 512, 0, False   # production
+        seed, b, n, sp = 0, 2, 78, 16384
+        nb = (sp + n) // 4                                          # 4115
+        args = _prod_args()
+        src = _prod_indexer(args, 0, seed)
+        cons = _prod_indexer(args, 1, seed + 77)
+        x, qr, _sp, fv, ik = _inputs(np.random.default_rng(seed), args,
+                                     b=b, n=n, nb=nb, sp=sp)
+        # (a) the geometry really is in the D3 window (fails loudly, not silently,
+        # if the tile constants ever move): replicated TILED, band-only UNTILED.
+        align = args.candidate_block_size                           # source
+        self.assertLess(IX.tiled(b, n, args.index_n_heads, nb, align), nb,
+                        "replicated run must be TILED here (D3 window)")
+        self.assertGreaterEqual(IX.tiled(b, n // 2, args.index_n_heads, nb, align), nb,
+                                "band-only routing must be UNTILED here (D3 window)")
+        # (b) the band reproduces the replicated run, SOURCE and CONSUMER.
+        recon, rcons, full, fcons = _banded_pair(src, cons, x, qr, sp, fv, ik,
+                                                 offset=args.window_size + n)
+        src_rows = int((recon != full).any(-1).sum())
+        cons_rows = int((rcons != fcons).any(-1).sum())
+        record({"case": "d3_tiled_route", "hier": False, "n": n, "start_pos": sp,
+                "nb": nb, "src_diff_rows": src_rows, "cons_diff_rows": cons_rows})
+        self.assertEqual(src_rows, 0, "source band != replicated")
+        self.assertEqual(cons_rows, 0, "consumer band took a different route than the "
+                                       "replicated run (D3: route must key on n_full)")
 
 
 if __name__ == "__main__":

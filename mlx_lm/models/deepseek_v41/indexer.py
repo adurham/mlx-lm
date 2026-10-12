@@ -713,7 +713,17 @@ class Indexer(nn.Module):
         lens = ((qpos + 1) // ratio)[:, None]                          # [n, 1]
 
         align = self.candidate_block_size if self.is_candidate_source else 1
-        tile = tiled(bsz, n, self.n_heads, nb, align)
+        # D3 (audit p20-idxsplit-audit2, REPORT.md): key the tiled/untiled ROUTE on
+        # the FULL chunk's row count, not the band's. The replicated run routes on
+        # ``n_full``; routing a band on its own smaller ``n`` let it take a
+        # different path (UNTILED vs TILED) than the run it must reproduce. The two
+        # paths differ on CONSUMER layers (L1: untiled has no ``isfinite`` guard), so
+        # at HIER=0 the band's consumer selection diverged (audit: 5/84 shapes; prod
+        # n=78, start_pos~26.6K-53K). ``n_full`` gives the band the identical
+        # route/geometry; ``band is None`` is unchanged, and this line is never the
+        # one consumed under HIER=1 (the hier branch above returns first for
+        # ``n > _FENCE_MIN_ROWS``), so the production path is untouched.
+        tile = tiled(bsz, n_full, self.n_heads, nb, align)
 
         if _HIER and n > _FENCE_MIN_ROWS:
             # ---- hierarchical / streamed exact pass (M2), env-gated -----------
