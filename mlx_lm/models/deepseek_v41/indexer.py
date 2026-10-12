@@ -672,24 +672,42 @@ class Indexer(nn.Module):
         ratio, rd = self.ratio, self.rope_head_dim
         nb = index_k.shape[1]
 
+        # The two query projections ALWAYS run on the full chunk (M = n_full rows),
+        # banded or not. Neither GEMM is row-count invariant: ``wq_b`` is an
+        # EXL3Linear whose kernel is chosen by the row count (exl3_linear.py:
+        # <=16 fused simd GEMM, <=FUSED_GEMM_ROW_LIMIT=64 fused trellis GEMM,
+        # else decode_full + native matmul), and MLX's native bf16 matmul
+        # (``weights_proj``, 4096x64) picks an M-dependent kernel too. Projecting
+        # only the band's rows therefore produced a DIFFERENT q / w for the same
+        # row than the replicated run (n=78 -> band 39 crosses the 64-row EXL3
+        # crossover: 2027 differing q elements; n=2048 -> band 1024: 41 differing
+        # weights_proj rows), the fp4 fake-quant amplified it, and the k=512
+        # boundary flipped -- the identity_3 live divergence (postmortem
+        # 2026-10-11). Slicing AFTER the projections makes every band row bitwise
+        # the replicated run's row: everything downstream (rope, fp4 quant, the
+        # score, the top-k) is row-local. Cost: the band re-runs the two small
+        # projections on the other rank's rows (~2*n*1024*8192 + 2*n*4096*64
+        # FLOPs) -- the n*nb*heads*d score pass, the part the split exists to
+        # halve, stays at half the rows.
+        q_full = self.wq_b(qr)
+        w_full = self.weights_proj(x)
         # Query-band split: slice the query axis (never batch) and shift the rope
         # positions to the band's absolute range. With ``band is None`` these two
-        # branches collapse to the original expressions (x, qr, arange(start, start+n)).
+        # branches collapse to the original expressions (arange(start, start+n)).
         if band is None:
-            xr, qrr = x, qr
             qpos = mx.arange(start_pos, start_pos + n_full)
         else:
             lo, hi = band
-            xr, qrr = x[:, lo:hi, :], qr[:, lo:hi, :]
+            q_full, w_full = q_full[:, lo:hi, :], w_full[:, lo:hi, :]
             qpos = mx.arange(start_pos + lo, start_pos + hi)
         n = qpos.shape[0]
 
-        q = self.wq_b(qrr).reshape(bsz, n, self.n_heads, self.head_dim)
+        q = q_full.reshape(bsz, n, self.n_heads, self.head_dim)
         # Query rows: exactly this rank's n positions, computed on demand.
         q = rope_tail(q, rd, *cos_sin_at(freqvec, qpos))
         q = fake_quant_fp4_ue8m0(q, 32)
 
-        w = self.weights_proj(xr) * (self.softmax_scale * self.n_heads ** -0.5)
+        w = w_full * (self.softmax_scale * self.n_heads ** -0.5)
 
         # visibility: group j is visible to query i once the query passed its last token
         lens = ((qpos + 1) // ratio)[:, None]                          # [n, 1]

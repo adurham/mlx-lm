@@ -516,5 +516,299 @@ class AttentionCallSiteTest(_GateFixture):
         record({"case": "t3_attention_bands", "band": list(seen[0]["band"])})
 
 
+# --------------------------------------------------------------------------
+# 7. live-A/B remediation — banded NON-FIRST chunks, row-count-dependent GEMMs
+# --------------------------------------------------------------------------
+# Live gate (postmortem 2026-10-11): prompt identity_3 = 2 prefill chunks (2048 +
+# 78); only chunk 2 (even n=78 -> bands of 39) engaged the band, and the output
+# diverged at token 4. Root cause: the band ran the indexer's two QUERY
+# projections (``wq_b``, ``weights_proj``) on ITS rows only. Neither GEMM is
+# row-count invariant -- production ``wq_b`` is an EXL3Linear whose kernel is
+# picked by the row count (fused trellis GEMM for rows <= 64, decode_full +
+# native matmul above), and MLX's bf16 matmul is M-dependent as well -- so a
+# band row's q/w differed from the replicated run's, and the k-th boundary
+# flipped. The suite missed it because nn.Linear fp32 at n=64 is M-invariant.
+class _RowCountSensitive:
+    """Projection whose output depends on the CALL's row count (like EXL3's
+    rows<=64 vs rows>64 kernel switch, or an M-dependent GEMM): ``lin(x) +
+    noise * rows``. Deterministic, and guaranteed to differ between a band call
+    (n/2 rows) and the full call (n rows) -- so a band that projects only its own
+    rows CANNOT reproduce the replicated selection."""
+
+    def __init__(self, lin, seed: int):
+        self._lin = lin
+        rng = np.random.default_rng(seed)
+        self._noise = mx.array(rng.standard_normal(lin.weight.shape[0])
+                               .astype(np.float32) * 2e-3)
+        self.rows_seen: list[int] = []
+
+    def __call__(self, x: mx.array) -> mx.array:
+        rows = x.size // x.shape[-1]
+        self.rows_seen.append(rows)
+        return self._lin(x) + self._noise * float(rows)
+
+
+def _synth_exl3(inf: int, outf: int, seed: int, k: int = 3):
+    """Synthetic EXL3 layer (unique runtime-cache key per shape+seed)."""
+    from mlx_lm.models.exl3.ref.layer import EXL3Layer
+    rng = np.random.default_rng(seed)
+    return EXL3Layer(
+        key=f"qsplit-test-{seed}-{inf}x{outf}", in_features=inf, out_features=outf,
+        k=k, trellis=rng.integers(0, 2 ** 16, size=(inf // 16, outf // 16, 256 * k // 16),
+                                  dtype=np.uint16),
+        suh=rng.choice(np.array([-1.0, 1.0], np.float16), size=inf),
+        svh=rng.choice(np.array([-1.0, 1.0], np.float16), size=outf), mul1=True)
+
+
+def _band_vs_full(idx, x, qr, sp, fv, ik, *, offset: int):
+    """(reconstructed two-rank cidx, replicated cidx) for an even chunk."""
+    n = x.shape[1]
+    full, _ = _run_full(idx, x, qr, sp, fv, ik, offset=offset)
+    _o0, p0, _ = _run_banded(idx, x, qr, sp, fv, ik, band=(0, n // 2),
+                             group=FakeGroup(0), offset=offset)
+    _o1, p1, _ = _run_banded(idx, x, qr, sp, fv, ik, band=(n // 2, n),
+                             group=FakeGroup(1), offset=offset)
+    return p0 + p1, full
+
+
+class NonFirstChunkBandTest(_GateFixture):
+    """Banded NON-FIRST chunks: nonzero chunk base, even/odd band boundaries,
+    row-count-dependent projections. Each case compares the two-rank
+    reconstruction to the replicated run byte-for-byte."""
+
+    def _case(self, *, hier: bool, n: int, sp: int, nb: int, seed: int,
+              proj: str, source: bool = True) -> None:
+        IX._QSPLIT = True
+        IX._HIER = hier
+        IX._TILE, IX._TILE_MIN_NB, IX._TILE_FORCE = 8, 0, not hier
+        args = _args(candidate_source_layer=(0 if source else -1), index_topk=6)
+        idx = _indexer(args, 0)
+        if proj in ("wq_b", "both"):
+            setattr(idx, "wq_b", _RowCountSensitive(idx.wq_b, seed))
+        if proj in ("weights_proj", "both"):
+            setattr(idx, "weights_proj", _RowCountSensitive(idx.weights_proj, seed + 1))
+        rng = np.random.default_rng(seed)
+        x, qr, _sp, fv, ik = _inputs(rng, args, n=n, nb=nb)
+        offset = args.window_size + n                    # concat-space, like attention
+        recon, full = _band_vs_full(idx, x, qr, sp, fv, ik, offset=offset)
+        rows = int((recon != full).any(-1).sum())
+        record({"case": "nonfirst_chunk", "hier": hier, "n": n, "start_pos": sp,
+                "nb": nb, "proj": proj, "diff_rows": rows})
+        self.assertEqual(rows, 0, f"{rows} band rows != replicated (proj={proj}, "
+                                  f"hier={hier}, n={n}, start_pos={sp})")
+
+    # identity_3's chunk-2 geometry, scaled: even n=78 -> bands of 39 (odd)
+    def test_chunk2_n78_rowcount_wq_b_hier(self) -> None:
+        self._case(hier=True, n=78, sp=2048, nb=(2048 + 78) // 2 // 8, seed=41,
+                   proj="wq_b")
+
+    def test_chunk2_n78_rowcount_wq_b_tiled(self) -> None:
+        self._case(hier=False, n=78, sp=2048, nb=(2048 + 78) // 2 // 8, seed=42,
+                   proj="wq_b")
+
+    def test_chunk2_n78_rowcount_weights_proj_hier(self) -> None:
+        self._case(hier=True, n=78, sp=2048, nb=(2048 + 78) // 2 // 8, seed=43,
+                   proj="weights_proj")
+
+    def test_chunk2_n78_rowcount_weights_proj_tiled(self) -> None:
+        self._case(hier=False, n=78, sp=2048, nb=(2048 + 78) // 2 // 8, seed=44,
+                   proj="weights_proj")
+
+    def test_even_band_rows_n80(self) -> None:
+        # band rows 40 (even) -- the other parity of the band boundary
+        self._case(hier=True, n=80, sp=512, nb=150, seed=45, proj="both")
+
+    def test_plain_role_nonfirst(self) -> None:
+        self._case(hier=True, n=78, sp=1024, nb=270, seed=46, proj="both",
+                   source=False)
+
+    def test_band_boundaries_even_odd(self) -> None:
+        """The live table's chunk-2 sizes: 3 / 129 (odd) stay replicated; 78
+        bands at 39 (odd band rows); 2048 at 1024; 80 at 40 (even band rows)."""
+        IX._QSPLIT = True
+        for n in (3, 129, 79):
+            self.assertIsNone(IX.query_band(n, FakeGroup(0)), f"n={n}")
+        for n, h in ((78, 39), (80, 40), (2048, 1024), (34, 17)):
+            self.assertEqual(IX.query_band(n, FakeGroup(0)), (0, h))
+            self.assertEqual(IX.query_band(n, FakeGroup(1)), (h, n))
+        record({"case": "band_boundaries_even_odd"})
+
+    def test_projections_see_the_full_chunk(self) -> None:
+        """Structural: a banded call projects ALL n_full rows (then slices), so
+        each band row is bitwise the replicated run's row whatever kernel the
+        row count selects."""
+        IX._QSPLIT = True
+        IX._HIER = True
+        args = _args()
+        idx = _indexer(args, 0)
+        wq = _RowCountSensitive(idx.wq_b, 1)
+        wp = _RowCountSensitive(idx.weights_proj, 2)
+        setattr(idx, "wq_b", wq)
+        setattr(idx, "weights_proj", wp)
+        x, qr, sp, fv, ik = _inputs(np.random.default_rng(5), args, n=78, nb=120)
+        _run_banded(idx, x, qr, 2048, fv, ik, band=(39, 78), group=FakeGroup(1))
+        self.assertEqual(wq.rows_seen, [78])
+        self.assertEqual(wp.rows_seen, [78])
+        record({"case": "projections_full_rows", "wq_b": wq.rows_seen,
+                "weights_proj": wp.rows_seen})
+
+
+class MarginZeroTieTest(_GateFixture):
+    """Margin-0 ties AT the k=512 boundary: a third of the key columns are one
+    duplicated key, so many rows' 512th/513th scores are bitwise equal and the
+    pick is argpartition's tie rule. Band rows are bitwise the replicated rows
+    (same q, w, keys, same top-k op on the same row shape [nb]), so the tie
+    break is applied to identical inputs and must agree exactly. Control: green
+    pre- and post-fix on nn.Linear (row-count invariant); the RED proof is
+    the row-count-sensitive variant below."""
+
+    def _tie_case(self, *, hier: bool, rowcount: bool, seed: int) -> None:
+        IX._QSPLIT = True
+        IX._HIER = hier
+        IX._TILE, IX._TILE_MIN_NB, IX._TILE_FORCE = 512, 0, False
+        # no candidate pre-filter: the k=512 boundary must sit inside the tie class
+        args = _args(compress_ratios=(4, 4), index_topk=512, index_n_heads=4,
+                     max_seq_len=1 << 14, candidate_source_layer=-1)
+        idx = _indexer(args, 0)
+        if rowcount:
+            setattr(idx, "wq_b", _RowCountSensitive(idx.wq_b, seed))
+        rng = np.random.default_rng(seed)
+        n, sp = 78, 2048
+        nb = (sp + n) // 4                                     # 531 > k=512
+        x, qr, _sp, fv, _ik = _inputs(rng, args, n=n, nb=nb)
+        keys = rng.standard_normal((nb, args.index_head_dim)).astype(np.float32)
+        dup = rng.choice(nb, size=nb // 3, replace=False)
+        keys[dup] = keys[dup[0]]
+        ik = mx.array(keys[None])
+        recon, full = _band_vs_full(idx, x, qr, sp, fv, ik, offset=8 + n)
+        rows = int((recon != full).any(-1).sum())
+        record({"case": "margin0_ties_k512", "hier": hier, "rowcount": rowcount,
+                "diff_rows": rows})
+        self.assertEqual(rows, 0)
+
+    def test_ties_hier(self) -> None:
+        self._tie_case(hier=True, rowcount=False, seed=51)
+
+    def test_ties_untiled(self) -> None:
+        self._tie_case(hier=False, rowcount=False, seed=52)
+
+    def test_ties_rowcount_sensitive(self) -> None:
+        self._tie_case(hier=True, rowcount=True, seed=53)
+
+
+class ProductionExl3ChunkTwoTest(_GateFixture):
+    """The deterministic OFFLINE repro of identity_3's class at production
+    indexer geometry: q_lora 1024 -> EXL3 ``wq_b`` 8192 (64 heads x 128), bf16
+    ``weights_proj`` 4096 -> 64, k=512, ratio 4, chunk 2 at start_pos=2048 with
+    n=78 (bands of 39 rows: the fused-trellis-GEMM side of
+    ``EXL3_FUSED_ROW_LIMIT=64``; the full 78 rows take decode_full + matmul).
+    Pre-fix: seed 4 diverges at row 38 (1 swapped slot; 8/32 seeds diverge).
+    Post-fix: identical."""
+
+    def test_identity3_shape_real_exl3(self) -> None:
+        from mlx_lm.models.deepseek_v41.exl3_build import Exl3Proj
+        from mlx_lm.models.exl3 import EXL3Linear
+        IX._QSPLIT = True
+        IX._HIER = True
+        seed = 4
+        a = ModelArgs(dim=4096, n_layers=1, n_heads=4, head_dim=512, rope_head_dim=64,
+                      q_lora_rank=1024, o_lora_rank=32, o_groups=4, window_size=128,
+                      compress_ratios=(4,), kv_source_layers=(0,),
+                      index_source_layers=(0,), index_n_heads=64, index_head_dim=128,
+                      index_topk=512, max_seq_len=8192, candidate_source_layer=0,
+                      candidate_topk_blocks=64, candidate_block_size=8)
+        mx.random.seed(seed)
+        idx = IX.Indexer(a, 0)
+        idx.set_dtype(mx.bfloat16)
+        setattr(idx, "wq_b", Exl3Proj(EXL3Linear(_synth_exl3(1024, 8192, seed))))
+        mx.eval(idx.parameters())
+        rng = np.random.default_rng(seed)
+        n, sp = 78, 2048
+        nb = (sp + n) // 4
+        x = mx.array(rng.standard_normal((1, n, a.dim)).astype(np.float32)).astype(mx.bfloat16)
+        qr = mx.array(rng.standard_normal((1, n, a.q_lora_rank)).astype(np.float32)
+                      ).astype(mx.bfloat16)
+        ik = IX.fake_quant_fp4_ue8m0(
+            mx.array(rng.standard_normal((1, nb, a.index_head_dim)).astype(np.float32) * 0.5),
+            32).astype(mx.bfloat16)
+        fv = mx.array(np.linspace(1.0, 1e-4, a.rope_head_dim // 2).astype(np.float32))
+        recon, full = _band_vs_full(idx, x, qr, sp, fv, ik, offset=128 + n)
+        rows = [int(r) for r in np.nonzero((recon != full).any(-1))[1]]
+        record({"case": "identity3_real_exl3", "diff_rows": rows})
+        self.assertEqual(rows, [], f"band != replicated at rows {rows}")
+
+
+class MultiChunkAttentionTest(_GateFixture):
+    """Multi-chunk prompt through the real ``Attention.__call__`` (window +
+    compressed KV + indexer + sparse_attn), flag ON with a simulated 2-rank cidx
+    exchange vs flag OFF: the chunk outputs (the DOWNSTREAM effect, not only the
+    selection) must be bitwise equal on every chunk, including the non-first
+    banded chunk. The indexer's ``wq_b`` is row-count sensitive (the production
+    EXL3 property)."""
+
+    def test_two_chunk_prompt_outputs_identical(self) -> None:
+        from mlx_lm.models.deepseek_v41.attention import Attention
+        from mlx_lm.models.deepseek_v41.cache import ModelCache
+        IX._HIER = True
+        args = _args(n_layers=1, max_seq_len=256)
+        chunks = (40, 78)                                 # bands 20 then 39
+        mx.random.seed(9)
+        xs = [mx.random.normal((1, c, args.dim)) * 0.5 for c in chunks]
+
+        def prompt(flag: bool):
+            IX._QSPLIT = flag
+            mx.random.seed(0)
+            att = Attention(0, args)
+            mx.eval(att.parameters())
+            setattr(att.indexer, "wq_b", _RowCountSensitive(att.indexer.wq_b, 61))
+            setattr(att, "group", FakeGroup(0))
+            cache = ModelCache(args, 1, 256)
+            cache.ensure_capacity(sum(chunks))
+            idx_cls = type(att.indexer)
+            orig = idx_cls.__call__
+            bands: list[tuple[int, int]] = []
+
+            def two_rank(self_ix, x, qr, sp, off, fv, ik, shared, **kw):
+                # simulate both ranks' bands + the padded all_sum in-process
+                if kw.get("band") is None:
+                    return orig(self_ix, x, qr, sp, off, fv, ik, shared, **kw)
+                nf = x.shape[1]
+                bands.append(kw["band"])
+                pads = []
+                for r, b in enumerate(((0, nf // 2), (nf // 2, nf))):
+                    pads.append(orig(self_ix, x, qr, sp, off, fv, ik, shared,
+                                     band=b, group=FakeGroup(r)))
+                return pads[0] + pads[1]
+
+            real_sum = IX._coll.all_sum
+            setattr(idx_cls, "__call__", two_rank)
+            IX._coll.all_sum = lambda t, group=None: t     # noqa: ARG005
+            outs, sels = [], []
+            try:
+                sp = 0
+                for x in xs:
+                    shared = SharedState()
+                    o = att(x, sp, cache, shared)
+                    mx.eval(o, shared.topk_idxs)
+                    outs.append(np.array(o))
+                    sels.append(np.array(shared.topk_idxs))
+                    sp += x.shape[1]
+            finally:
+                setattr(idx_cls, "__call__", orig)
+                IX._coll.all_sum = real_sum
+            return outs, sels, bands
+
+        off_o, off_s, off_b = prompt(False)
+        on_o, on_s, on_b = prompt(True)
+        self.assertEqual(off_b, [])
+        self.assertEqual(on_b, [(0, 20), (0, 39)], "both chunks must band")
+        sel_rows = [int((a != b).any(-1).sum()) for a, b in zip(on_s, off_s)]
+        out_eq = [bool(np.array_equal(a, b)) for a, b in zip(on_o, off_o)]
+        record({"case": "two_chunk_attention", "chunks": list(chunks),
+                "sel_diff_rows": sel_rows, "out_equal": out_eq})
+        self.assertEqual(sel_rows, [0, 0], "cidx differs on a banded chunk")
+        self.assertEqual(out_eq, [True, True], "attention output differs")
+
+
 if __name__ == "__main__":
     unittest.main()
