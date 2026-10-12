@@ -43,10 +43,14 @@ call at nb=16384). ``DSV41_INDEXER_TILED_IMPL=merge`` restores the previous
 per-tile running merge (:func:`_tiled_scores_merge`), kept for A/B and rollback.
 
 Exactness. Score elements come from the same expressions on the same data, and
-the per-tile score is bitwise equal to the untiled path at every production
-width (``pB_indexer_test.py parity``), including under the per-shape compiled
-score body (``DSV41_INDEXER_COMPILE``, default on, per-shape key so a width
-change cannot silently mismatch). With one global exact top-k over those values,
+the per-tile score is bitwise equal to the untiled path at the widths
+``pB_indexer_test.py parity`` exercises -- NOT universally: MLX picks the GEMM
+kernel by shape, and idxprof5 measured 2-5 fp32 row elements (|d| <= 1.5e-8)
+differing across widths at some deep shapes (incl. 512 vs untiled at nb=1M).
+Each width is deterministic run-to-run and rank-identical, also under the
+per-shape compiled score body (``DSV41_INDEXER_COMPILE``, default on, per-shape
+key so a width change cannot silently mismatch). With one global exact top-k
+over those values,
 the selected *value* multiset equals the untiled top-k; selected *indices* can
 differ only where equal scores straddle the k-th boundary (argpartition's tie
 pick is implementation-defined, the same class round 1 documented). Measured 0
@@ -113,6 +117,15 @@ _COMPILED_BODIES: dict = {}
 # fp32 regardless (see _tiled_scores_buffer).
 _ROW_DTYPE = (mx.float32 if os.environ.get("DSV41_INDEXER_ROW_BF16", "1") == "0"
               else mx.bfloat16)
+# Small-n wide tile (R-B, idxprof5/6). For forwards with n <= _FENCE_MIN_ROWS
+# (decode / verify; n is the FULL chunk's rows, D3) that exceed the budget,
+# tile_width() returns the aligned budget cap instead of min(_TILE, cap): same
+# tiled branch, same budget, same row dtype and top-k, but 2-4 host fences per
+# call instead of ceil(nb/512) (~100 ms per verify-round call at 300K live).
+# Deterministic and rank-identical; NOT bit-identical to the 512-wide row (ulp
+# diffs in a few elements; index sets identical in every offline case).
+# "0" restores the previous min(_TILE, cap) rule byte-for-byte. Read at import.
+_SMALLN_WIDE_TILE = os.environ.get("DSV41_INDEXER_SMALLN_WIDE_TILE", "1") == "1"
 
 # --- L2-full: small-n full-width fp32 row (lever-2 ship design) --------------
 # WHY. The row-count guard (`n > _FENCE_MIN_ROWS`) sends decode (n=1) and verify
@@ -337,6 +350,13 @@ def tile_width(bsz: int, n: int, n_heads: int, nb: int, align: int) -> int:
 
     ``align`` keeps tiles block-aligned for the candidate path's block merge.
     This is the raw width; use :func:`tiled` for the routing decision.
+
+    Large n: ``min(_TILE, cap)`` aligned. Small n (``n <= _FENCE_MIN_ROWS``,
+    ``n`` = the full chunk's rows, D3) with ``DSV41_INDEXER_SMALLN_WIDE_TILE``
+    on (default): the aligned budget ``cap`` itself (R-B), so a tiled small-n
+    call runs a few budget-sized tiles instead of ceil(nb/512) fenced ones.
+    A pure function of (bsz, n, n_heads, nb, align, env): static and
+    identical on every rank.
     """
     if _TILE <= 0:
         return nb
@@ -345,7 +365,16 @@ def tile_width(bsz: int, n: int, n_heads: int, nb: int, align: int) -> int:
     # bsz*n*n_heads*tile elements of fp32 (the head-sum accumulation stays fp32).
     row_size = _row_dtype(n).size
     cap = max(align, _TILE_BUDGET // max(1, bsz * n * (n_heads * 4 + row_size)))
-    t = max(align, (min(_TILE, cap) // align) * align)
+    if _SMALLN_WIDE_TILE and n <= _FENCE_MIN_ROWS and not _TILE_FORCE:
+        # R-B (idxprof5): at small n a _TILE-wide tile is ~10 us of GPU work
+        # behind a ~135 us blocking host fence, so the loop is fence-bound
+        # (8-50x slower than untiled). Use the whole aligned budget cap: still
+        # one budget-sized transient per tile, but only ceil(nb/cap) fences.
+        # (Not under the _TILE_FORCE test hook, whose contract is "tiled at
+        # _TILE for any nb > one tile": a cap >= nb would silently un-tile it.)
+        t = max(align, (cap // align) * align)
+    else:
+        t = max(align, (min(_TILE, cap) // align) * align)
     return min(nb, t)
 
 
@@ -360,6 +389,10 @@ def tiled(bsz: int, n: int, n_heads: int, nb: int, align: int = 1) -> int:
       ``DSV41_INDEXER_TILE_MB`` (default 128 MB) — so *decode* (n=1) stays on
       the fast path even at 100K context, where the transient is only a few MB
       and a tile loop would add ``nb/tile`` graph synchronizations per step.
+
+    The decision itself is independent of ``DSV41_INDEXER_SMALLN_WIDE_TILE``:
+    that switch changes only the WIDTH a tiled small-n call uses
+    (:func:`tile_width`), never whether it is tiled.
     """
     tile = tile_width(bsz, n, n_heads, nb, align)
     if nb < _TILE_MIN_NB or tile >= nb:
