@@ -84,7 +84,7 @@ def arm(name, mode):
             mx.eval(mx.zeros((1,), dtype=mx.uint8))
         else:                        # warmstep: full throwaway decode + rollback
             pos = int(cache.offset)
-            sn = SP.snap(cache, pos)
+            sn = SP.snap(cache, pos, 1)   # the warm step writes a single row
             nxt0 = am.reshape(-1)[-1:].astype(mx.int32)
             _, _, _ = step(cache, nxt0)
             SP.rollback(cache, sn, pos, SP.stashes(cache))

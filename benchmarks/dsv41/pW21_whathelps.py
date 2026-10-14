@@ -145,14 +145,14 @@ cache = fresh_cache()
 am = PF.prefill(model, ids, cache, last_logit_only=True, argmax=True, final_clear=False)
 mx.eval(am)
 pos = int(cache.offset)
-sn = SP.snap(cache, pos)
+sn = SP.snap(cache, pos, 1)          # a single-token step writes one row
 nxt = am.reshape(-1)[-1:].astype(mx.int32)
 b0, e0, nb0, _ = step(cache, nxt)
 st = SP.stashes(cache)
 SP.rollback(cache, sn, pos, st)
 b1, e1, nb1, _ = step(cache, nxt)
 # repeat once more to see if it keeps getting cheaper
-sn2 = SP.snap(cache, pos)
+sn2 = SP.snap(cache, pos, 1)         # a single-token step writes one row
 b2, e2, nb2, _ = step(cache, nxt)
 print(f"[pW21] E step0-twice at ctx={pos}: first {b0:.1f}+{e0:.2f} nb{nb0}  "
       f"repeat {b1:.1f}+{e1:.2f} nb{nb1}  repeat2 {b2:.1f}+{e2:.2f} nb{nb2}", flush=True)

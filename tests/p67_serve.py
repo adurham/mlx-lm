@@ -568,7 +568,11 @@ class Events:
             if e[0] == "call":
                 off, rows, kw = e[1], e[2], (e[3] if len(e) > 3 else {})
                 assert c.offset == off, f"replay order: {off} != {c.offset}"
-                sn = SP.snap(c, off)
+                # snapshot span = the replayed chunk width. The forward below
+                # writes exactly len(rows) rows at off; spec.snap sizes its ring
+                # copy from verify_rows and spec.rollback refuses a snapshot that
+                # does not cover the write, so this is both required and exact.
+                sn = SP.snap(c, off, len(rows))
                 # replay the SAME kwargs: last_logit_only/argmax change the head
                 # path, and for a 4-row verify batch last_logit_only=True would
                 # hand back one row instead of four
