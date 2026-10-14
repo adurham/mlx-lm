@@ -309,3 +309,120 @@ def test_window_write_slots_matches_the_write_it_describes():
         for k in range(max(0, n - w), n):
             assert after[0, (pos + k) % w, 0] == 5.0
         lc.win_kv = mx.zeros_like(lc.win_kv)
+
+
+# -------------------------------------------------------------------------
+# Gate 1: the TP=2 rank-consistency hash on the rollback path
+# (``EXO_DSV41_SPEC_ROLLBACK_HASH``). Default OFF; when ON every rejected
+# rollback prints one line so the two ranks' logs can be diffed.
+# -------------------------------------------------------------------------
+
+_TAG = "[DSV41-RB-HASH] "
+
+
+def _hash_lines(capsys) -> list[str]:
+    return [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(_TAG)]
+
+
+def _fields(line: str) -> dict:
+    return dict(tok.split("=", 1) for tok in line[len(_TAG):].split(" "))
+
+
+def _arm(monkeypatch) -> None:
+    monkeypatch.setenv(spec._ROLLBACK_HASH_ENV, "1")
+    spec._reset_rollback_hash_gate()
+
+
+def test_rank_hash_gate_defaults_off_and_parses_env(monkeypatch):
+    """The hook must be OFF unless explicitly armed, and honour the usual
+    falsy spellings; anything else arms it."""
+    monkeypatch.delenv(spec._ROLLBACK_HASH_ENV, raising=False)
+    spec._reset_rollback_hash_gate()
+    assert spec.rollback_hash_enabled() is False
+    for v in ("0", "false", "off", "no", ""):
+        monkeypatch.setenv(spec._ROLLBACK_HASH_ENV, v)
+        spec._reset_rollback_hash_gate()
+        assert spec.rollback_hash_enabled() is False, v
+    for v in ("1", "true", "yes", "on"):
+        monkeypatch.setenv(spec._ROLLBACK_HASH_ENV, v)
+        spec._reset_rollback_hash_gate()
+        assert spec.rollback_hash_enabled() is True, v
+    spec._reset_rollback_hash_gate()
+
+
+@pytest.mark.parametrize("window", WINDOWS)
+def test_rank_hash_off_logs_nothing(monkeypatch, capsys, window):
+    """Default OFF: a rejected round emits no line (zero-cost path)."""
+    monkeypatch.delenv(spec._ROLLBACK_HASH_ENV, raising=False)
+    spec._reset_rollback_hash_gate()
+    args, x = _args(window), _filler(window)
+    _spec_round(args, x, 100, gamma=GAMMA, acc=1, next_rows=1)
+    assert _hash_lines(capsys) == []
+
+
+@pytest.mark.parametrize("window", WINDOWS)
+@pytest.mark.parametrize("acc", [0, 1, 2])
+def test_rank_hash_identical_across_two_ranks(monkeypatch, capsys, window, acc):
+    """THE cross-rank property this gate exists for: two independent caches (the
+    two TP ranks) run the SAME round (same ``start``/``target``/``rows``) with
+    DIFFERENT rejected-draft content. The restored-subset digest -- ring slots
+    AND compressed rows -- must be byte-identical, because the rollback restores
+    exactly the pre-verify bytes on every rank. ``acc == 0`` is a full reject."""
+    _arm(monkeypatch)
+    args, x = _args(window), _filler(window)
+    _spec_round(args, x, 100, gamma=GAMMA, acc=acc, next_rows=1)
+    a = _fields(_hash_lines(capsys)[0])
+    _spec_round(args, x, 200, gamma=GAMMA, acc=acc, next_rows=1)
+    b = _fields(_hash_lines(capsys)[0])
+    assert a["start"] == b["start"] and a["target"] == b["target"]
+    assert a["rows"] == str(GAMMA + 1)          # snap covers the whole verify
+    assert a["rejected"] == str(GAMMA - acc)    # rows the rollback must undo
+    assert a["ring"] == b["ring"], (a["ring"], b["ring"])
+    assert a["latents"] == b["latents"], (a["latents"], b["latents"])
+    assert a["combined"] == b["combined"], (a["combined"], b["combined"])
+
+
+@pytest.mark.parametrize("window", WINDOWS)
+def test_rank_hash_covers_exactly_the_restored_rejected_slots(monkeypatch, capsys,
+                                                              window):
+    """The ring digest is over the REJECTED positions' slots (their pre-verify
+    bytes), and is selective: it does NOT include the accepted slots (which keep
+    the verify value). Checks the logged digest against an independently
+    computed digest of exactly the rejected slots captured BEFORE the verify."""
+    _arm(monkeypatch)
+    args, x = _args(window), _filler(window)
+    pos, acc = _pos(window), 1
+    target = pos + acc + 1
+    cache = ModelCache(args, 1, pos + 256)
+    stack = _Stack(args, seed=7)
+    stack(x[:, :pos], 0, cache)
+    before = [np.array(lc.win_kv.astype(mx.float32)) for lc in cache.layers]
+    sn = spec.snap(cache, pos, GAMMA + 1)
+    mx.random.seed(100)
+    junk = mx.random.normal((1, GAMMA - acc, x.shape[-1]))
+    stack(mx.concatenate([x[:, pos:target], junk], axis=1), pos, cache)
+    spec.rollback(cache, sn, target, spec.stashes(cache))
+    f = _fields(_hash_lines(capsys)[0])
+    assert (f["start"], f["target"], f["rows"], f["rejected"]) == (
+        str(pos), str(target), str(GAMMA + 1), str(GAMMA - acc))
+    got = f["ring"].split(",")
+    for i, lc in enumerate(cache.layers):
+        rejected = [(p % lc.window) for p in range(target, pos + GAMMA + 1)]
+        assert got[i] == spec._digest(before[i][:, rejected]), (
+            f"layer {i}: ring digest is not the rejected slots' pre-verify bytes")
+        accepted = [(p % lc.window) for p in range(pos, target)]
+        assert got[i] != spec._digest(before[i][:, accepted]), (
+            f"layer {i}: ring digest includes accepted slots (it must be selective)")
+
+
+def test_restored_subset_hashes_the_engram_live_prefix():
+    """``engram_ids`` is position-addressed and NOT restored by rollback, so it is
+    hashed over the LIVE prefix ``[:, :target]`` -- a rejected round that
+    exercises the engram path is still proven rank-identical."""
+    cache = ModelCache(_args(8), 1, 64)
+    assert cache.engram_ids is None                     # fixture has no engram
+    cache.engram_ids = np.arange(64, dtype=np.int64).reshape(1, 64)
+    empty = spec.RollbackSnapshot(0, 0, [], [], [])
+    _ring, _lat, eng, _comb = spec._restored_subset(cache, empty, 10, 10)
+    assert eng == spec._digest(cache.engram_ids[:, :10])
+    assert eng != spec._digest(cache.engram_ids)        # only the live prefix

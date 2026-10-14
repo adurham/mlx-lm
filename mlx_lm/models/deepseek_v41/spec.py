@@ -29,12 +29,150 @@ every acceptance count ``m`` in ``0..gamma`` (a full reject included):
 
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import NamedTuple
 
 import mlx.core as mx
 
 from .cache import NEG_INF
+
+# --------------------------------------------------------------------------
+# OPTIONAL: TP=2 rank-consistency debug hash on the rollback path.
+#
+# The offline tests for this fix are single-rank, so they cannot show that BOTH
+# cluster ranks land on the SAME post-rollback state -- the property the fix
+# exists to guarantee (a rejected draft's overwritten ring slots and compressed
+# rows must be restored identically on every rank, or the two ranks drift and
+# the TP collective mixes divergent caches).
+#
+# This hook makes each rank print ONE line per REJECTED rollback (a round with at
+# least one rejected row) carrying a digest of exactly the state the rollback
+# restored, so the two nodes' logs for the same round can be diffed directly.
+#
+# Gate: ``EXO_DSV41_SPEC_ROLLBACK_HASH`` -- default OFF, and when off the
+# rollback path is byte-for-byte unchanged (one cached-flag read). Rank is read
+# from ``MLX_RANK`` (set by exo's ``mlx_distributed_init``). The cross-rank key
+# is the round-position tuple ``(start, target, rows)``: both ranks decode the
+# identical committed token sequence, so those three numbers match round-for-
+# round and let a diff align the two nodes' lines. ``turn`` is an optional
+# operator tag (``EXO_DSV41_SPEC_ROLLBACK_TURN``); mlx-lm has no notion of a
+# request id, so it defaults to ``-``.
+_ROLLBACK_HASH_ENV = "EXO_DSV41_SPEC_ROLLBACK_HASH"
+_ROLLBACK_TURN_ENV = "EXO_DSV41_SPEC_ROLLBACK_TURN"
+
+_HASH_ENABLED: bool | None = None   # cached gate (None => not read yet)
+_ROLLBACK_SEQ = 0                   # per-process rejected-rollback counter
+
+
+def rollback_hash_enabled() -> bool:
+    """True when the rank-consistency rollback hash is armed (default: off)."""
+    global _HASH_ENABLED
+    if _HASH_ENABLED is None:
+        raw = os.environ.get(_ROLLBACK_HASH_ENV, "0").strip().lower()
+        _HASH_ENABLED = raw not in ("", "0", "false", "off", "no")
+    return _HASH_ENABLED
+
+
+def _reset_rollback_hash_gate() -> None:
+    """Test hook: forget the cached gate so the env var can be flipped."""
+    global _HASH_ENABLED, _ROLLBACK_SEQ
+    _HASH_ENABLED = None
+    _ROLLBACK_SEQ = 0
+
+
+def _digest(value) -> str:
+    """16-hex sha256 over an array's shape, dtype and bytes (content + layout)."""
+    import numpy as np
+
+    try:
+        arr = np.asarray(value)
+    except Exception:
+        # bfloat16 (and any dtype numpy has no PEP-3118 buffer format for) cannot
+        # be viewed directly: cast through mlx first. The cast is exact and
+        # identical on every rank, so the digest stays a faithful content hash.
+        arr = np.asarray(mx.array(value).astype(mx.float32))
+    a = np.ascontiguousarray(arr)
+    h = hashlib.sha256()
+    h.update(f"{a.shape}|{a.dtype}|".encode())
+    h.update(a.tobytes())
+    return h.hexdigest()[:16]
+
+
+def _restored_subset(cache, sn, target: int, written_end: int):
+    """Per-layer digests of the state the rollback just restored.
+
+    * ``ring``   -- the window-ring slots of the REJECTED positions
+      ``[target, written_end)``: the content a decode that never speculated would
+      still hold there (accepted positions keep the verify value and are NOT
+      part of this digest);
+    * ``latents`` -- the ``comp_kv`` / ``index_k`` rows for the restored groups
+      ``[target // ratio, end_pos // ratio)``;
+    * ``engram``  -- the LIVE prefix ``engram_ids[:, :target]`` (position-
+      addressed and deliberately NOT restored by rollback; included so a rejected
+      round that exercises the engram path is still proven rank-identical).
+
+    Returns ``(ring_list, latent_list, engram, combined)``.
+    """
+    ring: list[str] = []
+    latents: list[str] = []
+    h = hashlib.sha256()
+    for lc, (_end, saved) in zip(cache.layers, sn.ring):
+        first = _end - saved.shape[1]
+        lo = max(int(target), first)
+        if lo >= written_end:
+            ring.append("-")
+            continue
+        slots = (lo + mx.arange(written_end - lo)) % lc.window
+        d = _digest(lc.win_kv[:, slots])
+        ring.append(d)
+        h.update(f"R{lc.window}:{d}|".encode())
+    for lc, lat in zip(cache.layers, sn.latents):
+        if lat is None:
+            latents.append("-")
+            continue
+        g0, rows = lat
+        lo = max(int(target) // lc.ratio, g0)
+        parts: list[str] = []
+        for name, saved in rows:
+            hi = g0 + saved.shape[1]
+            if lo >= hi:
+                parts.append(f"{name}=-")
+                continue
+            d = _digest(getattr(lc, name)[:, lo:hi])
+            parts.append(f"{name}={d}")
+            h.update(f"L{name}:{d}|".encode())
+        latents.append(",".join(parts))
+    engram = "-"
+    ids = getattr(cache, "engram_ids", None)
+    if ids is not None and int(target) > 0:
+        engram = _digest(ids[:, : int(target)])
+        h.update(f"E:{engram}|".encode())
+    return ring, latents, engram, h.hexdigest()[:16]
+
+
+def _log_rollback_hash(cache, sn, target: int, written_end: int) -> None:
+    """Emit ONE diffable line describing the restored state (debug path only).
+
+    Goes to stdout (like the fork's other env-gated diagnostics) so it lands in
+    each node's ``~/exo.log``; ``flush`` keeps the line intact under the
+    runner's unbuffered redirect.
+    """
+    global _ROLLBACK_SEQ
+    _ROLLBACK_SEQ += 1
+    rank = os.environ.get("MLX_RANK", "-")
+    turn = os.environ.get(_ROLLBACK_TURN_ENV, "-")
+    head = (f"[DSV41-RB-HASH] rank={rank} turn={turn} seq={_ROLLBACK_SEQ} "
+            f"start={sn.start_pos} target={target} rows={sn.end_pos - sn.start_pos} "
+            f"rejected={max(0, written_end - target)}")
+    try:
+        ring, latents, engram, combined = _restored_subset(cache, sn, target,
+                                                           written_end)
+    except Exception as e:  # pragma: no cover - debug hook must never break decode
+        print(f"{head} error={type(e).__name__}:{e}", flush=True)
+        return
+    print(f"{head} ring={','.join(ring)} latents={'|'.join(latents)} "
+          f"engram={engram} combined={combined}", flush=True)
 
 
 class RollbackSnapshot(NamedTuple):
@@ -189,6 +327,10 @@ def rollback(cache, sn, target: int, st) -> None:
         if lat is not None:
             _restore_latent_rows(lc, lat, target // lc.ratio)
     _restore_ring(cache, ring, target, written_end)
+    # Rank-consistency debug hook (default OFF): only a round that actually
+    # rejected a row has restored state worth diffing across the two ranks.
+    if written_end > target and rollback_hash_enabled():
+        _log_rollback_hash(cache, sn, target, written_end)
 
 
 def _restore_latent_rows(lc, lat, first_restored: int) -> None:
