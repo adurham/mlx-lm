@@ -81,8 +81,8 @@ feed = json.load(open(HOME + "/p30_prompt_ids.json"))[64:72]
 dts = []
 for i in range(8):
     pos = cache3.offset
-    sn = SP.snap(cache3, pos)
     chunk = [feed[(i + j) % len(feed)] for j in range(8)]
+    sn = SP.snap(cache3, pos, len(chunk))
     t = time.perf_counter()
     lg8 = model(mx.array([chunk]), cache3)
     mx.eval(lg8)

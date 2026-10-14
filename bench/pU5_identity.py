@@ -147,7 +147,7 @@ while len(out) < STEPS * (GAMMA + 1):
     d, _ = head2.draft(nxt, model.embed, model.head, dsc, width=GAMMA)
     d = d.astype(mx.int32)
     vin = mx.concatenate([nxt.reshape(1, 1), d], axis=1)
-    sn = SP.snap(cache, pos)
+    sn = SP.snap(cache, pos, vin.shape[1])
     am, taps = model(vin, cache, return_taps=True, argmax=True)
     mx.eval(am, d)
     tg, dd = np.array(am[0]), np.array(d[0])

@@ -55,7 +55,7 @@ for R in ROWS:
     lg = None
     for i in range(4):
         pos = cache.offset
-        sn = SP.snap(cache, pos)
+        sn = SP.snap(cache, pos, R)
         vin = mx.array([[feed[(i + j) % len(feed)] for j in range(R)]], dtype=mx.int32)
         lg = model(vin, cache, logits_only=True) if False else model(vin, cache)
         mx.eval(lg)

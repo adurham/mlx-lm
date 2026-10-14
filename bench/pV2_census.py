@@ -125,7 +125,7 @@ for R in [int(x) for x in os.environ.get("PV2_ROWS", "1,4").split(",")]:
     steps = []
     for i in range(int(os.environ.get("PV2_STEPS", "12"))):
         pos = cache.offset
-        sn = SP.snap(cache, pos)
+        sn = SP.snap(cache, pos, R)
         chunk = [feed[(i + j) % len(feed)] for j in range(R)]
         s0 = time.perf_counter()
         lg = model(mx.array([chunk]), cache)

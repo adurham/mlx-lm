@@ -210,7 +210,8 @@ for i in range(ROUNDS):
         n += 1
     new = [int(v) for v in dd[:n]] + [int(tg[n])]
     PHASE[0] = "snap_rollback"
-    sn = SP.snap(cache, pos)
+    # no forward since the verify above: the snapshot span is that round's rows
+    sn = SP.snap(cache, pos, 1 + GAMMA)
     SP.rollback(cache, sn, pos + n + 1, SP.stashes(cache))
     PHASE[0] = "append_ctx"
     head.append_ctx(mx.concatenate([taps[L] for L in TAPS], axis=-1)[:, :n + 1], dsc)

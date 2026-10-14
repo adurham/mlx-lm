@@ -119,7 +119,7 @@ def rounds(n=ROUNDS):
         d = d.astype(mx.int32)
         vin = mx.concatenate([nxt.reshape(1, 1), d], axis=1)
         PHASE[0] = "snap"
-        sn = SP.snap(cache, pos)
+        sn = SP.snap(cache, pos, vin.shape[1])
         PHASE[0] = "verify"
         am, taps = model(vin, cache, return_taps=True, argmax=True)
         mx.eval(am, d)                                   # the round's one sync

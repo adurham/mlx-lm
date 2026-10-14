@@ -169,7 +169,7 @@ step_ms = []
 snap = None
 for i in range(REPS):
     pos = cache.offset
-    sn = SP.snap(cache, pos)
+    sn = SP.snap(cache, pos, R)
     vin = mx.array([[feed[(i + j) % len(feed)] for j in range(R)]], dtype=mx.int32)
     for k in SEGS:
         _acc[k] = 0.0

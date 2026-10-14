@@ -63,8 +63,8 @@ if os.environ.get("PU0_SMOKE", "1") == "1":
     mx.eval(d)
     log(f"draft w3 {1000 * (time.time() - t0):.1f} ms tokens={d.tolist()} conf={conf.shape}")
     pos = cache.offset
-    sn = SP.snap(cache, pos)
     vin = mx.concatenate([nxt.reshape(1, 1), d.astype(mx.int32)], axis=1)
+    sn = SP.snap(cache, pos, vin.shape[1])
     t0 = time.time()
     am2, taps2 = model(vin, cache, return_taps=True, argmax=True)
     mx.eval(am2)

@@ -77,7 +77,7 @@ for R in ROWS:
     ts = []
     for i in range(REPS):
         pos = cache.offset
-        sn = SP.snap(cache, pos)
+        sn = SP.snap(cache, pos, R)
         vin = mx.array([[feed[(i + j) % len(feed)] for j in range(R)]], dtype=mx.int32)
         s0 = time.perf_counter()
         out = model(vin, cache, return_taps=True, argmax=True)

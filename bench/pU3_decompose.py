@@ -118,7 +118,7 @@ def spec_rounds(gamma=GAMMA, n=STEPS, iso=0, quiesce=False):
             mx.eval(d)
         tc = time.perf_counter()
         vin = mx.concatenate([nxt.reshape(1, 1), d], axis=1)
-        sn = SP.snap(cache, pos)
+        sn = SP.snap(cache, pos, vin.shape[1])
         am, taps = model(vin, cache, return_taps=True, argmax=True)
         td = time.perf_counter()
         mx.eval(am, d)                                   # the round's one sync
@@ -196,7 +196,7 @@ for R in (1, 2, 3, 4, 5, 6):
     ts = []
     for _ in range(8):
         pos = cache.offset
-        sn = SP.snap(cache, pos)
+        sn = SP.snap(cache, pos, R)
         s0 = time.perf_counter()
         lg = model(mx.full((1, R), 100, dtype=mx.int32), cache, argmax=True)
         mx.eval(lg)

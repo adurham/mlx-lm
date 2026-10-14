@@ -145,7 +145,7 @@ if RANK == 0:
 TAG[0] = "verify"
 c1 = len(HITS)
 vin = mx.concatenate([nxt.reshape(1, 1), d], axis=1)
-sn = SP.snap(cache, pos)
+sn = SP.snap(cache, pos, vin.shape[1])
 am, taps = model(vin, cache, return_taps=True, argmax=True)
 mx.eval(am)
 sv = [w for _, w in HITS[c1:]]

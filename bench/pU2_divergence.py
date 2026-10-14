@@ -102,7 +102,7 @@ def loop(iso, n=ROUNDS):
         if iso >= 1:
             mx.eval(d)                      # the extra sync under test
         vin = mx.concatenate([nxt.reshape(1, 1), d], axis=1)
-        sn = SP.snap(cache, pos)
+        sn = SP.snap(cache, pos, vin.shape[1])
         am, taps = model(vin, cache, return_taps=True, argmax=True)
         mx.eval(am, d)
         tg, dd = np.array(am[0]), np.array(d[0])
@@ -150,7 +150,7 @@ pos = cache.offset
 vin = mx.array([[int(nxt.item())] * (KG + 1)], dtype=mx.int32)
 outs = []
 for trial in range(4):
-    sn = SP.snap(cache, pos)
+    sn = SP.snap(cache, pos, vin.shape[1])
     am = model(vin, cache, argmax=True)
     if trial % 2 == 1:
         mx.eval(mx.ones(1))              # unrelated eval before the force
