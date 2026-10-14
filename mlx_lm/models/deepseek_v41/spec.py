@@ -4,20 +4,62 @@
 Chunk verify runs the ``gamma + 1`` verify rows in ONE body forward. It is not
 bit-identical to plain greedy (the body result depends on chunk shape, a
 property of the body measured in exo phase 3), which is the same tradeoff
-production DSv4 makes. Rollback: window ring and compressed caches are
-position-addressed and are rewritten before they are read again; only the
-compressor open-group carry must be rebuilt (from the saved carry plus the
-rows the compressor stashed for this chunk).
+production DSv4 makes.
+
+Rollback must leave behind what a decode that never speculated would have, for
+every acceptance count ``m`` in ``0..gamma`` (a full reject included):
+
+* ``comp_kv`` / ``index_k`` rows are **group**-addressed: rows below the
+  rollback point were built from the carried + accepted rows only and are kept;
+  rows at or above it are not yet readable (``compress_len = offset // ratio``)
+  and the verify's copies of them are put back (``_latent_save``);
+* the compressor open-group carry is rebuilt from the saved carry plus the rows
+  the compressor stashed for this chunk (``_rebuild``);
+* the **window ring is not** position-addressed -- slot ``p % window`` also
+  holds the already-committed position ``p - window`` -- so a REJECTED verify row
+  at ``p`` overwrites KV that a live read of ``p - window`` needs. That write
+  cannot be undone by address arithmetic, which is why ``cache.py``'s
+  ``ring_snapshot`` exists for session checkpoints and ``prefill.decode_prime``
+  saves its ring slot by hand. :func:`snap` therefore copies the
+  ``verify_rows`` slots the verify forward is about to overwrite, and
+  :func:`rollback` puts the rejected ones back; accepted rows keep the verify
+  value. The copy is ``min(verify_rows, window)`` ring rows plus the closed
+  groups' cache rows per layer, and is paid only on the speculative path.
 """
 
 from __future__ import annotations
 
 import os
+from typing import NamedTuple
 
 import mlx.core as mx
 
+from .cache import NEG_INF
 
-def snap(cache, start_pos: int):
+
+class RollbackSnapshot(NamedTuple):
+    """What :func:`rollback` must put back.
+
+    ``end_pos`` is the position past the last row the forward is about to write;
+    ``ring`` and ``latents`` are per layer (``[]`` when the model has no layers at
+    all, which only test doubles do). ``start_pos``/``end_pos`` are kept outside the
+    per-layer lists so ``rollback`` can refuse an under-sized snapshot even then.
+    """
+
+    start_pos: int
+    end_pos: int
+    carries: list
+    ring: list
+    latents: list
+
+
+def carries(cache, start_pos: int):
+    """Per-layer compressor open-group carry live at ``start_pos``.
+
+    ``(kv_rows, score_rows, m)`` per layer, ``(None, None, 0)`` on a group
+    boundary or a layer with no compressor: the format :func:`rollback` and
+    ``session_cache`` restore from.
+    """
     st = []
     for lc in cache.layers:
         cs = lc.comp_state
@@ -27,7 +69,51 @@ def snap(cache, start_pos: int):
         m = start_pos % lc.ratio
         st.append((mx.array(cs.kv_state[:, :m]), mx.array(cs.score_state[:, :m]), m)
                   if m else (None, None, 0))
-    return start_pos, st
+    return st
+
+
+def snap(cache, start_pos: int, verify_rows: int):
+    """Snapshot everything a forward of ``verify_rows`` rows at ``start_pos``
+    will change and a rollback has to undo: the compressor carries and the ring
+    slots that write is about to overwrite.
+
+    ``verify_rows`` is the row count of the NEXT forward (the speculative loop's
+    ``1 + gamma``). It is required, not defaulted: the ring copy is sized from
+    it, and a value below the real row count would leave rejected rows
+    unrecoverable (``rollback`` refuses that case). Over-estimating is harmless --
+    the extra slots are restored to the value they already hold.
+
+    The ring rows are gathered, never aliased, and are not evaluated here: an
+    eval would materialise the lazily drafted tokens before the verify forward
+    and cost the one-sync-per-round overlap.
+    """
+    verify_rows = int(verify_rows)
+    if verify_rows < 1:
+        raise ValueError("spec.snap: verify_rows must be >= 1")
+    end_pos = start_pos + verify_rows
+    ring, latents = [], []
+    for lc in cache.layers:
+        ring.append((end_pos, mx.array(
+            lc.win_kv[:, lc.window_write_slots(start_pos, verify_rows)])))
+        latents.append(_latent_save(lc, start_pos, end_pos))
+    return RollbackSnapshot(start_pos, end_pos, carries(cache, start_pos),
+                            ring, latents)
+
+
+def _latent_save(lc, start_pos: int, end_pos: int):
+    """The ``comp_kv`` / ``index_k`` rows a forward over ``[start_pos, end_pos)``
+    writes: groups ``[start_pos // ratio, end_pos // ratio)`` (``Compressor``
+    returns one latent per closed group; ``Indexer.publish_keys`` writes the same
+    rows). ``None`` when this layer owns no compressed cache or closes no group."""
+    if lc.comp_kv is None or lc.ratio <= 0:
+        return None
+    g0, g1 = start_pos // lc.ratio, end_pos // lc.ratio
+    if g1 <= g0:
+        return None
+    rows = [(name, mx.array(getattr(lc, name)[:, g0:g1]))
+            for name in ("comp_kv", "index_k")
+            if getattr(lc, name, None) is not None]
+    return g0, rows
 
 
 def stashes(cache):
@@ -35,11 +121,10 @@ def stashes(cache):
             if lc.comp_state is not None else (None, None) for lc in cache.layers]
 
 
-def _rebuild(cs, ratio, chunk_start, target, saved, stash):
-    s = ratio * (target // ratio)
-    need = target - s
+def _rebuild(cs, chunk_start, target, need, saved, stash):
     if need == 0:
         return
+    s = target - need
     saved_kv, saved_sc, m = saved
     stash_kv, stash_sc = stash
     pk, ps = [], []
@@ -59,18 +144,89 @@ def _rebuild(cs, ratio, chunk_start, target, saved, stash):
 
 
 def rollback(cache, sn, target: int, st) -> None:
-    chunk_start, saved = sn
+    """Undo a verify forward: land the cache exactly on ``target``.
+
+    ``target`` is the position just past the last row the target model actually
+    committed, so rows ``[start_pos, target)`` survive and the rejected suffix
+    ``[target, start_pos + verify_rows)`` must leave no trace. ``target`` may equal
+    ``start_pos`` (a full reject).
+    """
+    chunk_start, saved, ring, latents = (sn.start_pos, sn.carries, sn.ring,
+                                         sn.latents)
+    # The forward advanced the offset to the end of what it wrote. Anything past
+    # the snapshot span would be unrecoverable, so refuse loudly instead of
+    # leaving the rejected rows in the ring.
+    written_end = int(cache.offset)
+    if written_end > sn.end_pos:
+        raise RuntimeError(
+            f"spec.rollback: the verify forward wrote {written_end - chunk_start} "
+            f"rows but spec.snap covered {sn.end_pos - chunk_start}; the rejected "
+            "rows cannot be restored (call snap with the forward's row count)")
     cache.offset = target
-    for lc, sv, stash in zip(cache.layers, saved, st):
-        if lc.comp_state is None:
+    for lc, sv, stash, lat in zip(cache.layers, saved, st, latents):
+        # Compressor open-group carry. Only a ratio > 1 kv source owns one, and
+        # only a layer whose compressor actually ran for this chunk has stashed
+        # rows to rebuild from: an out-of-subset kv source on a PARTIAL build
+        # never stashes, so its carry is untouched and there is nothing to
+        # rebuild. (ws2/U)
+        if lc.comp_state is not None and stash[0] is not None:
+            need = target % lc.ratio
+            if need == 0:
+                # Target is a group boundary: canonicalize the carry to "no
+                # carried rows", exactly as a freshly allocated cache has it, so
+                # the rejected rows cannot survive in it. (The buffer holds the
+                # verify's rejected rows otherwise; its upper rows are never
+                # read.)
+                lc.reset_carry()
+            else:
+                _rebuild(lc.comp_state, chunk_start, target, need, sv, stash)
+                # Rows [need, ratio) are dead (the next compressor call prepends
+                # only start_pos % ratio rows), but the verify left rejected rows
+                # in them.
+                cs = lc.comp_state
+                cs.kv_state[:, need:] = 0
+                cs.score_state[:, need:] = NEG_INF
+        if lat is not None:
+            _restore_latent_rows(lc, lat, target // lc.ratio)
+    _restore_ring(cache, ring, target, written_end)
+
+
+def _restore_latent_rows(lc, lat, first_restored: int) -> None:
+    """Put back the compressed / index rows the verify wrote ABOVE the rollback
+    point (groups ``[target // ratio, end_pos // ratio)``).
+
+    Rows below that point were produced from the carried + accepted rows only and
+    are what the next forward reads (``compress_len = offset // ratio``), so they
+    must keep the verify value. Rows above are not readable until the chunk that
+    closes their group, which rewrites them from the carry -- but nothing on this
+    path may leave rejected content anywhere, so they go back to what the rollback
+    point's cache had: never written.
+    """
+    g0, rows = lat
+    lo = max(int(first_restored), g0)
+    for name, saved in rows:
+        hi = g0 + saved.shape[1]
+        if lo >= hi:
             continue
-        # A layer whose compressor did not run for this chunk has no stashed
-        # rows, so its carry is untouched and there is nothing to rebuild. This
-        # only happens on a PARTIAL build (out-of-subset kv source never
-        # stashes); on the full model every source runs every forward. (ws2/U)
-        if stash[0] is None:
-            continue
-        _rebuild(lc.comp_state, lc.ratio, chunk_start, target, sv, stash)
+        getattr(lc, name)[:, lo:hi] = saved[:, lo - g0: hi - g0]
+
+
+def _restore_ring(cache, ring, target: int, written_end: int) -> None:
+    """Put the REJECTED positions' ring slots back the way the verify found them.
+
+    Accepted rows are left alone: for a committed position the verify value is
+    what a decode that never speculated would have written there, up to the
+    documented chunk-shape difference. ``ring`` is ``[(end_pos, rows), ...]`` from
+    :func:`snap`, ``rows`` holding the pre-verify content of the
+    ``min(verify_rows, window)`` slots ending at ``end_pos``, in position order.
+    """
+    for lc, (end_pos, saved) in zip(cache.layers, ring):
+        first = end_pos - saved.shape[1]             # first position snapshotted
+        lo = max(int(target), first)                 # first rejected position
+        if lo >= written_end:
+            continue                                 # nothing rejected in range
+        slots = (lo + mx.arange(written_end - lo)) % lc.window
+        lc.win_kv[:, slots] = saved[:, lo - first: written_end - first]
 
 
 # Measured on 2x M4 Max TP=2 (exo phase 16/17): verify forward ms by rows.
@@ -312,7 +468,7 @@ def generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
         d, _ = head.draft(nxt, model.embed, model.head, dsc, width=g)
         d = d.astype(mx.int32)
         vin = mx.concatenate([nxt.reshape(1, 1), d], axis=1)
-        sn = snap(cache, pos)
+        sn = snap(cache, pos, g + 1)
         tr0 = time.perf_counter()
         am, taps = model(vin, cache, return_taps=True, argmax=True)
         mx.eval(am, d)                                   # the one sync per round

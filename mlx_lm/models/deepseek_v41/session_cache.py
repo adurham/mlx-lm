@@ -13,18 +13,20 @@ a complete description of the prefix it has seen:
   and a group is rewritten by the chunk that completes it before anything
   reads it;
 * compressor carry -- ``ratio`` rows of the open group, plus how many are live
-  (``spec.snap`` / ``spec.rollback``'s format);
+  (``spec.carries`` / ``spec.rollback``'s format);
 * engram id history -- an indexable host array.
 
 The one buffer that cannot be left alone on a rewind is the **window ring**: a
 discarded write at position ``q`` clobbers the slot that a live read at
 ``q - window`` needs, and the first row of the next forward reads the window at
-the rollback point *before* any write of its own. (``spec.rollback`` is exact
-for the speculative loop precisely because there the discarded rows are then
-re-written at the same positions before anything reads them -- a rewind is
-not.) So a session checkpoint stores a materialized ring copy per layer
-(~256 KB each at ``window=128, head_dim=512`` fp32; ~10 MB for 40 layers) next
-to the compressor carry, captured with :func:`spec.snap`.
+the rollback point *before* any write of its own. ``spec.rollback`` is exact for
+the speculative loop for the SAME reason it must copy the ring itself: a rejected
+verify row at ``p`` aliases the committed ``p - window``, so the two paths use the
+same bounded slot copy -- ``spec.snap(cache, pos, 1 + gamma)`` -- and neither may
+be skipped. A rewind to an arbitrary point needs the full copy below. So a session
+checkpoint stores a materialized ring copy per layer (~128 KB each at
+``window=128, head_dim=512`` bf16; ~5 MB for 40 layers) next to the compressor
+carry, taken with :func:`spec.carries`.
 
 Stale compressed rows above a rollback point are never read: ``compress_len =
 end_pos // ratio`` only reaches a group once the chunk that closes it has
@@ -367,7 +369,7 @@ class SessionCache:
     def snapshot(self) -> Snapshot:
         """Checkpoint the current state (materialized ring copies + carries)."""
         pos = self.cache.offset
-        _, carries = _spec.snap(self.cache, pos)         # reuse spec's carry rows
+        carries = _spec.carries(self.cache, pos)         # reuse spec's carry rows
         rings = [lc.ring_snapshot() for lc in self.cache.layers]
         mx.eval([r for r in rings if r is not None])
         snap = Snapshot(pos=pos, rings=rings, carries=carries)

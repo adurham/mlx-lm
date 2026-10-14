@@ -129,13 +129,23 @@ class LayerCache:
         slots = (first + mx.arange(wp)) % w
         return self.win_kv[:, slots]
 
+    def window_write_slots(self, pos: int, n: int) -> mx.array:
+        """Ring slots a write of ``n`` rows at positions [pos, pos+n) occupies.
+
+        The one definition of the aliasing rule: slot ``p % window``. Only the
+        last ``min(n, window)`` rows survive a write (a chunk longer than the
+        window overwrites itself), so this is also the exact slot set a
+        speculative rollback has to be able to undo -- see ``spec.snap``.
+        """
+        keep = min(int(n), self.window)
+        return (pos + int(n) - keep + mx.arange(keep)) % self.window
+
     def write_window(self, pos: int, kv: mx.array):
         """Write chunk KV at positions [pos, pos+n) into the ring."""
         n = kv.shape[1]
         keep = min(n, self.window)
-        tail = kv[:, n - keep:]
-        slots = (pos + n - keep + mx.arange(keep)) % self.window
-        self.win_kv[:, slots] = tail.astype(self.dtype)
+        self.win_kv[:, self.window_write_slots(pos, n)] = \
+            kv[:, n - keep:].astype(self.dtype)
 
     # ---- session reuse (workstream E): exact-state snapshot / restore ----
 
@@ -145,8 +155,13 @@ class LayerCache:
         The ring is the one position-addressed buffer a rollback cannot
         reconstruct on its own: slots alias every ``window`` positions, so a
         discarded write at ``q`` silently corrupts a live read of ``q -
-        window``. A session checkpoint therefore keeps a copy (~64 KB at
-        window 128 / head_dim 512 bf16)."""
+        window``. A session checkpoint therefore keeps a copy (~128 KB at
+        window 128 / head_dim 512 bf16).
+
+        The speculative rollback is the other writer that must undo a ring
+        write; it saves only the ``min(verify_rows, window)`` slots the verify
+        forward is about to overwrite (``spec.snap`` / ``spec.rollback``), which
+        is the bounded form of this full copy."""
         return mx.array(self.win_kv)
 
     def ring_restore(self, snap) -> None:

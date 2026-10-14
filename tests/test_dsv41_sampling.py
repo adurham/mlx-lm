@@ -191,7 +191,7 @@ class _StubSpec:
     adaptive path, so the fake (cacheless) loop can exercise both."""
 
     @staticmethod
-    def snap(cache, start_pos):
+    def snap(cache, start_pos, verify_rows):
         return None
 
     @staticmethod

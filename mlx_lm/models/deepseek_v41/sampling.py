@@ -481,7 +481,7 @@ def spec_generate(model, head, prompt_ids, max_new: int, *, gamma: int = 3,
         nxt = dev.array([[int(out[-1])]], dtype=dev.int32)
         d, _ = head.draft(nxt[:, 0], model.embed, probe, dsc, width=g)
         vin = dev.concat([nxt, d], axis=1)
-        sn = sp.snap(cache, pos)
+        sn = sp.snap(cache, pos, g + 1)
         lg, taps = model(vin, cache, return_taps=True)          # fp32 logits [1, g+1, V]
         dev.eval(lg, d, sampler.pool, *probe.qs)                        # mx.eval: one sync
         p_rows = sampler.probs(dev.host(lg)[0])                         # [g+1, V] host fp32

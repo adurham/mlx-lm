@@ -262,14 +262,16 @@ def decode_prime(model, cache, *, enabled: bool = True) -> float:
     running one throwaway decode step and rolling the cache back exactly. After
     it, the first real decode step is steady state (measured 1.01x, pW24 arm D).
 
-    Bit-exactness: the probe step writes only position-addressed cache state
-    (window ring slot ``offset % window``, compressed-KV slot, index-key slot)
-    and the compressor open-group carry for one position; the rollback used
-    here (``spec.snap``/``stashes``/``rollback``) is the same machinery the
-    speculative decoder uses to reject drafts, restores the exact pre-step
-    carry, and does not touch the ring (position-addressed: position ``offset``
-    is rewritten by the next real write before it can be read). The probe's own
-    logits are discarded. ``cache.offset`` is unchanged.
+    Bit-exactness: the probe step writes only cache state addressed by the one
+    position ``offset`` (window ring slot ``offset % window``, compressed-KV slot,
+    index-key slot) plus the compressor open-group carry, and this function saves
+    and restores every one of them, the ring row included. The ring NEEDS that
+    explicit copy: slot ``offset % window`` aliases the committed ``offset -
+    window``, and the next forward reads that slot before writing it, so it is
+    never safe to rely on "the next write rewrites it" (``cache.py``
+    ``ring_snapshot``; ``spec.snap`` copies exactly the same slots for the verify
+    rows a draft rejection discards). The probe's own logits are discarded.
+    ``cache.offset`` is unchanged.
 
     ``enabled=False`` (or an unbuilt/None layer set) returns 0.0 without
     running the probe. Set ``DSV41_DECODE_PRIME=0`` to disable globally.
