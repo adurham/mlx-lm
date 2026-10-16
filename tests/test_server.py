@@ -19,8 +19,10 @@ from mlx_lm.server import (
     LRUPromptCache,
     ResponseGenerator,
     SamplingArguments,
+    ToolCallFormatter,
     _make_sampler,
 )
+from mlx_lm.tool_parsers import pythonic
 from mlx_lm.utils import load
 
 
@@ -28,6 +30,7 @@ class DummyModelProvider:
     def __init__(self, with_draft=False, kv_bits=None, quantized_kv_start=0):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
+        self.processor = None
         self.model_key = (HF_MODEL_PATH, None)
         self.is_batchable = True
 
@@ -209,6 +212,52 @@ class TestTextStateMachine(unittest.TestCase):
         state, s = sm.discard(state)
         self.assertEqual(s, "tool")
 
+    def test_split_keeps_text_in_its_state(self):
+        # Held text released by a transition belongs to the state before it.
+        sm = TextStateMachine(
+            {
+                "normal": [("<think>", "reasoning"), ("<tool_call>", "tool")],
+                "reasoning": [("</think>", "normal")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, segments = sm.split(state, "x <")
+        self.assertEqual(segments, [("normal", "x ")])
+        state, segments = sm.split(state, "<tool_call>{}")
+        self.assertEqual(segments, [("normal", "<"), ("tool", "{}")])
+        state, segments = sm.split(state, "</tool_call>")
+        self.assertEqual(segments, [("tool", ""), ("normal", "")])
+
+    def test_held_text_read_once(self):
+        sm = TextStateMachine({"normal": [("##", "normal")]})
+        state = sm.make_state()
+        state, t1, _ = sm.step(state, "a #")
+        state, t2, _ = sm.step(state, "# b")
+        state, rest, _ = sm.flush(state)
+        self.assertEqual(t1 + t2 + rest, "a  b")
+
+
+class TestToolCallFormatter(unittest.TestCase):
+    def test_formats_parallel_tool_calls(self):
+        formatter = ToolCallFormatter(pythonic.parse_tool_call, tools=None)
+        raw_tool_call = (
+            '[get_time(location="Paris"), '
+            'grocery.order(items=[{"name": "noodles", "organic": true}])]'
+        )
+
+        tool_calls = formatter([raw_tool_call])
+
+        self.assertEqual(
+            [tc["function"]["name"] for tc in tool_calls],
+            ["get_time", "grocery.order"],
+        )
+        self.assertTrue(all(tc["type"] == "function" for tc in tool_calls))
+        self.assertEqual(
+            json.loads(tool_calls[1]["function"]["arguments"]),
+            {"items": [{"name": "noodles", "organic": True}]},
+        )
+
 
 class TestServer(unittest.TestCase):
     @classmethod
@@ -232,6 +281,11 @@ class TestServer(unittest.TestCase):
         cls.httpd.server_close()
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
+
+    def test_max_tokens_zero_is_rejected(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})
+        self.assertEqual(response.status_code, 400)
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -333,6 +387,35 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_handle_chat_completions_with_dict_tool_arguments(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        chat_post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "what is 2+3?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": "123",
+                            "function": {
+                                "name": "add",
+                                "arguments": {"a": 2, "b": 3},
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "5", "tool_call_id": "123"},
+            ],
+        }
+        response = requests.post(url, json=chat_post_data)
+        response_body = response.text
+        self.assertIn("id", response_body)
+        self.assertIn("choices", response_body)
+
     def test_generation_thread_exit_releases_model(self):
         response_generator = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
         provider = response_generator.model_provider
@@ -355,6 +438,7 @@ class TestServer(unittest.TestCase):
             tool_call_end_tokens = ()
             eos_token_ids = [2]
             structural_markers = ()
+            response_transitions = {}
 
             def convert_ids_to_tokens(self, t):
                 return f"<eos{t}>"
@@ -874,7 +958,7 @@ class TestModelSwapClearsCache(unittest.TestCase):
         tokenizer = mock.Mock()
         tokenizer.chat_template = None
         tokenizer.default_chat_template = None
-        load.return_value = (mock.Mock(), tokenizer)
+        load.return_value = (mock.Mock(), tokenizer, {})
         init.return_value.size.return_value = 1
 
         provider = ModelProvider(args)

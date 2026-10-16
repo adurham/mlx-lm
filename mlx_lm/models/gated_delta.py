@@ -42,6 +42,20 @@ def compute_lower_bound_g(A_log, a, dt_bias, lower_bound):
     )
 
 
+def normalize_qk(
+    q: mx.array, k: mx.array, *, inv_scale: float, eps: float
+) -> Tuple[mx.array, mx.array]:
+    """L2-normalize q/k and fold the ``head_dim**-0.5`` readout scale into q.
+
+    ``eps`` is the reference l2norm eps, which is added to sum(x^2).
+    ``mx.fast.rms_norm`` adds it to mean(x^2), so scale it by ``inv_scale**2``.
+    """
+    rms_eps = eps * inv_scale**2
+    q = (inv_scale**2) * mx.fast.rms_norm(q, None, rms_eps)
+    k = inv_scale * mx.fast.rms_norm(k, None, rms_eps)
+    return q, k
+
+
 def _make_gated_delta_kernel(has_mask=False, vectorized=False):
     if not mx.metal.is_available():
         return None
@@ -610,14 +624,17 @@ def gated_delta_update(
     dt_bias: mx.array,
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
+    *,
     use_kernel: bool = True,
     lower_bound: float | None = None,
+    allow_neg_eigval: bool = False,
 ) -> Tuple[mx.array, mx.array]:
     """Gated delta rule recurrence.
 
-    Contract: callers fold the ``Dk**-0.5`` readout scale into q before calling
-    (e.g. ``inv_scale = Dk**-0.5; q = inv_scale**2 * rms_norm(q, eps);
-    k = inv_scale * rms_norm(k, eps)``). The helper applies no scale of its own.
+    Contract: callers normalize q/k with ``normalize_qk``, which folds the
+    ``Dk**-0.5`` readout scale into q. The helper applies no scale of its own.
+
+    Set ``allow_neg_eigval`` to put beta in [0, 2] instead of [0, 1].
     """
     # Fork delta: sigmoid in float32. In bf16 the beta gate quantises coarsely
     # and the error accumulates in the recurrent state; f32 matches the
@@ -626,6 +643,8 @@ def gated_delta_update(
     # beta is bound as a float buffer and read correctly — upstream already
     # passes a float32 `g` alongside bf16 q/k/v for the packed path.
     beta = mx.sigmoid(b.astype(mx.float32))
+    if allow_neg_eigval:
+        beta = beta * 2.0
     if lower_bound is None:
         g = compute_g(A_log, a, dt_bias)
     else:
