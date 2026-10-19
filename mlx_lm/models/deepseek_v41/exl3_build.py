@@ -722,6 +722,19 @@ def build_block(ck: Exl3Checkpoint, args: ModelArgs, layer_id: int, *,
                 rank=rank, world=world))
         else:
             _set(blk, tail, _dense(ck, g))
+    # A projection the quantizer left UNQUANTIZED (no trellis group) still has
+    # to be TP-sharded like its dense siblings, or the rank-local attention
+    # output width disagrees with the full weight the block kept. DeepSeek-V4.1
+    # Flash 1017 ships layer 14's `attn.wo_b` as BF16 [dim, n_groups*o_lora_rank]
+    # for exactly this reason: it is present in the index as a plain `.weight`,
+    # so the dense loop never saw it, and the un-sharded copy then matmul'd the
+    # sharded [b, s, 4096] attention output against a [8192, 5120] weight.
+    raw_wo_b = f"{pre}attn.wo_b.weight"
+    raw_wo_b_sliced = attn_tp and "attn.wo_b" not in dense and raw_wo_b in ck.index
+    if raw_wo_b_sliced:
+        w = _plain(ck, raw_wo_b)                             # [out, in]
+        a, b = _block_bounds(w.shape[1] // 16, rank, world, "in_tiles", raw_wo_b)
+        blk.attn.wo_b.weight = mx.contiguous(w[:, a * 16 : b * 16])
     if shared_tp:
         blk.ffn.shared_sharded = True
 
@@ -752,6 +765,8 @@ def build_block(ck: Exl3Checkpoint, args: ModelArgs, layer_id: int, *,
     fp32 = ("norm.weight", "attn_sink", "hc_", "gate.bias", "q_weight", "k_weight")
     items = []
     for tail, name in have.items():
+        if raw_wo_b_sliced and tail == "attn.wo_b.weight":
+            continue            # already set as this rank's in-axis slice above
         dt = mx.float32 if any(s in tail for s in fp32) else None
         items.append((tail, _plain(ck, name, dt)))
     if attn_tp:
