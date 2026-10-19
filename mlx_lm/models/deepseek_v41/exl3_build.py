@@ -722,19 +722,40 @@ def build_block(ck: Exl3Checkpoint, args: ModelArgs, layer_id: int, *,
                 rank=rank, world=world))
         else:
             _set(blk, tail, _dense(ck, g))
-    # A projection the quantizer left UNQUANTIZED (no trellis group) still has
-    # to be TP-sharded like its dense siblings, or the rank-local attention
-    # output width disagrees with the full weight the block kept. DeepSeek-V4.1
-    # Flash 1017 ships layer 14's `attn.wo_b` as BF16 [dim, n_groups*o_lora_rank]
-    # for exactly this reason: it is present in the index as a plain `.weight`,
-    # so the dense loop never saw it, and the un-sharded copy then matmul'd the
-    # sharded [b, s, 4096] attention output against a [8192, 5120] weight.
-    raw_wo_b = f"{pre}attn.wo_b.weight"
-    raw_wo_b_sliced = attn_tp and "attn.wo_b" not in dense and raw_wo_b in ck.index
-    if raw_wo_b_sliced:
-        w = _plain(ck, raw_wo_b)                             # [out, in]
-        a, b = _block_bounds(w.shape[1] // 16, rank, world, "in_tiles", raw_wo_b)
-        blk.attn.wo_b.weight = mx.contiguous(w[:, a * 16 : b * 16])
+    # Checkpoints can store individual projections UNQUANTIZED (no trellis
+    # group). DeepSeek-V4.1 Flash 1017 does exactly that for layer 14, an engram
+    # layer: `attn.wo_b` and `ffn.shared_experts.w2` arrive as plain BF16
+    # `.weight` tensors while every other layer carries trellis groups.
+    #
+    # The dense loop above only walks trellis groups, so under Tensor
+    # parallelism those two kept their FULL shape while every sibling got the
+    # per-rank slice — the sharded activation then met a full-size weight:
+    #   [matmul] (1,512,4096) vs (8192,5120)   # attn.wo_b
+    #   [matmul] (512,1152)   vs (2304,5120)   # shared_experts.w2
+    # Slice them on the same 128-wide block boundaries the dense path uses.
+    _RAW_TP = (
+        ("attn.wq_b", "out", "attn"),
+        ("attn.wo_b", "in", "attn"),
+        ("ffn.shared_experts.w1", "out", "shared"),
+        ("ffn.shared_experts.w3", "out", "shared"),
+        ("ffn.shared_experts.w2", "in", "shared"),
+    )
+    raw_sliced: set[str] = set()
+    for _name, _axis, _kind in _RAW_TP:
+        if _name in dense or (_kind == "attn" and not attn_tp) or (_kind == "shared" and not shared_tp):
+            continue
+        _key = f"{pre}{_name}.weight"
+        if _key not in ck.index:
+            continue
+        _w = _plain(ck, _key)                       # [out, in]
+        _n = (_w.shape[0] if _axis == "out" else _w.shape[1]) // 16
+        _a, _b = _block_bounds(_n, rank, world, f"{_axis}_tiles", _key)
+        _slice = _w[_a * 16 : _b * 16] if _axis == "out" else _w[:, _a * 16 : _b * 16]
+        _obj = blk
+        for _p in _name.split(".")[:-1]:
+            _obj = getattr(_obj, _p)
+        getattr(_obj, _name.split(".")[-1]).weight = mx.contiguous(_slice)
+        raw_sliced.add(f"{_name}.weight")
     if shared_tp:
         blk.ffn.shared_sharded = True
 
@@ -765,8 +786,8 @@ def build_block(ck: Exl3Checkpoint, args: ModelArgs, layer_id: int, *,
     fp32 = ("norm.weight", "attn_sink", "hc_", "gate.bias", "q_weight", "k_weight")
     items = []
     for tail, name in have.items():
-        if raw_wo_b_sliced and tail == "attn.wo_b.weight":
-            continue            # already set as this rank's in-axis slice above
+        if tail in raw_sliced:
+            continue            # already set as this rank's slice above
         dt = mx.float32 if any(s in tail for s in fp32) else None
         items.append((tail, _plain(ck, name, dt)))
     if attn_tp:
