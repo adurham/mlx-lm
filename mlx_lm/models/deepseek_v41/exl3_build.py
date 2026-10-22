@@ -102,12 +102,79 @@ class AffineProj(nn.Module):
         # exl3 on the cluster, ROUND-Q1B). Affine-only: exl3 never builds this.
         mx.clear_cache()
         self._bits, self._group = bits, group
+        self._mode = "affine"
+        self._act = mx.float16
         self.out_features = w.shape[0]
 
+    @classmethod
+    def from_quantized(cls, weight: mx.array, scales: mx.array,
+                       biases: mx.array | None, *, bits: int, group: int,
+                       mode: str = "affine", bias: mx.array | None = None,
+                       expect: tuple[int, int] | None = None) -> "AffineProj":
+        """``AffineProj`` from ALREADY-packed tensors (a checkpoint's own).
+
+        No dequantize/re-quantize round trip: ``weight`` (uint32 packed),
+        ``scales`` and -- affine only -- ``biases`` are stored as they came out
+        of the checkpoint, so a tensor-parallel rank can hand over the packed
+        column slice ``_qslice`` produced. ``mode`` is one of MLX's
+        quantized_matmul modes (``affine``/``mxfp4``/``mxfp8``/``nvfp4``);
+        ``biases`` must be None for every non-affine mode.
+
+        Activations are cast to the *scale* dtype: MLX falls back to a slow
+        path (and, for affine, returns fp32) when it does not match. Plain
+        bf16 activations against bf16 scales therefore stay on the fast path.
+        """
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        if weight.ndim != 2:
+            raise ValueError(
+                f"AffineProj.from_quantized: expected a 2-D packed [out, "
+                f"packed_in] weight, got {tuple(weight.shape)}")
+        if bits not in (2, 3, 4, 5, 6, 8):
+            raise ValueError(f"AffineProj.from_quantized: unsupported bits {bits}")
+        if mode == "affine":
+            if biases is None:
+                raise ValueError("AffineProj.from_quantized: affine mode needs biases")
+        elif biases is not None:
+            raise ValueError(
+                f"AffineProj.from_quantized: mode {mode!r} must not carry biases")
+        in_elems = weight.shape[-1] * 32 // bits
+        if scales.shape[0] != weight.shape[0] or scales.shape[-1] * group != in_elems:
+            raise ValueError(
+                f"AffineProj.from_quantized: scales {tuple(scales.shape)} do not "
+                f"describe {tuple(weight.shape)} at bits={bits} group={group}")
+        if biases is not None and tuple(biases.shape) != tuple(scales.shape):
+            raise ValueError(
+                f"AffineProj.from_quantized: biases {tuple(biases.shape)} != "
+                f"scales {tuple(scales.shape)}")
+        if expect is not None and (weight.shape[0], in_elems) != tuple(expect):
+            raise ValueError(
+                f"AffineProj.from_quantized: [{weight.shape[0]}, {in_elems}] != "
+                f"expected [out, in] {tuple(expect)}")
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        if bias is not None:
+            self.bias = bias
+        self._q = None
+        self._mode = mode
+        self._bits, self._group = bits, group
+        self._act = (scales.dtype if scales.dtype in (mx.float16, mx.bfloat16)
+                     else mx.bfloat16)
+        self.out_features = weight.shape[0]
+        return self
+
     def __call__(self, x: mx.array) -> mx.array:
+        if self._q is None:                      # checkpoint-packed tensors
+            y = mx.quantized_matmul(x.astype(self._act), self.weight,
+                                    self.scales, self.biases, transpose=True,
+                                    group_size=self._group, bits=self._bits,
+                                    mode=self._mode)
+            return y.astype(x.dtype)
         wq, sc, bi = self._q
         y = mx.quantized_matmul(x.astype(mx.float16), wq, sc, bi, transpose=True,
-                                group_size=self._group, bits=self._bits)
+                                group_size=self._group, bits=self._bits,
+                                mode=self._mode)
         return y.astype(x.dtype)
 
 
@@ -391,9 +458,13 @@ class ShardedHead(nn.Module):
     (adding zeros is exact, so values equal the full head's). all_sum is used
     instead of all_gather because the JACCL mesh all_gather rejects this size."""
 
-    def __init__(self, lin, group, rank: int, world: int, vocab: int):
+    def __init__(self, lin=None, group=None, rank: int = 0, world: int = 1,
+                 vocab: int | None = None, *, proj=None):
         super().__init__()
-        self._p = Exl3Proj(lin)
+        # ``proj`` supplies an already-wrapped projection (the oQ build hands
+        # over a plain/quantized module it built itself); otherwise ``lin`` is
+        # an EXL3 linear and is wrapped here.
+        self._p = proj if proj is not None else Exl3Proj(lin)
         self._group = group
         self._rank, self._world = rank, world
         self._lo = rank * (vocab // world)
