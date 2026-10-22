@@ -613,6 +613,67 @@ def _check_accounting(ck: OqCheckpoint, obj: nn.Module, pre: str, consumed: set,
 
 
 # --------------------------------------------------------------------------
+# engram tables carried inside the pack
+# --------------------------------------------------------------------------
+class PackedEngramTable(nn.Module):
+    """Row-on-demand reader for an engram table that lives inside an oQ pack.
+
+    The native release stores these tables as ``F8_E4M3`` with ``F8_E8M0``
+    per-32 exponents, which is what ``exl3_build.LazyEngramTable`` reads. An oQ
+    pack may instead carry them quantized (the abliterated 1017 pack uses
+    4-bit affine, group 32, with BF16 scales *and* biases), in which case the
+    rows have to be dequantized rather than reinterpreted. The pack declares
+    the layout in ``omlx_deepseek_v41.engram_tables``; this class trusts that
+    spec and reads rows straight off the memmap, so a 57 GiB table still costs
+    only the rows a forward asks for.
+    """
+
+    def __init__(self, ck: "OqCheckpoint", layer_id: int, spec: dict):
+        super().__init__()
+        self._ck = ck
+        self._mod = f"layers.{layer_id}.engram.embed"
+        self._bits = int(spec.get("bits", 4))
+        self._group = int(spec.get("group_size", 32))
+        self._mode = spec.get("mode", "affine")
+        rows, packed_cols = ck.shape(f"{self._mod}.weight")
+        self._dim = packed_cols * 32 // self._bits
+        self._pending = None
+
+    def _take(self, name: str, uniq: np.ndarray) -> mx.array:
+        view = np.ascontiguousarray(self._ck.np_view(name)[uniq])
+        mx_dt = _DTYPES[self._ck.dtype_name(name)][1]
+        arr = mx.array(view)
+        return arr if arr.dtype == mx_dt else arr.view(mx_dt)
+
+    def _read(self, uniq: np.ndarray) -> mx.array:
+        w = self._take(f"{self._mod}.weight", uniq)
+        s = self._take(f"{self._mod}.scales", uniq)
+        b = (self._take(f"{self._mod}.biases", uniq)
+             if self._ck.has(f"{self._mod}.biases") else None)
+        rows = mx.dequantize(w, s, b, group_size=self._group, bits=self._bits,
+                             mode=self._mode)
+        mx.eval(rows)
+        return rows
+
+    def prefetch(self, indices) -> None:
+        idx = np.asarray(indices, dtype=np.int64)
+        uniq = np.unique(idx.reshape(-1))
+        self._pending = (idx.tobytes(), uniq)
+
+    def __call__(self, indices) -> mx.array:
+        idx = np.asarray(indices, dtype=np.int64)
+        flat = idx.reshape(-1)
+        pend, self._pending = self._pending, None
+        if pend is not None and pend[0] == idx.tobytes():
+            uniq = pend[1]
+        else:
+            uniq = np.unique(flat)
+        rows = self._read(uniq)
+        inv = mx.array(np.searchsorted(uniq, flat).astype(np.int32))
+        return rows[inv].reshape(idx.shape + (self._dim,))
+
+
+# --------------------------------------------------------------------------
 # build
 # --------------------------------------------------------------------------
 def build_block(ck: OqCheckpoint, args: ModelArgs, layer_id: int, *,
@@ -621,7 +682,9 @@ def build_block(ck: OqCheckpoint, args: ModelArgs, layer_id: int, *,
     """One ``Block`` from the oQ pack. Returns ``(block, report)``.
 
     ``native`` is the FP8 release checkpoint the engram rows are read from
-    (``exl3.loader.Exl3Checkpoint``), exactly as in ``exl3_build``.
+    (``exl3.loader.Exl3Checkpoint``), exactly as in ``exl3_build``. A pack that
+    carries its own engram tables (``engram_in_index``) is read directly and
+    needs no native release at all.
     """
     pre = f"layers.{layer_id}."
     blk = Block(layer_id, args)
@@ -654,14 +717,21 @@ def build_block(ck: OqCheckpoint, args: ModelArgs, layer_id: int, *,
                                         world=world)
     consumed |= wo_consumed
 
-    # Engram tables never come from this pack (2 x 94 GiB shards); rows are read
-    # on demand from the native FP8 release, exactly as the EXL3 path does.
+    # Engram tables: a pack that indexes its own (``engram_in_index``) is read
+    # row-on-demand from the pack itself; otherwise rows come from the native
+    # FP8 release, exactly as the EXL3 path does.
     skip = ("ffn.experts.", "attn.wo_a.")
     if blk.engram is not None:
-        if native is None:
-            raise ValueError(f"layer {layer_id} has engram; pass the native "
-                             f"release via native_dir")
-        blk.engram.embed = LazyEngramTable(native, layer_id)
+        spec = (ck.engram_tables.get(TEXT_PREFIX + f"layers.{layer_id}.engram.embed")
+                if getattr(ck, "engram_in_index", False) else None)
+        if spec:
+            blk.engram.embed = PackedEngramTable(ck, layer_id, spec)
+        elif native is not None:
+            blk.engram.embed = LazyEngramTable(native, layer_id)
+        else:
+            raise ValueError(
+                f"layer {layer_id} has engram but the pack carries no table and "
+                f"no native release was passed via native_dir")
         skip = skip + ("engram.embed.",)
 
     items, used, sliced = _load_dense(ck, blk, pre, rank=rank, world=world,
