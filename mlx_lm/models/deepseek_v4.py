@@ -3591,10 +3591,14 @@ class DeepseekV4MoE(nn.Module):
         # drift accumulate across ranks and JACCL ack barriers wedge.
         # See `dsv4_v4block_compile_2026_05_08.md` for the all_sum-inside-
         # compile case (effectively N=∞) collapsing c=2 100K to 7.7 tok/s.
-        import os as _os
-        self._fence_every_n = max(1, int(
-            _os.environ.get("EXO_DSV4_FENCE_EVERY_N_LAYERS", "1")
-        ))
+        #
+        # 2026-10-22: the assignment that used to live here is GONE. After
+        # OPT-7 was reverted the value was read by nothing, so
+        # EXO_DSV4_FENCE_EVERY_N_LAYERS has had no effect in this model, and
+        # none at all in the DSv4.1 path (which fences prefill only and goes
+        # to the collective through deepseek_v41.collective). An inert knob
+        # that still takes runs is worse than no knob: 8r.9 spent a 30-minute
+        # A/B on it and read "no change" as a property of the model.
         self._num_total_layers = int(config.num_hidden_layers)
         self.gate = MoEGate(config, layer_idx)
         self.switch_mlp = SwitchGLU(
